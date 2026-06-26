@@ -17,6 +17,7 @@ pub struct Config {
     pub order_size_filter: f32,
     pub trade_size_scale: Option<i32>,
     pub coalescing: Option<CoalesceKind>,
+    pub iceberg_ratio: f64,
 }
 
 impl Default for Config {
@@ -26,6 +27,7 @@ impl Default for Config {
             order_size_filter: 0.0,
             trade_size_scale: Some(100),
             coalescing: Some(CoalesceKind::Average(0.15)),
+            iceberg_ratio: 3.0,
         }
     }
 }
@@ -291,6 +293,15 @@ impl HistoricalDepth {
                     .filter(|run| run.until_time >= latest_timestamp)
                     .map(|run| (price, run))
             })
+    }
+
+    pub fn visible_qty_at(&self, price: Price, time: UnixMs, is_bid: bool) -> Option<Qty> {
+        self.price_levels.get(&price).and_then(|runs| {
+            runs.iter()
+                .rev()
+                .find(|run| run.is_bid == is_bid && run.start_time <= time && run.until_time > time)
+                .map(|run| run.qty)
+        })
     }
 
     pub fn cleanup_old_price_levels(&mut self, oldest_time: UnixMs) {

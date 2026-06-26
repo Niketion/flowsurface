@@ -5,11 +5,12 @@ use crate::widget::chart::heatmap::scene::pipeline::{DrawItem, DrawLayer, DrawOp
 use crate::widget::chart::heatmap::view::ViewWindow;
 
 use data::aggr::time::TimeSeries;
-use data::chart::heatmap::{Config, HeatmapDataPoint, ProfileKind};
+use data::chart::heatmap::{Config, HeatmapDataPoint, HistoricalDepth, ProfileKind};
 use exchange::SizeUnit;
 use exchange::UnixMs;
 use exchange::adapter::MarketKind;
 use exchange::unit::{Price, PriceStep, Qty};
+
 
 #[derive(Debug, Clone)]
 pub struct OverlayBuild {
@@ -112,13 +113,15 @@ impl InstanceBuilder {
         market_type: &MarketKind,
         profile_kind: Option<&ProfileKind>,
         show_volume_strip: bool,
+        depth_history: &HistoricalDepth,
+        show_iceberg_detector: bool,
     ) -> OverlayBuild {
         // Reset denoms each rebuild to avoid stale overlay labels
         self.depth_profile_scale_max_qty = None;
         self.volume_strip_scale_max_qty = None;
         self.volume_profile_scale_max_qty = None;
 
-        let circles = self.build_circles(
+        let mut circles = self.build_circles(
             w,
             trades,
             base_price,
@@ -129,6 +132,21 @@ impl InstanceBuilder {
             config,
             market_type,
         );
+
+        if show_iceberg_detector {
+            circles.extend(self.build_iceberg_circles(
+                w,
+                trades,
+                depth_history,
+                base_price,
+                step,
+                y_anchor,
+                scroll_ref_bucket,
+                palette,
+                config,
+                market_type,
+            ));
+        }
 
         let mut rects: Vec<RectInstance> = Vec::new();
 
@@ -364,6 +382,75 @@ impl InstanceBuilder {
                 config.trade_size_scale,
                 fallback_radius_px,
             ));
+        }
+
+        out
+    }
+
+    fn build_iceberg_circles(
+        &self,
+        w: &ViewWindow,
+        trades: &TimeSeries<HeatmapDataPoint>,
+        depth_history: &HistoricalDepth,
+        base_price: Price,
+        step: PriceStep,
+        y_anchor: Option<Price>,
+        ref_bucket: i64,
+        palette: &HeatmapPalette,
+        config: &Config,
+        market_type: &MarketKind,
+    ) -> Vec<CircleInstance> {
+        let mut out = Vec::new();
+        let size_in_quote_ccy = exchange::unit::qty::volume_size_unit() == SizeUnit::Quote;
+        let trade_size_filter = config.trade_size_filter.max(0.0);
+
+        for (bucket_time, dp) in trades
+            .datapoints
+            .range(UnixMs::new(w.earliest)..=UnixMs::new(w.latest_vis))
+        {
+            let bucket = (bucket_time.as_u64() / w.aggr_time) as i64;
+
+            for trade in dp.grouped_trades.iter() {
+                if trade.price < w.lowest || trade.price > w.highest {
+                    continue;
+                }
+
+                let trade_size =
+                    market_type.qty_in_quote_value(trade.qty, trade.price, size_in_quote_ccy);
+                if trade_size as f32 <= trade_size_filter {
+                    continue;
+                }
+
+                // A buy market trade consumes resting asks; a sell market trade consumes resting bids.
+                let resting_side_is_bid = trade.is_sell;
+                let Some(visible_qty) =
+                    depth_history.visible_qty_at(trade.price, *bucket_time, resting_side_is_bid)
+                else {
+                    continue;
+                };
+
+                if visible_qty.is_zero() {
+                    continue;
+                }
+
+                let score = trade.qty.to_f64() / visible_qty.to_scale_or_one();
+                if score < config.iceberg_ratio {
+                    continue;
+                }
+
+                out.push(CircleInstance::from_iceberg_signal(
+                    trade.price,
+                    resting_side_is_bid,
+                    bucket,
+                    ref_bucket,
+                    base_price,
+                    step,
+                    y_anchor,
+                    w,
+                    palette,
+                    score as f32,
+                ));
+            }
         }
 
         out

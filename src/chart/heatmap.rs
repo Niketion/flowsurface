@@ -38,6 +38,7 @@ const MAX_SCALING: f32 = 1.2;
 
 const MAX_CELL_WIDTH: f32 = 12.0;
 const MIN_CELL_WIDTH: f32 = 1.0;
+const ICEBERG_MIN_RATIO: f64 = 3.0;
 
 const MAX_CELL_HEIGHT: f32 = 10.0;
 const MIN_CELL_HEIGHT: f32 = 1.0;
@@ -146,6 +147,7 @@ impl PlotConstants for HeatmapChart {
 enum IndicatorData {
     #[default]
     Volume,
+    Iceberg,
 }
 
 pub struct HeatmapChart {
@@ -174,6 +176,7 @@ impl HeatmapChart {
         for &indicator in enabled_indicators {
             indicators[indicator] = Some(match indicator {
                 HeatmapIndicator::Volume => IndicatorData::Volume,
+                HeatmapIndicator::Iceberg => IndicatorData::Iceberg,
             });
         }
 
@@ -373,6 +376,7 @@ impl HeatmapChart {
         } else {
             let data = match indicator {
                 HeatmapIndicator::Volume => IndicatorData::Volume,
+                HeatmapIndicator::Iceberg => IndicatorData::Iceberg,
             };
             self.indicators[indicator] = Some(data);
         }
@@ -489,6 +493,7 @@ impl canvas::Program<Message> for HeatmapChart {
             let size_in_quote_ccy = volume_size_unit() == SizeUnit::Quote;
 
             let volume_indicator = self.indicators[HeatmapIndicator::Volume].is_some();
+            let iceberg_indicator = self.indicators[HeatmapIndicator::Iceberg].is_some();
 
             if let Some(merge_strat) = self.visual_config().coalescing {
                 let coalesced_visual_runs = self.heatmap.coalesced_runs(
@@ -661,6 +666,38 @@ impl canvas::Program<Message> for HeatmapChart {
                                 &Path::circle(Point::new(x_position, y_position), radius),
                                 color,
                             );
+                        }
+
+                        if iceberg_indicator
+                            && trade_size as f32 > self.visual_config.trade_size_filter
+                        {
+                            let resting_side_is_bid = trade.is_sell;
+                            if let Some(visible_qty) =
+                                self.heatmap
+                                    .visible_qty_at(trade.price, *time, resting_side_is_bid)
+                                && !visible_qty.is_zero()
+                            {
+                                let score = trade.qty.to_f64() / visible_qty.to_scale_or_one();
+                                if score >= ICEBERG_MIN_RATIO {
+                                    let t = ((score - 1.0) / 8.0).clamp(0.0, 1.0) as f32;
+                                    let radius = 4.0 + t * 14.0;
+                                    let base = if resting_side_is_bid {
+                                        palette.success.base.color
+                                    } else {
+                                        palette.danger.base.color
+                                    };
+                                    let color = Color {
+                                        r: base.r + (1.0 - base.r) * 0.65,
+                                        g: base.g + (0.78 - base.g) * 0.65,
+                                        b: base.b + (0.18 - base.b) * 0.65,
+                                        a: 0.95,
+                                    };
+                                    frame.fill(
+                                        &Path::circle(Point::new(x_position, y_position), radius),
+                                        color,
+                                    );
+                                }
+                            }
                         }
                     });
 

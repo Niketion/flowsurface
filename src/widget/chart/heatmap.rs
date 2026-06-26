@@ -690,6 +690,7 @@ impl HeatmapShader {
             .map(|(price, run)| (*price, run.qty, run.is_bid));
 
         let show_volume_indicator = self.indicators.contains(&HeatmapIndicator::Volume);
+        let show_iceberg_detector = self.indicators.contains(&HeatmapIndicator::Iceberg);
 
         let built = self.instances.build_instances(
             &effective_window,
@@ -705,6 +706,8 @@ impl HeatmapShader {
             &self.ticker_info.market_type(),
             volume_profile,
             show_volume_indicator,
+            &self.depth_history,
+            show_iceberg_detector,
         );
 
         let draw_list = built.draw_list();

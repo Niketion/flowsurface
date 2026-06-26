@@ -22,6 +22,9 @@ impl CircleInstance {
     pub const R_MIN_PX: f32 = 1.5;
     const R_MAX_PX: f32 = 25.0;
     const ALPHA: f32 = 0.8;
+    const ICEBERG_ALPHA: f32 = 0.95;
+    const ICEBERG_R_MIN_PX: f32 = 4.0;
+    const ICEBERG_R_MAX_PX: f32 = 18.0;
 
     pub fn from_trade(
         trade: &GroupedTrade,
@@ -73,6 +76,50 @@ impl CircleInstance {
             radius_px,
             _pad: 0.0,
             color: rgba,
+        }
+    }
+
+    pub fn from_iceberg_signal(
+        price: Price,
+        is_bid_iceberg: bool,
+        bucket: i64,
+        ref_bucket: i64,
+        base_price: Price,
+        step: PriceStep,
+        y_anchor: Option<Price>,
+        w: &ViewWindow,
+        palette: &HeatmapPalette,
+        score: f32,
+    ) -> Self {
+        let x_bin_rel = (bucket - ref_bucket).clamp(i32::MIN as i64, i32::MAX as i64) as i32;
+        let y_world = w.y_center_for_price_texture_aligned(price, base_price, step, y_anchor);
+        let t = ((score - 1.0) / 8.0).clamp(0.0, 1.0);
+        let radius_px =
+            Self::ICEBERG_R_MIN_PX + t * (Self::ICEBERG_R_MAX_PX - Self::ICEBERG_R_MIN_PX);
+
+        let base_rgb = if is_bid_iceberg {
+            palette.bid_rgb
+        } else {
+            palette.ask_rgb
+        };
+
+        // Tint probable icebergs toward amber so they stand out from normal trade bubbles
+        // while still preserving bid/ask context.
+        let amber = [1.0, 0.78, 0.18];
+        let tint = 0.65;
+        let rgb = [
+            base_rgb[0] + (amber[0] - base_rgb[0]) * tint,
+            base_rgb[1] + (amber[1] - base_rgb[1]) * tint,
+            base_rgb[2] + (amber[2] - base_rgb[2]) * tint,
+        ];
+
+        Self {
+            y_world,
+            x_bin_rel,
+            x_frac: 0.0,
+            radius_px,
+            _pad: 0.0,
+            color: [rgb[0], rgb[1], rgb[2], Self::ICEBERG_ALPHA],
         }
     }
 }

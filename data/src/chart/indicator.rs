@@ -52,6 +52,7 @@ impl Display for KlineIndicator {
 #[derive(Debug, Clone, Copy, PartialEq, Deserialize, Serialize, Eq, Enum)]
 pub enum HeatmapIndicator {
     Volume,
+    Iceberg,
 }
 
 impl Indicator for HeatmapIndicator {
@@ -67,15 +68,16 @@ impl HeatmapIndicator {
     // Indicator togglers on UI menus depend on these arrays.
     // Every variant needs to be in either SPOT, PERPS or both.
     /// Indicators that can be used with spot market tickers
-    const FOR_SPOT: [HeatmapIndicator; 1] = [HeatmapIndicator::Volume];
+    const FOR_SPOT: [HeatmapIndicator; 2] = [HeatmapIndicator::Volume, HeatmapIndicator::Iceberg];
     /// Indicators that can be used with perpetual swap market tickers
-    const FOR_PERPS: [HeatmapIndicator; 1] = [HeatmapIndicator::Volume];
+    const FOR_PERPS: [HeatmapIndicator; 2] = [HeatmapIndicator::Volume, HeatmapIndicator::Iceberg];
 }
 
 impl Display for HeatmapIndicator {
     fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
         match self {
             HeatmapIndicator::Volume => write!(f, "Volume"),
+            HeatmapIndicator::Iceberg => write!(f, "Iceberg detector"),
         }
     }
 }
