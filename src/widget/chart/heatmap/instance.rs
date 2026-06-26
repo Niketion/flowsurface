@@ -10,6 +10,60 @@ use exchange::SizeUnit;
 use exchange::UnixMs;
 use exchange::adapter::MarketKind;
 use exchange::unit::{Price, PriceStep, Qty};
+use rustc_hash::FxHashMap;
+
+const ICEBERG_MIN_HITS: usize = 3;
+const ICEBERG_WINDOW_BUCKETS: i64 = 3;
+const ICEBERG_COOLDOWN_BUCKETS: i64 = 5;
+const ICEBERG_MAX_SWEEP_LEVELS: usize = 2;
+
+#[derive(Debug, Clone, Copy, Default)]
+struct IcebergCandidate {
+    first_bucket: i64,
+    last_bucket: i64,
+    hits: usize,
+    cum_qty: f64,
+    max_visible_qty: f64,
+    last_signal_bucket: Option<i64>,
+}
+
+impl IcebergCandidate {
+    fn reset(&mut self, bucket: i64, trade_qty: f64, visible_qty: f64) {
+        self.first_bucket = bucket;
+        self.last_bucket = bucket;
+        self.hits = 1;
+        self.cum_qty = trade_qty;
+        self.max_visible_qty = visible_qty;
+    }
+
+    fn absorb(&mut self, bucket: i64, trade_qty: f64, visible_qty: f64) {
+        if self.hits == 0 || bucket - self.first_bucket > ICEBERG_WINDOW_BUCKETS {
+            self.reset(bucket, trade_qty, visible_qty);
+            return;
+        }
+
+        self.last_bucket = bucket;
+        self.hits += 1;
+        self.cum_qty += trade_qty;
+        self.max_visible_qty = self.max_visible_qty.max(visible_qty);
+    }
+
+    fn score(&self) -> f64 {
+        if self.max_visible_qty <= f64::EPSILON {
+            0.0
+        } else {
+            self.cum_qty / self.max_visible_qty
+        }
+    }
+
+    fn can_signal(&self, ratio: f64, bucket: i64) -> bool {
+        self.hits >= ICEBERG_MIN_HITS
+            && self.score() >= ratio
+            && self
+                .last_signal_bucket
+                .map_or(true, |last| bucket - last >= ICEBERG_COOLDOWN_BUCKETS)
+    }
+}
 
 
 #[derive(Debug, Clone)]
@@ -401,8 +455,41 @@ impl InstanceBuilder {
         market_type: &MarketKind,
     ) -> Vec<CircleInstance> {
         let mut out = Vec::new();
+        let mut candidates: FxHashMap<(Price, bool), IcebergCandidate> = FxHashMap::default();
+        let mut touched_levels: FxHashMap<(i64, bool), Vec<Price>> = FxHashMap::default();
         let size_in_quote_ccy = exchange::unit::qty::volume_size_unit() == SizeUnit::Quote;
         let trade_size_filter = config.trade_size_filter.max(0.0);
+        let required_ratio = config.iceberg_ratio.max(1.0);
+
+        // Pre-compute how many distinct price levels each aggressive side touches per bucket.
+        // A side sweeping several levels in the same bucket is usually initiative flow, not
+        // hidden liquidity reloading at one passive level.
+        for (bucket_time, dp) in trades
+            .datapoints
+            .range(UnixMs::new(w.earliest)..=UnixMs::new(w.latest_vis))
+        {
+            let bucket = (bucket_time.as_u64() / w.aggr_time) as i64;
+
+            for trade in dp.grouped_trades.iter() {
+                if trade.price < w.lowest || trade.price > w.highest {
+                    continue;
+                }
+
+                let trade_size =
+                    market_type.qty_in_quote_value(trade.qty, trade.price, size_in_quote_ccy);
+                if trade_size as f32 <= trade_size_filter {
+                    continue;
+                }
+
+                let resting_side_is_bid = trade.is_sell;
+                let prices = touched_levels
+                    .entry((bucket, resting_side_is_bid))
+                    .or_default();
+                if !prices.contains(&trade.price) {
+                    prices.push(trade.price);
+                }
+            }
+        }
 
         for (bucket_time, dp) in trades
             .datapoints
@@ -423,6 +510,14 @@ impl InstanceBuilder {
 
                 // A buy market trade consumes resting asks; a sell market trade consumes resting bids.
                 let resting_side_is_bid = trade.is_sell;
+
+                if touched_levels
+                    .get(&(bucket, resting_side_is_bid))
+                    .map_or(false, |levels| levels.len() > ICEBERG_MAX_SWEEP_LEVELS)
+                {
+                    continue;
+                }
+
                 let Some(visible_qty) =
                     depth_history.visible_qty_at(trade.price, *bucket_time, resting_side_is_bid)
                 else {
@@ -433,11 +528,15 @@ impl InstanceBuilder {
                     continue;
                 }
 
-                let score = trade.qty.to_f64() / visible_qty.to_scale_or_one();
-                if score < config.iceberg_ratio {
+                let key = (trade.price, resting_side_is_bid);
+                let candidate = candidates.entry(key).or_default();
+                candidate.absorb(bucket, trade.qty.to_f64(), visible_qty.to_scale_or_one());
+
+                if !candidate.can_signal(required_ratio, bucket) {
                     continue;
                 }
 
+                let score = candidate.score();
                 out.push(CircleInstance::from_iceberg_signal(
                     trade.price,
                     resting_side_is_bid,
@@ -450,6 +549,7 @@ impl InstanceBuilder {
                     palette,
                     score as f32,
                 ));
+                candidate.last_signal_bucket = Some(bucket);
             }
         }
 

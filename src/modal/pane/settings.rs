@@ -39,6 +39,42 @@ where
         .into()
 }
 
+fn iceberg_detector_column<'a>(cfg: heatmap::Config, pane: pane_grid::Pane) -> Element<'a, Message> {
+    let ratio_slider = {
+        let ratio = cfg.iceberg_ratio;
+        labeled_slider(
+            "Ratio",
+            1.0..=20.0,
+            ratio,
+            move |value| {
+                Message::VisualConfigChanged(
+                    pane,
+                    VisualConfig::Heatmap(heatmap::Config {
+                        iceberg_ratio: value,
+                        ..cfg
+                    }),
+                    false,
+                )
+            },
+            |value| format!("{:.1}x", *value),
+            Some(0.5),
+        )
+    };
+
+    column![
+        text("Iceberg detector").size(crate::style::text_size::SECTION),
+        ratio_slider,
+        text(format!(
+            "Requires {ICEBERG_MIN_HITS} hits on the same price level and filters bucket sweeps."
+        ))
+        .size(crate::style::text_size::TINY),
+    ]
+    .spacing(8)
+    .into()
+}
+
+const ICEBERG_MIN_HITS: usize = 3;
+
 pub fn heatmap_cfg_view<'a>(
     cfg: heatmap::Config,
     pane: pane_grid::Pane,
@@ -270,6 +306,7 @@ pub fn heatmap_cfg_view<'a>(
         size_filters_column,
         noise_filters_column,
         trade_viz_column,
+        iceberg_detector_column(cfg, pane),
         column![text("Studies").size(crate::style::text_size::SECTION), study_cfg].spacing(8),
         row![
             space::horizontal(),
@@ -390,6 +427,7 @@ pub fn heatmap_shader_cfg_view<'a>(
     let content = split_column![
         size_filters_column,
         trade_viz_column,
+        iceberg_detector_column(cfg, pane),
         column![text("Studies").size(crate::style::text_size::SECTION), study_cfg].spacing(8),
         row![
             space::horizontal(),

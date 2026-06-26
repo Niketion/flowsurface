@@ -38,7 +38,58 @@ const MAX_SCALING: f32 = 1.2;
 
 const MAX_CELL_WIDTH: f32 = 12.0;
 const MIN_CELL_WIDTH: f32 = 1.0;
-const ICEBERG_MIN_RATIO: f64 = 3.0;
+const ICEBERG_MIN_HITS: usize = 3;
+const ICEBERG_WINDOW_BUCKETS: i64 = 3;
+const ICEBERG_COOLDOWN_BUCKETS: i64 = 5;
+const ICEBERG_MAX_SWEEP_LEVELS: usize = 2;
+
+#[derive(Debug, Clone, Copy, Default)]
+struct IcebergCandidate {
+    first_bucket: i64,
+    last_bucket: i64,
+    hits: usize,
+    cum_qty: f64,
+    max_visible_qty: f64,
+    last_signal_bucket: Option<i64>,
+}
+
+impl IcebergCandidate {
+    fn reset(&mut self, bucket: i64, trade_qty: f64, visible_qty: f64) {
+        self.first_bucket = bucket;
+        self.last_bucket = bucket;
+        self.hits = 1;
+        self.cum_qty = trade_qty;
+        self.max_visible_qty = visible_qty;
+    }
+
+    fn absorb(&mut self, bucket: i64, trade_qty: f64, visible_qty: f64) {
+        if self.hits == 0 || bucket - self.first_bucket > ICEBERG_WINDOW_BUCKETS {
+            self.reset(bucket, trade_qty, visible_qty);
+            return;
+        }
+
+        self.last_bucket = bucket;
+        self.hits += 1;
+        self.cum_qty += trade_qty;
+        self.max_visible_qty = self.max_visible_qty.max(visible_qty);
+    }
+
+    fn score(&self) -> f64 {
+        if self.max_visible_qty <= f64::EPSILON {
+            0.0
+        } else {
+            self.cum_qty / self.max_visible_qty
+        }
+    }
+
+    fn can_signal(&self, ratio: f64, bucket: i64) -> bool {
+        self.hits >= ICEBERG_MIN_HITS
+            && self.score() >= ratio
+            && self
+                .last_signal_bucket
+                .map_or(true, |last| bucket - last >= ICEBERG_COOLDOWN_BUCKETS)
+    }
+}
 
 const MAX_CELL_HEIGHT: f32 = 10.0;
 const MIN_CELL_HEIGHT: f32 = 1.0;
@@ -627,6 +678,112 @@ impl canvas::Program<Message> for HeatmapChart {
                 }
             };
 
+            let iceberg_signals: FxHashMap<(UnixMs, Price, bool), f32> = if iceberg_indicator {
+                let mut signals = FxHashMap::default();
+                let mut candidates: FxHashMap<(Price, bool), IcebergCandidate> = FxHashMap::default();
+                let mut touched_levels: FxHashMap<(i64, bool), Vec<Price>> = FxHashMap::default();
+                let required_ratio = self.visual_config.iceberg_ratio.max(1.0);
+                let aggr_time = match chart.basis {
+                    Basis::Time(interval) => interval.to_milliseconds(),
+                    Basis::Tick(_) => 1,
+                };
+
+                self.trades
+                    .datapoints
+                    .range(UnixMs::new(earliest)..=UnixMs::new(latest))
+                    .for_each(|(time, dp)| {
+                        let bucket = (time.as_u64() / aggr_time) as i64;
+
+                        dp.grouped_trades.iter().for_each(|trade| {
+                            if trade.price < lowest || trade.price > highest {
+                                return;
+                            }
+
+                            let trade_size = market_type.qty_in_quote_value(
+                                trade.qty,
+                                trade.price,
+                                size_in_quote_ccy,
+                            );
+
+                            if trade_size as f32 <= self.visual_config.trade_size_filter {
+                                return;
+                            }
+
+                            let resting_side_is_bid = trade.is_sell;
+                            let prices = touched_levels
+                                .entry((bucket, resting_side_is_bid))
+                                .or_default();
+                            if !prices.contains(&trade.price) {
+                                prices.push(trade.price);
+                            }
+                        });
+                    });
+
+                self.trades
+                    .datapoints
+                    .range(UnixMs::new(earliest)..=UnixMs::new(latest))
+                    .for_each(|(time, dp)| {
+                        let bucket = (time.as_u64() / aggr_time) as i64;
+
+                        dp.grouped_trades.iter().for_each(|trade| {
+                            if trade.price < lowest || trade.price > highest {
+                                return;
+                            }
+
+                            let trade_size = market_type.qty_in_quote_value(
+                                trade.qty,
+                                trade.price,
+                                size_in_quote_ccy,
+                            );
+
+                            if trade_size as f32 <= self.visual_config.trade_size_filter {
+                                return;
+                            }
+
+                            let resting_side_is_bid = trade.is_sell;
+
+                            if touched_levels
+                                .get(&(bucket, resting_side_is_bid))
+                                .map_or(false, |levels| levels.len() > ICEBERG_MAX_SWEEP_LEVELS)
+                            {
+                                return;
+                            }
+
+                            let Some(visible_qty) = self.heatmap.visible_qty_at(
+                                trade.price,
+                                *time,
+                                resting_side_is_bid,
+                            ) else {
+                                return;
+                            };
+
+                            if visible_qty.is_zero() {
+                                return;
+                            }
+
+                            let candidate = candidates
+                                .entry((trade.price, resting_side_is_bid))
+                                .or_default();
+                            candidate.absorb(
+                                bucket,
+                                trade.qty.to_f64(),
+                                visible_qty.to_scale_or_one(),
+                            );
+
+                            if !candidate.can_signal(required_ratio, bucket) {
+                                return;
+                            }
+
+                            signals.insert((*time, trade.price, resting_side_is_bid), candidate.score() as f32);
+                            candidate.last_signal_bucket = Some(bucket);
+                        });
+                    });
+
+                signals
+            } else {
+                FxHashMap::default()
+            };
+
             self.trades
                 .datapoints
                 .range(UnixMs::new(earliest)..=UnixMs::new(latest))
@@ -672,31 +829,26 @@ impl canvas::Program<Message> for HeatmapChart {
                             && trade_size as f32 > self.visual_config.trade_size_filter
                         {
                             let resting_side_is_bid = trade.is_sell;
-                            if let Some(visible_qty) =
-                                self.heatmap
-                                    .visible_qty_at(trade.price, *time, resting_side_is_bid)
-                                && !visible_qty.is_zero()
+                            if let Some(score) =
+                                iceberg_signals.get(&(*time, trade.price, resting_side_is_bid))
                             {
-                                let score = trade.qty.to_f64() / visible_qty.to_scale_or_one();
-                                if score >= ICEBERG_MIN_RATIO {
-                                    let t = ((score - 1.0) / 8.0).clamp(0.0, 1.0) as f32;
-                                    let radius = 4.0 + t * 14.0;
-                                    let base = if resting_side_is_bid {
-                                        palette.success.base.color
-                                    } else {
-                                        palette.danger.base.color
-                                    };
-                                    let color = Color {
-                                        r: base.r + (1.0 - base.r) * 0.65,
-                                        g: base.g + (0.78 - base.g) * 0.65,
-                                        b: base.b + (0.18 - base.b) * 0.65,
-                                        a: 0.95,
-                                    };
-                                    frame.fill(
-                                        &Path::circle(Point::new(x_position, y_position), radius),
-                                        color,
-                                    );
-                                }
+                                let t = ((*score as f64 - 1.0) / 8.0).clamp(0.0, 1.0) as f32;
+                                let radius = 4.0 + t * 14.0;
+                                let base = if resting_side_is_bid {
+                                    palette.success.base.color
+                                } else {
+                                    palette.danger.base.color
+                                };
+                                let color = Color {
+                                    r: base.r + (1.0 - base.r) * 0.65,
+                                    g: base.g + (0.78 - base.g) * 0.65,
+                                    b: base.b + (0.18 - base.b) * 0.65,
+                                    a: 0.95,
+                                };
+                                frame.fill(
+                                    &Path::circle(Point::new(x_position, y_position), radius),
+                                    color,
+                                );
                             }
                         }
                     });
