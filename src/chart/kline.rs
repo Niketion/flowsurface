@@ -9,8 +9,8 @@ use data::aggr::ticks::TickAggr;
 use data::aggr::time::TimeSeries;
 use data::chart::indicator::{Indicator, KlineIndicator};
 use data::chart::kline::{
-    ClusterKind, ClusterScaling, Config, FootprintStudy, FootprintSummary, KlineDataPoint,
-    KlineTrades, NPoc, PointOfControl,
+    BubbleColorMode, ClusterKind, ClusterScaling, Config, FootprintStudy, FootprintSummary,
+    KlineDataPoint, KlineTrades, NPoc, PointOfControl, VolumeBubbleConfig, VolumeBubbleSession,
 };
 use data::chart::{Autoscale, KlineChartKind, ViewConfig};
 
@@ -23,6 +23,7 @@ use iced::theme::palette::Extended;
 use iced::widget::canvas::{self, Event, Geometry, Path, Stroke};
 use iced::{Alignment, Color, Element, Point, Rectangle, Renderer, Size, Theme, Vector, mouse};
 
+use chrono::{Datelike, TimeZone, Timelike};
 use enum_map::EnumMap;
 use std::time::Instant;
 
@@ -393,7 +394,7 @@ impl KlineChart {
                 }
 
                 // priority 2, trades
-                if let KlineChartKind::Footprint { .. } = self.kind
+                if matches!(self.kind, KlineChartKind::Footprint { .. })
                     && !self.fetching_trades.0
                     && is_trade_fetch_enabled()
                     && let Some((fetch_from, fetch_to)) =
@@ -403,6 +404,34 @@ impl KlineChart {
                     if let Some(action) = request_fetch(&mut self.request_handler, range) {
                         self.fetching_trades = (true, None);
                         return Some(action);
+                    }
+                }
+
+                if matches!(self.kind, KlineChartKind::Candles)
+                    && self.visual_config.volume_bubbles.enabled
+                    && !self.fetching_trades.0
+                {
+                    // Candlestick Volume Bubbles intentionally fetch only current-session trades.
+                    // This avoids expensive historical trade downloads when the visible range spans
+                    // older candles that are not useful for the active order-flow overlay.
+                    let session_start = current_volume_bubble_session_start_ms(
+                        chrono::Utc::now(),
+                        self.visual_config.volume_bubbles.session,
+                    );
+                    let request_earliest = visible_earliest_ms.max(session_start);
+
+                    if visible_latest_ms > session_start
+                        && let Some((fetch_from, fetch_to)) = timeseries
+                            .suggest_trade_fetch_range(request_earliest, visible_latest_ms)
+                    {
+                        let fetch_from = fetch_from.max(session_start);
+                        if fetch_to > fetch_from {
+                            let range = FetchRange::Trades(fetch_from, fetch_to);
+                            if let Some(action) = request_fetch(&mut self.request_handler, range) {
+                                self.fetching_trades = (true, None);
+                                return Some(action);
+                            }
+                        }
                     }
                 }
 
@@ -515,12 +544,23 @@ impl KlineChart {
     }
 
     pub fn set_visual_config(&mut self, visual_config: Config) {
+        let should_refetch_volume_bubbles = matches!(self.kind, KlineChartKind::Candles)
+            && visual_config.volume_bubbles.enabled
+            && (!self.visual_config.volume_bubbles.enabled
+                || self.visual_config.volume_bubbles.session
+                    != visual_config.volume_bubbles.session);
+
         self.visual_config = visual_config;
         self.chart.cache.clear_all();
         self.indicators
             .values_mut()
             .filter_map(Option::as_mut)
             .for_each(|indi| indi.clear_all_caches());
+
+        if should_refetch_volume_bubbles {
+            self.reset_request_handler();
+            self.last_tick = Instant::now() - std::time::Duration::from_secs(1);
+        }
     }
 
     pub fn set_cluster_kind(&mut self, new_kind: ClusterKind) {
@@ -1081,6 +1121,25 @@ impl canvas::Program<Message> for KlineChart {
                 }
                 KlineChartKind::Candles => {
                     let candle_width = chart.cell_width * 0.8;
+                    let volume_bubbles = self.visual_config.volume_bubbles;
+                    let volume_bubble_session_start = volume_bubbles.enabled.then(|| {
+                        current_volume_bubble_session_start_ms(
+                            chrono::Utc::now(),
+                            volume_bubbles.session,
+                        )
+                        .as_u64()
+                    });
+                    let visible_max_bubble_qty = if volume_bubbles.enabled {
+                        visible_max_bubble_qty(
+                            &self.data_source,
+                            volume_bubble_session_start
+                                .map_or(earliest, |session_start| earliest.max(session_start)),
+                            latest,
+                            volume_bubbles.min_qty,
+                        )
+                    } else {
+                        0.0
+                    };
 
                     render_data_source(
                         &self.data_source,
@@ -1088,7 +1147,7 @@ impl canvas::Program<Message> for KlineChart {
                         earliest,
                         latest,
                         interval_to_x,
-                        |frame, x_position, kline, _| {
+                        |frame, x_position, kline, trades| {
                             draw_candle_dp(
                                 frame,
                                 price_to_y,
@@ -1097,6 +1156,19 @@ impl canvas::Program<Message> for KlineChart {
                                 x_position,
                                 kline,
                             );
+
+                            if volume_bubbles.enabled {
+                                draw_volume_bubbles(
+                                    frame,
+                                    price_to_y,
+                                    x_position,
+                                    trades,
+                                    &volume_bubbles,
+                                    visible_max_bubble_qty,
+                                    chart.scaling,
+                                    palette,
+                                );
+                            }
                         },
                     );
                 }
@@ -1237,6 +1309,213 @@ fn draw_candle_dp(
         Size::new(candle_width / 4.0, (y_high - y_low).abs()),
         wick_color,
     );
+}
+
+#[derive(Clone, Copy)]
+struct VolumeBubblePoint {
+    price: Price,
+    total_qty: f64,
+    buy_qty: f64,
+    sell_qty: f64,
+}
+
+fn draw_volume_bubbles(
+    frame: &mut canvas::Frame,
+    price_to_y: impl Fn(Price) -> f32,
+    x_position: f32,
+    trades: &KlineTrades,
+    config: &VolumeBubbleConfig,
+    visible_max_qty: f64,
+    scaling: f32,
+    palette: &Extended,
+) {
+    if visible_max_qty <= 0.0 || config.max_bubbles_per_bar == 0 || scaling <= f32::EPSILON {
+        return;
+    }
+
+    for bubble in collect_volume_bubble_points(trades, config) {
+        let radius_px = volume_bubble_radius(bubble.total_qty, visible_max_qty, config);
+        let radius = radius_px / scaling;
+        let center = Point::new(x_position, price_to_y(bubble.price));
+        let color = volume_bubble_color(bubble, config.color_mode, palette);
+
+        let circle = Path::circle(center, radius);
+        frame.stroke(
+            &circle,
+            Stroke::default()
+                .with_color(color.scale_alpha(0.86))
+                .with_width((1.6 / scaling).max(0.75 / scaling)),
+        );
+
+        if config.show_labels && radius_px >= 9.0 {
+            draw_cluster_text(
+                frame,
+                &abbr_large_numbers(bubble.total_qty),
+                center,
+                (radius_px * 0.72).clamp(7.0, 10.0) / scaling,
+                palette.background.base.text,
+                Alignment::Center,
+                Alignment::Center,
+            );
+        }
+    }
+}
+
+fn collect_volume_bubble_points(
+    trades: &KlineTrades,
+    config: &VolumeBubbleConfig,
+) -> Vec<VolumeBubblePoint> {
+    let mut points: Vec<_> = trades
+        .trades
+        .iter()
+        .filter_map(|(price, group)| {
+            let buy_qty = group.buy_qty.to_f64();
+            let sell_qty = group.sell_qty.to_f64();
+            let total_qty = buy_qty + sell_qty;
+
+            (total_qty > 0.0 && total_qty >= config.min_qty).then_some(VolumeBubblePoint {
+                price: *price,
+                total_qty,
+                buy_qty,
+                sell_qty,
+            })
+        })
+        .collect();
+
+    points.sort_by(|a, b| b.total_qty.total_cmp(&a.total_qty));
+    points.truncate(config.max_bubbles_per_bar);
+    points
+}
+
+fn volume_bubble_radius(qty: f64, visible_max_qty: f64, config: &VolumeBubbleConfig) -> f32 {
+    let min_radius = config.min_radius_px.min(config.max_radius_px);
+    let max_radius = config.min_radius_px.max(config.max_radius_px);
+    let intensity = if visible_max_qty > 0.0 {
+        (qty / visible_max_qty).clamp(0.0, 1.0) as f32
+    } else {
+        0.0
+    };
+
+    min_radius + intensity * (max_radius - min_radius)
+}
+
+fn volume_bubble_color(
+    bubble: VolumeBubblePoint,
+    color_mode: BubbleColorMode,
+    palette: &Extended,
+) -> Color {
+    let total_qty = bubble.total_qty.max(f64::EPSILON);
+    let delta = bubble.buy_qty - bubble.sell_qty;
+    let dominance = (delta.abs() / total_qty).clamp(0.0, 1.0) as f32;
+
+    if dominance < 0.10 {
+        return palette.background.strong.text;
+    }
+
+    match color_mode {
+        BubbleColorMode::Delta => {
+            let base = if delta > 0.0 {
+                palette.success.strong.color
+            } else {
+                palette.danger.strong.color
+            };
+            mix_color(
+                base,
+                palette.background.base.color,
+                0.55 + (dominance * 0.35),
+            )
+        }
+        BubbleColorMode::DominantSide => {
+            if bubble.buy_qty >= bubble.sell_qty {
+                palette.success.strong.color
+            } else {
+                palette.danger.strong.color
+            }
+        }
+    }
+}
+
+fn current_volume_bubble_session_start_ms(
+    now: chrono::DateTime<chrono::Utc>,
+    session: VolumeBubbleSession,
+) -> UnixMs {
+    let rome_now = now.with_timezone(&chrono_tz::Europe::Rome);
+    let active_session = match session {
+        VolumeBubbleSession::Auto => {
+            let minutes_since_midnight = rome_now.hour() * 60 + rome_now.minute();
+            match minutes_since_midnight {
+                0..540 => VolumeBubbleSession::Asian,
+                540..930 => VolumeBubbleSession::London,
+                _ => VolumeBubbleSession::NewYork,
+            }
+        }
+        selected => selected,
+    };
+
+    let (hour, minute) = match active_session {
+        VolumeBubbleSession::Auto => unreachable!("auto session is resolved above"),
+        VolumeBubbleSession::Asian => (0, 0),
+        VolumeBubbleSession::London => (9, 0),
+        VolumeBubbleSession::NewYork => (15, 30),
+    };
+
+    let session_start = chrono_tz::Europe::Rome
+        .with_ymd_and_hms(
+            rome_now.year(),
+            rome_now.month(),
+            rome_now.day(),
+            hour,
+            minute,
+            0,
+        )
+        .earliest()
+        .unwrap_or(rome_now)
+        .with_timezone(&chrono::Utc);
+
+    UnixMs::new(session_start.timestamp_millis().max(0) as u64)
+}
+
+fn visible_max_bubble_qty(
+    data_source: &PlotData<KlineDataPoint>,
+    earliest: u64,
+    latest: u64,
+    min_qty: f64,
+) -> f64 {
+    if latest < earliest {
+        return 0.0;
+    }
+
+    let max_from_trades = |trades: &KlineTrades| {
+        trades
+            .trades
+            .values()
+            .map(|group| group.total_qty().to_f64())
+            .filter(|qty| *qty > 0.0 && *qty >= min_qty)
+            .max_by(f64::total_cmp)
+            .unwrap_or_default()
+    };
+
+    match data_source {
+        PlotData::TickBased(tick_aggr) => {
+            let earliest = earliest as usize;
+            let latest = latest as usize;
+
+            tick_aggr
+                .datapoints
+                .iter()
+                .enumerate()
+                .filter(|(index, _)| *index >= earliest && *index <= latest)
+                .map(|(_, dp)| max_from_trades(&dp.footprint))
+                .max_by(f64::total_cmp)
+                .unwrap_or_default()
+        }
+        PlotData::TimeBased(timeseries) => timeseries
+            .datapoints
+            .range(UnixMs::new(earliest)..=UnixMs::new(latest))
+            .map(|(_, dp)| max_from_trades(&dp.footprint))
+            .max_by(f64::total_cmp)
+            .unwrap_or_default(),
+    }
 }
 
 fn render_data_source<F>(

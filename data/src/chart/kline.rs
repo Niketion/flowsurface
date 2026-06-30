@@ -422,6 +422,8 @@ pub struct Config {
     pub show_footprint_summary: bool,
     // Whether to show a small candle next to footprint table clusters.
     pub show_footprint_table_candle: bool,
+    // Optional main-chart order-flow bubbles for regular candlesticks.
+    pub volume_bubbles: VolumeBubbleConfig,
 }
 
 impl Default for Config {
@@ -430,6 +432,84 @@ impl Default for Config {
             data_labels_always_visible: false,
             show_footprint_summary: true,
             show_footprint_table_candle: true,
+            volume_bubbles: VolumeBubbleConfig::default(),
+        }
+    }
+}
+
+#[derive(Debug, Copy, Clone, PartialEq, Deserialize, Serialize)]
+#[serde(default)]
+pub struct VolumeBubbleConfig {
+    pub enabled: bool,
+    pub min_qty: f64,
+    pub max_bubbles_per_bar: usize,
+    pub min_radius_px: f32,
+    pub max_radius_px: f32,
+    pub show_labels: bool,
+    pub color_mode: BubbleColorMode,
+    pub session: VolumeBubbleSession,
+}
+
+impl Default for VolumeBubbleConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            min_qty: 0.0,
+            max_bubbles_per_bar: 3,
+            min_radius_px: 3.0,
+            max_radius_px: 14.0,
+            show_labels: false,
+            color_mode: BubbleColorMode::Delta,
+            session: VolumeBubbleSession::Auto,
+        }
+    }
+}
+
+#[derive(Debug, Copy, Clone, PartialEq, Eq, Default, Deserialize, Serialize)]
+pub enum BubbleColorMode {
+    #[default]
+    Delta,
+    DominantSide,
+}
+
+impl BubbleColorMode {
+    pub const ALL: [BubbleColorMode; 2] = [BubbleColorMode::Delta, BubbleColorMode::DominantSide];
+}
+
+impl std::fmt::Display for BubbleColorMode {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            BubbleColorMode::Delta => write!(f, "Delta"),
+            BubbleColorMode::DominantSide => write!(f, "Dominant side"),
+        }
+    }
+}
+
+#[derive(Debug, Copy, Clone, PartialEq, Eq, Default, Deserialize, Serialize)]
+pub enum VolumeBubbleSession {
+    #[default]
+    Auto,
+    Asian,
+    London,
+    NewYork,
+}
+
+impl VolumeBubbleSession {
+    pub const ALL: [VolumeBubbleSession; 4] = [
+        VolumeBubbleSession::Auto,
+        VolumeBubbleSession::Asian,
+        VolumeBubbleSession::London,
+        VolumeBubbleSession::NewYork,
+    ];
+}
+
+impl std::fmt::Display for VolumeBubbleSession {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            VolumeBubbleSession::Auto => write!(f, "Auto session"),
+            VolumeBubbleSession::Asian => write!(f, "Asian"),
+            VolumeBubbleSession::London => write!(f, "London"),
+            VolumeBubbleSession::NewYork => write!(f, "New York"),
         }
     }
 }

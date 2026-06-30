@@ -249,6 +249,8 @@ impl Dashboard {
                     return (self.refresh_streams(main_window.id), None);
                 }
                 pane::Message::VisualConfigChanged(pane, cfg, to_sync) => {
+                    let mut refresh_streams = false;
+
                     if to_sync {
                         if let Some(state) = self.get_pane(main_window.id, window, pane) {
                             let studies_cfg = state.content.studies();
@@ -288,7 +290,8 @@ impl Dashboard {
 
                                     if should_apply {
                                         state.settings.visual_config = Some(cfg.clone());
-                                        state.content.change_visual_config(cfg.clone());
+                                        refresh_streams |=
+                                            state.content.change_visual_config(cfg.clone());
 
                                         if let Some(studies) = &studies_cfg {
                                             state.content.update_studies(studies.clone());
@@ -306,7 +309,11 @@ impl Dashboard {
                         }
                     } else if let Some(state) = self.get_mut_pane(main_window.id, window, pane) {
                         state.settings.visual_config = Some(cfg.clone());
-                        state.content.change_visual_config(cfg);
+                        refresh_streams = state.content.change_visual_config(cfg);
+                    }
+
+                    if refresh_streams {
+                        return (self.refresh_streams(main_window.id), None);
                     }
                 }
                 pane::Message::SwitchLinkGroup(pane, group) => {

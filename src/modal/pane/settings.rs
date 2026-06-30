@@ -6,7 +6,7 @@ use crate::widget::{classic_slider_row, labeled_slider};
 use crate::{style, tooltip, widget::scrollable_content};
 
 use data::chart::heatmap::HeatmapStudy;
-use data::chart::kline::FootprintStudy;
+use data::chart::kline::{BubbleColorMode, FootprintStudy, VolumeBubbleSession};
 use data::chart::{
     KlineChartKind,
     heatmap::{self, CoalesceKind},
@@ -627,8 +627,188 @@ pub fn kline_cfg_view<'a>(
 
     let content = match kind {
         KlineChartKind::Candles => {
+            let bubbles_cfg = cfg.volume_bubbles;
+            let volume_bubbles_section = {
+                let enabled_checkbox = tooltip(
+                    checkbox(bubbles_cfg.enabled)
+                        .label("Show volume bubbles")
+                        .on_toggle(move |value| {
+                            Message::VisualConfigChanged(
+                                pane,
+                                VisualConfig::Kline(data::chart::kline::Config {
+                                    volume_bubbles: data::chart::kline::VolumeBubbleConfig {
+                                        enabled: value,
+                                        ..bubbles_cfg
+                                    },
+                                    ..cfg
+                                }),
+                                false,
+                            )
+                        }),
+                    Some("Draw order-flow bubbles on the main candlestick chart"),
+                    TooltipPosition::Top,
+                );
+
+                let max_bubbles_slider = slider(
+                    1.0..=10.0,
+                    bubbles_cfg.max_bubbles_per_bar as f32,
+                    move |value| {
+                        Message::VisualConfigChanged(
+                            pane,
+                            VisualConfig::Kline(data::chart::kline::Config {
+                                volume_bubbles: data::chart::kline::VolumeBubbleConfig {
+                                    max_bubbles_per_bar: value as usize,
+                                    ..bubbles_cfg
+                                },
+                                ..cfg
+                            }),
+                            false,
+                        )
+                    },
+                )
+                .step(1.0);
+
+                let min_qty_slider = labeled_slider(
+                    "Min volume",
+                    0.0..=100_000.0,
+                    bubbles_cfg.min_qty,
+                    move |value| {
+                        Message::VisualConfigChanged(
+                            pane,
+                            VisualConfig::Kline(data::chart::kline::Config {
+                                volume_bubbles: data::chart::kline::VolumeBubbleConfig {
+                                    min_qty: value,
+                                    ..bubbles_cfg
+                                },
+                                ..cfg
+                            }),
+                            false,
+                        )
+                    },
+                    |value| format_with_commas(*value),
+                    Some(100.0),
+                );
+
+                let min_radius_slider = labeled_slider(
+                    "Min size",
+                    1.0..=20.0,
+                    bubbles_cfg.min_radius_px,
+                    move |value| {
+                        Message::VisualConfigChanged(
+                            pane,
+                            VisualConfig::Kline(data::chart::kline::Config {
+                                volume_bubbles: data::chart::kline::VolumeBubbleConfig {
+                                    min_radius_px: value,
+                                    ..bubbles_cfg
+                                },
+                                ..cfg
+                            }),
+                            false,
+                        )
+                    },
+                    |value| format!("{value:.0}px"),
+                    Some(1.0),
+                );
+
+                let max_radius_slider = labeled_slider(
+                    "Max size",
+                    4.0..=40.0,
+                    bubbles_cfg.max_radius_px,
+                    move |value| {
+                        Message::VisualConfigChanged(
+                            pane,
+                            VisualConfig::Kline(data::chart::kline::Config {
+                                volume_bubbles: data::chart::kline::VolumeBubbleConfig {
+                                    max_radius_px: value,
+                                    ..bubbles_cfg
+                                },
+                                ..cfg
+                            }),
+                            false,
+                        )
+                    },
+                    |value| format!("{value:.0}px"),
+                    Some(1.0),
+                );
+
+                let labels_checkbox = checkbox(bubbles_cfg.show_labels)
+                    .label("Show bubble labels")
+                    .on_toggle(move |value| {
+                        Message::VisualConfigChanged(
+                            pane,
+                            VisualConfig::Kline(data::chart::kline::Config {
+                                volume_bubbles: data::chart::kline::VolumeBubbleConfig {
+                                    show_labels: value,
+                                    ..bubbles_cfg
+                                },
+                                ..cfg
+                            }),
+                            false,
+                        )
+                    });
+
+                let color_mode_picklist = pick_list(
+                    BubbleColorMode::ALL,
+                    Some(bubbles_cfg.color_mode),
+                    move |value| {
+                        Message::VisualConfigChanged(
+                            pane,
+                            VisualConfig::Kline(data::chart::kline::Config {
+                                volume_bubbles: data::chart::kline::VolumeBubbleConfig {
+                                    color_mode: value,
+                                    ..bubbles_cfg
+                                },
+                                ..cfg
+                            }),
+                            false,
+                        )
+                    },
+                );
+
+                let session_picklist = pick_list(
+                    VolumeBubbleSession::ALL,
+                    Some(bubbles_cfg.session),
+                    move |value| {
+                        Message::VisualConfigChanged(
+                            pane,
+                            VisualConfig::Kline(data::chart::kline::Config {
+                                volume_bubbles: data::chart::kline::VolumeBubbleConfig {
+                                    session: value,
+                                    ..bubbles_cfg
+                                },
+                                ..cfg
+                            }),
+                            false,
+                        )
+                    },
+                );
+
+                column![
+                    text("Volume bubbles").size(crate::style::text_size::SECTION),
+                    enabled_checkbox,
+                    text("Uses fetched trade data when enabled.")
+                        .size(crate::style::text_size::SMALL),
+                    session_picklist,
+                    column![
+                        text(format!(
+                            "Max per candle: {}",
+                            bubbles_cfg.max_bubbles_per_bar
+                        )),
+                        max_bubbles_slider,
+                    ]
+                    .spacing(4),
+                    min_qty_slider,
+                    min_radius_slider,
+                    max_radius_slider,
+                    labels_checkbox,
+                    color_mode_picklist,
+                ]
+                .spacing(8)
+            };
+
             split_column![
                 display_readout_section,
+                volume_bubbles_section,
                 row![
                     space::horizontal(),
                     sync_all_button(pane, VisualConfig::Kline(cfg))
