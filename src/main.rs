@@ -539,8 +539,12 @@ impl Flowsurface {
 
                 match event {
                     exchange::Event::Connected(_streams) => {}
-                    exchange::Event::Disconnected(_streams, reason) => {
+                    exchange::Event::Disconnected(streams, reason) => {
                         log::info!("a stream disconnected from WS: {reason:?}");
+                        log::warn!(
+                            "WS Backfill TODO | reason={reason:?} streams={} action=historical_gap_backfill_not_yet_wired",
+                            streams.len()
+                        );
                     }
                     exchange::Event::DepthReceived(stream, update_t, depth) => {
                         let task = dashboard
@@ -577,6 +581,22 @@ impl Flowsurface {
                 }
             }
             Message::Tick(now) => {
+                // Throttled tick debug logging (once every 2 seconds)
+                static LAST_TICK_LOG: std::sync::Mutex<Option<std::time::Instant>> =
+                    std::sync::Mutex::new(None);
+                if let Ok(mut last) = LAST_TICK_LOG.lock()
+                    && last.is_none_or(|t| t.elapsed() > Duration::from_secs(2))
+                {
+                    let popout_count = self.active_dashboard().popout.len();
+                    log::info!(
+                        "[tick] main={:?}, debug_term={:?}, popouts={}",
+                        self.main_window.id,
+                        self.debug_terminal_window,
+                        popout_count
+                    );
+                    *last = Some(now);
+                }
+
                 let main_window_id = self.main_window.id;
                 let handles = self.handles.clone();
 
@@ -612,6 +632,20 @@ impl Flowsurface {
                     active_windows.push(main_window);
 
                     return window::collect_window_specs(active_windows, Message::ExitRequested);
+                }
+                window::Event::Focused(id) => {
+                    log::info!(
+                        "[window] Focused: id={:?} ({})",
+                        id,
+                        self.debug_window_label(id)
+                    );
+                }
+                window::Event::Unfocused(id) => {
+                    log::info!(
+                        "[window] Unfocused: id={:?} ({})",
+                        id,
+                        self.debug_window_label(id)
+                    );
                 }
             },
             Message::ExitRequested(windows) => {
@@ -1168,7 +1202,7 @@ impl Flowsurface {
             .market_subscriptions(&self.handles)
             .map(Message::MarketWsEvent);
 
-        let tick = iced::window::frames().map(Message::Tick);
+        let tick = iced::time::every(Duration::from_millis(16)).map(Message::Tick);
         let debug_terminal = if self.debug_terminal_enabled || self.debug_terminal_window.is_some()
         {
             iced::time::every(Duration::from_millis(500)).map(|_| Message::DebugTerminalRefresh)
@@ -1194,6 +1228,18 @@ impl Flowsurface {
             debug_terminal,
             hotkeys,
         ])
+    }
+
+    fn debug_window_label(&self, id: window::Id) -> &'static str {
+        if id == self.main_window.id {
+            "main"
+        } else if self.debug_terminal_window == Some(id) {
+            "debug_terminal"
+        } else if self.active_dashboard().popout.contains_key(&id) {
+            "popout"
+        } else {
+            "unknown"
+        }
     }
 
     fn open_debug_terminal(&self) -> Task<Message> {

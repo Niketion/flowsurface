@@ -24,6 +24,8 @@ pub fn default_size() -> Size {
 #[derive(Debug, Clone, Copy)]
 pub enum Event {
     CloseRequested(window::Id),
+    Focused(window::Id),
+    Unfocused(window::Id),
 }
 
 pub fn events() -> Subscription<Event> {
@@ -39,6 +41,8 @@ fn filtered_events(
         iced::Event::Window(iced::window::Event::CloseRequested) => {
             Some(Event::CloseRequested(window))
         }
+        iced::Event::Window(iced::window::Event::Focused) => Some(Event::Focused(window)),
+        iced::Event::Window(iced::window::Event::Unfocused) => Some(Event::Unfocused(window)),
         _ => None,
     }
 }

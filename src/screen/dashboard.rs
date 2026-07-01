@@ -44,6 +44,11 @@ use std::{collections::HashMap, time::Instant, vec};
 pub enum Message {
     Pane(window::Id, pane::Message),
     ChangePaneStatus(uuid::Uuid, pane::Status),
+    FetchCompleted {
+        pane_id: uuid::Uuid,
+        req_id: Option<uuid::Uuid>,
+        fetch: Option<fetcher::FetchRange>,
+    },
     SavePopoutSpecs(HashMap<window::Id, WindowSpec>),
     ErrorOccurred(Option<uuid::Uuid>, DashboardError),
     Notification(Toast),
@@ -426,6 +431,13 @@ impl Dashboard {
                 if let Some(pane_state) = self.get_mut_pane_state_by_uuid(main_window.id, pane_id) {
                     pane_state.status = status;
                 }
+            }
+            Message::FetchCompleted {
+                pane_id,
+                req_id,
+                fetch,
+            } => {
+                self.complete_fetch(main_window.id, pane_id, req_id, fetch);
             }
             Message::DistributeFetchedData {
                 layout_id,
@@ -886,25 +898,47 @@ impl Dashboard {
         stream_type: StreamKind,
     ) -> Task<Message> {
         match data {
-            FetchedData::Trades { batch, until_time } => {
+            FetchedData::Trades {
+                batch,
+                until_time,
+                req_id,
+            } => {
                 let last_trade_time = batch.last().map_or(UnixMs::ZERO, |trade| trade.time);
 
                 if last_trade_time < until_time {
                     if let Err(reason) =
-                        self.insert_fetched_trades(main_window, pane_id, &batch, false)
+                        self.insert_fetched_trades(main_window, pane_id, &batch, false, req_id)
                     {
                         return self.handle_error(Some(pane_id), &reason, main_window);
                     }
                 } else {
+                    let received = batch.len();
+                    let first_received = batch.first().map(|trade| trade.time);
+                    let last_received = batch.last().map(|trade| trade.time);
                     let filtered_batch = batch
                         .iter()
                         .filter(|trade| trade.time <= until_time)
                         .copied()
                         .collect::<Vec<_>>();
+                    let dropped_after_until = received.saturating_sub(filtered_batch.len());
 
-                    if let Err(reason) =
-                        self.insert_fetched_trades(main_window, pane_id, &filtered_batch, true)
-                    {
+                    if dropped_after_until > 0 {
+                        log::debug!(
+                            "DATA Trades Filter | received={received} inserted={} dropped_after_until={dropped_after_until} until_time={} first_received={} last_received={}",
+                            filtered_batch.len(),
+                            fetcher::format_time_short(until_time),
+                            first_received.map_or("-".to_string(), fetcher::format_time_short),
+                            last_received.map_or("-".to_string(), fetcher::format_time_short)
+                        );
+                    }
+
+                    if let Err(reason) = self.insert_fetched_trades(
+                        main_window,
+                        pane_id,
+                        &filtered_batch,
+                        true,
+                        req_id,
+                    ) {
                         return self.handle_error(Some(pane_id), &reason, main_window);
                     }
                 }
@@ -936,12 +970,33 @@ impl Dashboard {
         Task::none()
     }
 
+    fn complete_fetch(
+        &mut self,
+        main_window: window::Id,
+        pane_id: uuid::Uuid,
+        req_id: Option<uuid::Uuid>,
+        fetch: Option<fetcher::FetchRange>,
+    ) {
+        let Some(pane_state) = self.get_mut_pane_state_by_uuid(main_window, pane_id) else {
+            return;
+        };
+
+        if let Some(fetcher::FetchRange::Trades(from, to)) = fetch
+            && let pane::Content::Kline { chart: Some(c), .. } = &mut pane_state.content
+        {
+            c.complete_trade_fetch(req_id, Some(fetcher::FetchRange::Trades(from, to)));
+        }
+
+        pane_state.status = pane::Status::Ready;
+    }
+
     fn insert_fetched_trades(
         &mut self,
         main_window: window::Id,
         pane_id: uuid::Uuid,
         trades: &[Trade],
         is_batches_done: bool,
+        req_id: Option<uuid::Uuid>,
     ) -> Result<(), DashboardError> {
         let pane_state = self
             .get_mut_pane_state_by_uuid(main_window, pane_id)
@@ -966,6 +1021,9 @@ impl Dashboard {
                     c.insert_raw_trades(trades.to_owned(), is_batches_done);
 
                     if is_batches_done {
+                        if let Some(id) = req_id {
+                            c.mark_trade_request_completed(id);
+                        }
                         pane_state.status = pane::Status::Ready;
                     }
                     Ok(())
@@ -1324,9 +1382,11 @@ impl From<fetcher::FetchUpdate> for Message {
                 fetcher::FetchTaskStatus::Loading(info) => {
                     Message::ChangePaneStatus(pane_id, pane::Status::Loading(info))
                 }
-                fetcher::FetchTaskStatus::Completed => {
-                    Message::ChangePaneStatus(pane_id, pane::Status::Ready)
-                }
+                fetcher::FetchTaskStatus::Completed { req_id, fetch } => Message::FetchCompleted {
+                    pane_id,
+                    req_id,
+                    fetch,
+                },
             },
             fetcher::FetchUpdate::Data {
                 layout_id,
