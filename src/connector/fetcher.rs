@@ -7,7 +7,77 @@ use iced::{
 use rustc_hash::FxHashMap;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, Ordering};
+use std::time::Instant;
 use uuid::Uuid;
+
+// ── Human-readable log helpers ──────────────────────────────────────────────
+
+/// Format a ticker symbol for display (e.g., "BTCUSDT")
+pub fn format_symbol(ticker_info: &TickerInfo) -> String {
+    ticker_info
+        .ticker
+        .display_symbol()
+        .unwrap_or(&ticker_info.ticker.to_string())
+        .to_string()
+}
+
+/// Format an exchange venue for display (e.g., "BinanceLinear")
+pub fn format_venue(ticker_info: &TickerInfo) -> String {
+    format!("{:?}", ticker_info.exchange())
+}
+
+/// Format a UnixMs timestamp as HH:MM:SS.mmm
+pub fn format_time_short(ms: UnixMs) -> String {
+    let dt = chrono::DateTime::from_timestamp_millis(ms.as_u64() as i64)
+        .unwrap_or_default()
+        .with_timezone(&chrono::Local);
+    dt.format("%H:%M:%S%.3f").to_string()
+}
+
+/// Format a time range as HH:MM:SS.mmm → HH:MM:SS.mmm
+pub fn format_time_range(from: UnixMs, to: UnixMs) -> String {
+    format!("{} → {}", format_time_short(from), format_time_short(to))
+}
+
+/// Format a duration in milliseconds as human-readable (e.g., "3.7s" or "625ms")
+pub fn format_duration_ms(ms: u64) -> String {
+    if ms >= 1000 {
+        format!("{:.1}s", ms as f64 / 1000.0)
+    } else {
+        format!("{ms}ms")
+    }
+}
+
+/// Shorten a UUID to first 8 characters
+pub fn short_id(id: Uuid) -> String {
+    let s = id.to_string();
+    s[..8.min(s.len())].to_string()
+}
+
+/// Format a FetchRange as a human-readable string
+pub fn format_fetch_range(fetch: &FetchRange) -> String {
+    match fetch {
+        FetchRange::Kline(from, to) => {
+            format!("Kline {}", format_time_range(*from, *to))
+        }
+        FetchRange::OpenInterest(from, to) => {
+            format!("OI {}", format_time_range(*from, *to))
+        }
+        FetchRange::Trades(from, to) => {
+            format!("Trades {}", format_time_range(*from, *to))
+        }
+    }
+}
+
+/// Check if a trade range is fully contained within another
+fn trades_contained(
+    inner_from: UnixMs,
+    inner_to: UnixMs,
+    outer_from: UnixMs,
+    outer_to: UnixMs,
+) -> bool {
+    inner_from >= outer_from && inner_to <= outer_to
+}
 
 static TRADE_FETCH_ENABLED: AtomicBool = AtomicBool::new(false);
 
@@ -68,20 +138,71 @@ impl RequestHandler {
             }
         }) {
             return match &existing_req.status {
-                RequestStatus::Failed(error_msg) => Err(ReqError::Failed(error_msg.clone())),
+                RequestStatus::Failed(error_msg) => {
+                    log::warn!(
+                        "CACHE Failed | {} req={} prev_error={}",
+                        format_fetch_range(&fetch),
+                        short_id(existing_id),
+                        error_msg
+                    );
+                    Err(ReqError::Failed(error_msg.clone()))
+                }
                 RequestStatus::Completed(ts) => {
-                    // retry completed requests after a cooldown
-                    // to handle data source failures or outdated results gracefully
                     if chrono::Utc::now().timestamp_millis() as u64 - ts > 30_000 {
+                        log::info!(
+                            "CACHE Expired | {} req={} retrying",
+                            format_fetch_range(&fetch),
+                            short_id(existing_id)
+                        );
                         Ok(Some(existing_id))
                     } else {
+                        log::debug!(
+                            "CACHE Hit | {} req={} skipping (cooldown)",
+                            format_fetch_range(&fetch),
+                            short_id(existing_id)
+                        );
                         Ok(None)
                     }
                 }
-                RequestStatus::Pending => Err(ReqError::Overlaps),
+                RequestStatus::Pending => {
+                    match &fetch {
+                        FetchRange::Trades(new_from, new_to) => {
+                            if let FetchRange::Trades(exist_from, exist_to) =
+                                existing_req.fetch_type
+                            {
+                                if trades_contained(*new_from, *new_to, exist_from, exist_to) {
+                                    log::debug!(
+                                        "CACHE Duplicate | Trades {} contained in pending req={}",
+                                        format_time_range(*new_from, *new_to),
+                                        short_id(existing_id)
+                                    );
+                                } else {
+                                    log::debug!(
+                                        "CACHE Overlap | Trades {} overlaps pending req={}",
+                                        format_time_range(*new_from, *new_to),
+                                        short_id(existing_id)
+                                    );
+                                }
+                            }
+                        }
+                        _ => {
+                            log::debug!(
+                                "CACHE Pending | {} req={} already in flight",
+                                format_fetch_range(&fetch),
+                                short_id(existing_id)
+                            );
+                        }
+                    }
+                    Err(ReqError::Overlaps)
+                }
             };
         }
 
+        log::info!(
+            "FETCH Queued | {} req={}",
+            format_fetch_range(&fetch),
+            short_id(id)
+        );
         self.requests.insert(id, request);
         Ok(Some(id))
     }
@@ -90,16 +211,18 @@ impl RequestHandler {
         if let Some(request) = self.requests.get_mut(&id) {
             let timestamp = chrono::Utc::now().timestamp_millis() as u64;
             request.status = RequestStatus::Completed(timestamp);
+            log::debug!("FETCH Completed | req={}", short_id(id));
         } else {
-            log::warn!("Request not found: {:?}", id);
+            log::warn!("FETCH NotFound | req={}", short_id(id));
         }
     }
 
     pub fn mark_failed(&mut self, id: Uuid, error: String) {
         if let Some(request) = self.requests.get_mut(&id) {
+            log::warn!("FETCH Failed | req={} error={}", short_id(id), error);
             request.status = RequestStatus::Failed(error);
         } else {
-            log::warn!("Request not found: {:?}", id);
+            log::warn!("FETCH NotFound | req={}", short_id(id));
         }
     }
 }
@@ -131,6 +254,7 @@ impl FetchRequest {
             (FetchRange::OpenInterest(s1, e1), FetchRange::OpenInterest(s2, e2)) => {
                 e1 == e2 && s1 == s2
             }
+            (FetchRange::Trades(s1, e1), FetchRange::Trades(s2, e2)) => e1 == e2 && s1 == s2,
             _ => false,
         }
     }
@@ -213,6 +337,14 @@ pub fn request_fetch(
     stream: Option<StreamKind>,
     on_trade_handle: &mut impl FnMut(Handle),
 ) -> Task<FetchUpdate> {
+    log::debug!(
+        "FETCH Dispatch | {} req={} pane={} streams={}",
+        format_fetch_range(&fetch),
+        short_id(req_id),
+        short_id(pane_id),
+        ready_streams.len()
+    );
+
     match fetch {
         FetchRange::Kline(from, to) => {
             let kline_stream = if let Some(s) = stream {
@@ -228,6 +360,12 @@ pub fn request_fetch(
             };
 
             if let Some((stream, pane_uid)) = kline_stream {
+                log::info!(
+                    "KLINE Start | pane={} req={} stream={stream:?} range={}",
+                    short_id(pane_uid),
+                    short_id(req_id),
+                    format_time_range(from, to)
+                );
                 return kline_fetch_task(
                     handles.clone(),
                     layout_id,
@@ -237,6 +375,12 @@ pub fn request_fetch(
                     Some((from, to)),
                 );
             }
+
+            log::debug!(
+                "KLINE Skip | pane={} req={} reason=no_kline_stream",
+                short_id(pane_id),
+                short_id(req_id)
+            );
         }
         FetchRange::OpenInterest(from, to) => {
             let kline_stream = if let Some(s) = stream {
@@ -252,6 +396,12 @@ pub fn request_fetch(
             };
 
             if let Some((stream, pane_uid)) = kline_stream {
+                log::info!(
+                    "OI Start | pane={} req={} stream={stream:?} range={}",
+                    short_id(pane_uid),
+                    short_id(req_id),
+                    format_time_range(from, to)
+                );
                 return oi_fetch_task(
                     handles.clone(),
                     layout_id,
@@ -261,6 +411,12 @@ pub fn request_fetch(
                     Some((from, to)),
                 );
             }
+
+            log::debug!(
+                "OI Skip | pane={} req={} reason=no_kline_stream",
+                short_id(pane_id),
+                short_id(req_id)
+            );
         }
         FetchRange::Trades(from_time, to_time) => {
             let trade_info = ready_streams.iter().find_map(|stream| {
@@ -279,6 +435,15 @@ pub fn request_fetch(
 
                 if is_binance {
                     let data_path = data::data_path(Some("market_data/binance/"));
+                    log::info!(
+                        "TRADE Start | {} {} {} req={} pane={} path={}",
+                        format_venue(&ticker_info),
+                        format_symbol(&ticker_info),
+                        format_time_range(from_time, to_time),
+                        short_id(req_id),
+                        short_id(pane_id),
+                        data_path.display()
+                    );
 
                     let (task, handle) = Task::sip(
                         fetch_trades_batched(
@@ -289,6 +454,13 @@ pub fn request_fetch(
                             data_path,
                         ),
                         move |batch| {
+                            log::debug!(
+                                "TRADE Batch | {} {} trades={} req={}",
+                                format_venue(&ticker_info),
+                                format_symbol(&ticker_info),
+                                batch.len(),
+                                short_id(req_id)
+                            );
                             let data = FetchedData::Trades {
                                 batch,
                                 until_time: to_time,
@@ -302,12 +474,25 @@ pub fn request_fetch(
                             }
                         },
                         move |result| match result {
-                            Ok(()) => FetchUpdate::Status {
-                                pane_id,
-                                status: FetchTaskStatus::Completed,
-                            },
+                            Ok(()) => {
+                                log::info!(
+                                    "TRADE Done | {} {} req={}",
+                                    format_venue(&ticker_info),
+                                    format_symbol(&ticker_info),
+                                    short_id(req_id)
+                                );
+                                FetchUpdate::Status {
+                                    pane_id,
+                                    status: FetchTaskStatus::Completed,
+                                }
+                            }
                             Err(err) => {
-                                log::error!("Trade fetch failed: {err}");
+                                log::error!(
+                                    "TRADE Failed | {} {} req={} error={err}",
+                                    format_venue(&ticker_info),
+                                    format_symbol(&ticker_info),
+                                    short_id(req_id)
+                                );
                                 FetchUpdate::Error {
                                     pane_id,
                                     error: err.ui_message(),
@@ -320,7 +505,20 @@ pub fn request_fetch(
                     on_trade_handle(handle.abort_on_drop());
 
                     return task;
+                } else {
+                    log::debug!(
+                        "TRADE Skip | {} {} req={} reason=unsupported_exchange",
+                        format_venue(&ticker_info),
+                        format_symbol(&ticker_info),
+                        short_id(req_id)
+                    );
                 }
+            } else {
+                log::debug!(
+                    "TRADE Skip | pane={} req={} reason=no_trade_stream",
+                    short_id(pane_id),
+                    short_id(req_id)
+                );
             }
         }
     }
@@ -373,16 +571,40 @@ pub fn oi_fetch_task(
             timeframe,
         } => {
             let fetch = async move {
-                handles
+                let started = Instant::now();
+                log::info!(
+                    "OI Request | pane={} req={:?} venue={:?} symbol={:?} tf={timeframe:?} range={range:?}",
+                    short_id(pane_id),
+                    req_id.map(short_id),
+                    ticker_info.exchange(),
+                    ticker_info.ticker
+                );
+
+                let result = handles
                     .fetch_open_interest(ticker_info, timeframe, range)
-                    .await
+                    .await;
+
+                match &result {
+                    Ok(oi) => log::info!(
+                        "OI Done | pane={} req={:?} records={} duration={}",
+                        short_id(pane_id),
+                        req_id.map(short_id),
+                        oi.len(),
+                        format_duration_ms(started.elapsed().as_millis() as u64)
+                    ),
+                    Err(err) => log::error!(
+                        "OI Error | pane={} req={:?} duration={} error={err}",
+                        short_id(pane_id),
+                        req_id.map(short_id),
+                        format_duration_ms(started.elapsed().as_millis() as u64)
+                    ),
+                }
+
+                result
             };
 
             Task::perform(
-                iced::futures::TryFutureExt::map_err(fetch, |err| {
-                    log::error!("Open interest fetch failed: {err}");
-                    err.ui_message()
-                }),
+                iced::futures::TryFutureExt::map_err(fetch, |err| err.ui_message()),
                 move |result| match result {
                     Ok(oi) => {
                         let data = FetchedData::OI { data: oi, req_id };
@@ -400,7 +622,12 @@ pub fn oi_fetch_task(
                 },
             )
         }
-        _ => Task::none(),
+        _ => {
+            log::debug!(
+                "Open interest fetch skipped: pane_id={pane_id}, req_id={req_id:?}, stream={stream:?}, reason=not_kline_stream"
+            );
+            Task::none()
+        }
     };
 
     update_status.chain(fetch_task)
@@ -424,13 +651,39 @@ pub fn kline_fetch_task(
             ticker_info,
             timeframe,
         } => {
-            let fetch = async move { handles.fetch_klines(ticker_info, timeframe, range).await };
+            let fetch = async move {
+                let started = Instant::now();
+                log::info!(
+                    "KLINE Request | pane={} req={:?} venue={:?} symbol={:?} tf={timeframe:?} range={range:?}",
+                    short_id(pane_id),
+                    req_id.map(short_id),
+                    ticker_info.exchange(),
+                    ticker_info.ticker
+                );
+
+                let result = handles.fetch_klines(ticker_info, timeframe, range).await;
+
+                match &result {
+                    Ok(klines) => log::info!(
+                        "KLINE Done | pane={} req={:?} records={} duration={}",
+                        short_id(pane_id),
+                        req_id.map(short_id),
+                        klines.len(),
+                        format_duration_ms(started.elapsed().as_millis() as u64)
+                    ),
+                    Err(err) => log::error!(
+                        "KLINE Error | pane={} req={:?} duration={} error={err}",
+                        short_id(pane_id),
+                        req_id.map(short_id),
+                        format_duration_ms(started.elapsed().as_millis() as u64)
+                    ),
+                }
+
+                result
+            };
 
             Task::perform(
-                iced::futures::TryFutureExt::map_err(fetch, |err| {
-                    log::error!("Kline fetch failed: {err}");
-                    err.ui_message()
-                }),
+                iced::futures::TryFutureExt::map_err(fetch, |err| err.ui_message()),
                 move |result| match result {
                     Ok(klines) => {
                         let data = FetchedData::Klines {
@@ -451,7 +704,14 @@ pub fn kline_fetch_task(
                 },
             )
         }
-        _ => Task::none(),
+        _ => {
+            log::debug!(
+                "KLINE Skip | pane={} req={:?} reason=not_kline_stream",
+                short_id(pane_id),
+                req_id.map(short_id)
+            );
+            Task::none()
+        }
     };
 
     update_status.chain(fetch_task)
@@ -464,26 +724,83 @@ pub fn fetch_trades_batched(
     to_time: UnixMs,
     data_path: PathBuf,
 ) -> impl Straw<(), Vec<Trade>, AdapterError> {
+    let venue = format_venue(&ticker_info);
+    let symbol = format_symbol(&ticker_info);
+
     sipper(async move |mut progress| {
         let mut latest_trade_t = from_time;
+        let started = Instant::now();
+        let mut total_trades = 0usize;
+        let mut request_count = 0usize;
+        let mut last_progress_log = Instant::now();
+
+        log::info!(
+            "TRADE Worker | {venue} {symbol} range={} path={}",
+            format_time_range(from_time, to_time),
+            data_path.display()
+        );
 
         while latest_trade_t < to_time {
+            request_count += 1;
+            let request_started = Instant::now();
+            log::debug!(
+                "TRADE Request | {venue} {symbol} #{request_count} from={}",
+                format_time_short(latest_trade_t)
+            );
+
             match handles
                 .fetch_trades(ticker_info, latest_trade_t, Some(data_path.clone()))
                 .await
             {
                 Ok(batch) => {
+                    let elapsed = request_started.elapsed().as_millis() as u64;
+                    log::debug!(
+                        "TRADE Response | {venue} {symbol} #{request_count} trades={} duration={}",
+                        batch.len(),
+                        format_duration_ms(elapsed)
+                    );
+
                     if batch.is_empty() {
+                        log::info!(
+                            "TRADE Stop | {venue} {symbol} reason=empty_batch requests={request_count} trades={total_trades} total_duration={}",
+                            format_duration_ms(started.elapsed().as_millis() as u64)
+                        );
                         break;
                     }
 
                     latest_trade_t = batch.last().map_or(latest_trade_t, |trade| trade.time);
+                    total_trades += batch.len();
+
+                    // Progress log every 5 seconds or every 10 requests
+                    if last_progress_log.elapsed().as_secs() >= 5
+                        || request_count.is_multiple_of(10)
+                    {
+                        log::info!(
+                            "TRADE Progress | {venue} {symbol} #{request_count} trades={total_trades} latest={} elapsed={}",
+                            format_time_short(latest_trade_t),
+                            format_duration_ms(started.elapsed().as_millis() as u64)
+                        );
+                        last_progress_log = Instant::now();
+                    }
 
                     let () = progress.send(batch).await;
                 }
-                Err(err) => return Err(err),
+                Err(err) => {
+                    log::error!(
+                        "TRADE Error | {venue} {symbol} #{request_count} from={} duration={} error={err}",
+                        format_time_short(latest_trade_t),
+                        format_duration_ms(request_started.elapsed().as_millis() as u64)
+                    );
+                    return Err(err);
+                }
             }
         }
+
+        log::info!(
+            "TRADE Worker Done | {venue} {symbol} range={} requests={request_count} trades={total_trades} duration={}",
+            format_time_range(from_time, to_time),
+            format_duration_ms(started.elapsed().as_millis() as u64)
+        );
 
         Ok(())
     })

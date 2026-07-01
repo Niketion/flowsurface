@@ -1,15 +1,20 @@
 use std::{
     backtrace::Backtrace,
+    collections::VecDeque,
     fs,
     io::{self, Write},
     panic::PanicHookInfo,
     path::PathBuf,
     process,
-    sync::{Once, mpsc},
+    sync::{Mutex, Once, mpsc},
     thread::{self, JoinHandle},
 };
 
 const MAX_LOG_FILE_SIZE: u64 = 50 * 1024 * 1024; // 50 MB
+const MAX_DEBUG_LINES: usize = 2_000;
+
+static DEBUG_LOGS: Mutex<VecDeque<String>> = Mutex::new(VecDeque::new());
+static DEBUG_PENDING_LINE: Mutex<String> = Mutex::new(String::new());
 
 enum LogMessage {
     Content(Vec<u8>),
@@ -32,14 +37,7 @@ pub fn setup(is_debug: bool) -> Result<(), data::log::Error> {
         .unwrap_or(default_level)
         .to_level_filter();
 
-    let mut io_sink = fern::Dispatch::new().format(|out, message, record| {
-        out.finish(format_args!(
-            "{}:{} -- {}",
-            chrono::Local::now().format("%H:%M:%S%.3f"),
-            record.level(),
-            message
-        ));
-    });
+    let mut io_sink = fern::Dispatch::new();
 
     if is_debug {
         io_sink = io_sink.chain(std::io::stdout());
@@ -53,6 +51,23 @@ pub fn setup(is_debug: bool) -> Result<(), data::log::Error> {
     }
 
     fern::Dispatch::new()
+        .format(|out, message, record| {
+            let timestamp = chrono::Local::now().format("%Y-%m-%d %H:%M:%S%.3f");
+            let prefix = format!(
+                "[{}] [{:<5}] [{}]",
+                timestamp,
+                record.level(),
+                record.target()
+            );
+            let message = message.to_string();
+            let formatted = message
+                .lines()
+                .map(|line| format!("{prefix} {line}"))
+                .collect::<Vec<_>>()
+                .join("\n");
+
+            out.finish(format_args!("{formatted}"));
+        })
         .level(log::LevelFilter::Off)
         .level_for("panic", log::LevelFilter::Error)
         .level_for("iced_wgpu", log::LevelFilter::Info)
@@ -60,9 +75,90 @@ pub fn setup(is_debug: bool) -> Result<(), data::log::Error> {
         .level_for("flowsurface_data", level_filter)
         .level_for("flowsurface", level_filter)
         .chain(io_sink)
+        .chain(Box::new(DebugTerminalLogger) as Box<dyn Write + Send>)
         .apply()?;
 
     Ok(())
+}
+
+pub fn debug_terminal_snapshot() -> Vec<String> {
+    DEBUG_LOGS
+        .lock()
+        .map(|lines| lines.iter().cloned().collect())
+        .unwrap_or_default()
+}
+
+pub fn clear_debug_terminal() {
+    if let Ok(mut lines) = DEBUG_LOGS.lock() {
+        lines.clear();
+    }
+
+    if let Ok(mut pending) = DEBUG_PENDING_LINE.lock() {
+        pending.clear();
+    }
+}
+
+fn push_debug_line(line: String) {
+    if line.trim().is_empty() {
+        return;
+    }
+
+    if let Ok(mut lines) = DEBUG_LOGS.lock() {
+        if lines.len() >= MAX_DEBUG_LINES {
+            lines.pop_front();
+        }
+
+        lines.push_back(line);
+    }
+}
+
+struct DebugTerminalLogger;
+
+impl Write for DebugTerminalLogger {
+    fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
+        let len = buf.len();
+        let content = String::from_utf8_lossy(buf);
+        let mut completed = Vec::new();
+
+        if let Ok(mut pending) = DEBUG_PENDING_LINE.lock() {
+            pending.push_str(&content);
+
+            while let Some(newline_index) = pending.find('\n') {
+                let mut line = pending.drain(..=newline_index).collect::<String>();
+                if line.ends_with('\n') {
+                    line.pop();
+                }
+                if line.ends_with('\r') {
+                    line.pop();
+                }
+
+                completed.push(line);
+            }
+        }
+
+        for line in completed {
+            push_debug_line(line);
+        }
+
+        Ok(len)
+    }
+
+    fn flush(&mut self) -> io::Result<()> {
+        let pending = DEBUG_PENDING_LINE.lock().ok().and_then(|mut pending| {
+            if pending.trim().is_empty() {
+                pending.clear();
+                None
+            } else {
+                Some(std::mem::take(&mut *pending))
+            }
+        });
+
+        if let Some(line) = pending {
+            push_debug_line(line);
+        }
+
+        Ok(())
+    }
 }
 
 fn initial_rotation(log_path: &PathBuf) -> io::Result<()> {

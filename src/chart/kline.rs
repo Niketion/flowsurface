@@ -379,6 +379,13 @@ impl KlineChart {
                     let earliest = latest.saturating_sub(450 * timeframe_ms);
 
                     let range = FetchRange::Kline(UnixMs::new(earliest), UnixMs::new(latest));
+                    log::info!(
+                        "CHART Initial | reason=empty_data range={}",
+                        crate::connector::fetcher::format_time_range(
+                            UnixMs::new(earliest),
+                            UnixMs::new(latest)
+                        )
+                    );
                     if let Some(action) = request_fetch(&mut self.request_handler, range) {
                         return Some(action);
                     }
@@ -394,50 +401,82 @@ impl KlineChart {
                 // priority 1, initial klines for visible range
                 if visible_earliest_ms < kline_earliest {
                     let range = FetchRange::Kline(UnixMs::new(prefetch_earliest), kline_earliest);
-
                     if let Some(action) = request_fetch(&mut self.request_handler, range) {
                         return Some(action);
                     }
                 }
 
                 // priority 2, trades
-                if matches!(self.kind, KlineChartKind::Footprint { .. })
-                    && !self.fetching_trades.0
-                    && is_trade_fetch_enabled()
-                    && let Some((fetch_from, fetch_to)) =
-                        timeseries.suggest_trade_fetch_range(visible_earliest_ms, visible_latest_ms)
-                {
-                    let range = FetchRange::Trades(fetch_from, fetch_to);
-                    if let Some(action) = request_fetch(&mut self.request_handler, range) {
-                        self.fetching_trades = (true, None);
-                        return Some(action);
-                    }
-                }
-
-                if matches!(self.kind, KlineChartKind::Candles)
-                    && self.visual_config.volume_bubbles.enabled
-                    && !self.fetching_trades.0
-                {
-                    // Candlestick Volume Bubbles intentionally fetch only current-session trades.
-                    // This avoids expensive historical trade downloads when the visible range spans
-                    // older candles that are not useful for the active order-flow overlay.
-                    let session_start = current_volume_bubble_session_start_ms(
-                        chrono::Utc::now(),
-                        self.visual_config.volume_bubbles.session,
-                    );
-                    let request_earliest = visible_earliest_ms.max(session_start);
-
-                    if visible_latest_ms > session_start
-                        && let Some((fetch_from, fetch_to)) = timeseries
-                            .suggest_trade_fetch_range(request_earliest, visible_latest_ms)
-                    {
-                        let fetch_from = fetch_from.max(session_start);
-                        if fetch_to > fetch_from {
+                if matches!(self.kind, KlineChartKind::Footprint { .. }) {
+                    if !self.fetching_trades.0 && is_trade_fetch_enabled() {
+                        if let Some((fetch_from, fetch_to)) = timeseries
+                            .suggest_trade_fetch_range(visible_earliest_ms, visible_latest_ms)
+                        {
+                            log::info!(
+                                "CHART Footprint | action=fetch_trades reason=missing_range range={}",
+                                crate::connector::fetcher::format_time_range(fetch_from, fetch_to)
+                            );
                             let range = FetchRange::Trades(fetch_from, fetch_to);
                             if let Some(action) = request_fetch(&mut self.request_handler, range) {
                                 self.fetching_trades = (true, None);
                                 return Some(action);
                             }
+                        } else {
+                            log::debug!("CHART Footprint | action=skip reason=no_missing_trades");
+                        }
+                    } else if !is_trade_fetch_enabled() {
+                        log::debug!("CHART Footprint | action=skip reason=trade_fetch_disabled");
+                    } else {
+                        log::debug!("CHART Footprint | action=skip reason=already_fetching");
+                    }
+                }
+
+                if matches!(self.kind, KlineChartKind::Candles)
+                    && self.visual_config.volume_bubbles.enabled
+                {
+                    if self.fetching_trades.0 {
+                        log::debug!("CHART Bubbles | action=skip reason=already_fetching");
+                    } else {
+                        let session = self.visual_config.volume_bubbles.session;
+                        let session_start =
+                            current_volume_bubble_session_start_ms(chrono::Utc::now(), session);
+                        let request_earliest = visible_earliest_ms.max(session_start);
+
+                        if visible_latest_ms <= session_start {
+                            log::debug!(
+                                "CHART Bubbles | action=skip reason=visible_before_session session={:?}",
+                                session
+                            );
+                        } else if let Some((fetch_from, fetch_to)) = timeseries
+                            .suggest_trade_fetch_range(request_earliest, visible_latest_ms)
+                        {
+                            let fetch_from = fetch_from.max(session_start);
+                            if fetch_to > fetch_from {
+                                log::info!(
+                                    "CHART Bubbles | action=fetch_trades session={:?} range={}",
+                                    session,
+                                    crate::connector::fetcher::format_time_range(
+                                        fetch_from, fetch_to
+                                    )
+                                );
+                                let range = FetchRange::Trades(fetch_from, fetch_to);
+                                if let Some(action) =
+                                    request_fetch(&mut self.request_handler, range)
+                                {
+                                    self.fetching_trades = (true, None);
+                                    return Some(action);
+                                }
+                            } else {
+                                log::debug!(
+                                    "CHART Bubbles | action=skip reason=fetch_range_empty session={:?}",
+                                    session
+                                );
+                            }
+                        } else {
+                            log::debug!(
+                                "CHART Bubbles | action=skip reason=no_missing_trades session={:?}",
+                                session
+                            );
                         }
                     }
                 }
@@ -492,6 +531,7 @@ impl KlineChart {
     }
 
     pub fn reset_request_handler(&mut self) {
+        log::info!("CHART Reset | reason=settings_changed");
         self.request_handler = RequestHandler::default();
         self.fetching_trades = (false, None);
     }
@@ -565,11 +605,22 @@ impl KlineChart {
     }
 
     pub fn set_visual_config(&mut self, visual_config: Config) {
+        let old_session = self.visual_config.volume_bubbles.session;
+        let old_enabled = self.visual_config.volume_bubbles.enabled;
+        let new_session = visual_config.volume_bubbles.session;
+        let new_enabled = visual_config.volume_bubbles.enabled;
+
         let should_refetch_volume_bubbles = matches!(self.kind, KlineChartKind::Candles)
-            && visual_config.volume_bubbles.enabled
-            && (!self.visual_config.volume_bubbles.enabled
-                || self.visual_config.volume_bubbles.session
-                    != visual_config.volume_bubbles.session);
+            && new_enabled
+            && (!old_enabled || old_session != new_session);
+
+        if should_refetch_volume_bubbles {
+            log::info!(
+                "CHART Settings | bubbles old={:?}→{:?} enabled={old_enabled}→{new_enabled} reason=session_changed",
+                old_session,
+                new_session
+            );
+        }
 
         self.visual_config = visual_config;
         self.chart.cache.clear_all();
@@ -721,6 +772,23 @@ impl KlineChart {
     }
 
     pub fn insert_raw_trades(&mut self, raw_trades: Vec<Trade>, is_batches_done: bool) {
+        let batch_size = raw_trades.len();
+        let total_after = self.raw_trades.len() + batch_size;
+        let earliest = raw_trades.first().map(|t| t.time);
+        let latest = raw_trades.last().map(|t| t.time);
+
+        log::debug!(
+            "DATA Trades | batch={batch_size} total={total_after} done={is_batches_done} earliest={} latest={}",
+            earliest.map_or(
+                "-".to_string(),
+                crate::connector::fetcher::format_time_short
+            ),
+            latest.map_or(
+                "-".to_string(),
+                crate::connector::fetcher::format_time_short
+            )
+        );
+
         match self.data_source {
             PlotData::TickBased(ref mut tick_aggr) => {
                 tick_aggr.insert_trades(&raw_trades);
@@ -739,12 +807,33 @@ impl KlineChart {
 
         if is_batches_done {
             self.fetching_trades = (false, None);
+            log::info!(
+                "DATA Trades Done | total_raw={} final_batch={batch_size}",
+                self.raw_trades.len()
+            );
         }
 
         self.invalidate(None);
     }
 
     pub fn insert_hist_klines(&mut self, req_id: uuid::Uuid, klines_raw: &[Kline]) {
+        let count = klines_raw.len();
+        let earliest = klines_raw.first().map(|k| k.time);
+        let latest = klines_raw.last().map(|k| k.time);
+
+        log::info!(
+            "DATA Klines | req={} records={count} earliest={} latest={}",
+            crate::connector::fetcher::short_id(req_id),
+            earliest.map_or(
+                "-".to_string(),
+                crate::connector::fetcher::format_time_short
+            ),
+            latest.map_or(
+                "-".to_string(),
+                crate::connector::fetcher::format_time_short
+            )
+        );
+
         match self.data_source {
             PlotData::TimeBased(ref mut timeseries) => {
                 timeseries.insert_klines(klines_raw);

@@ -31,6 +31,7 @@ pub struct SavedState {
     pub audio_cfg: data::AudioStream,
     pub volume_size_unit: exchange::SizeUnit,
     pub proxy_cfg: Option<exchange::proxy::Proxy>,
+    pub debug_terminal_enabled: bool,
 }
 
 impl SavedState {
@@ -60,6 +61,7 @@ impl Default for SavedState {
             audio_cfg: data::AudioStream::default(),
             volume_size_unit: exchange::SizeUnit::Base,
             proxy_cfg: None,
+            debug_terminal_enabled: false,
         }
     }
 }
@@ -390,6 +392,7 @@ pub fn load_saved_state() -> SavedState {
                 audio_cfg: state.audio_cfg,
                 volume_size_unit: state.size_in_quote_ccy,
                 proxy_cfg,
+                debug_terminal_enabled: state.debug_terminal_enabled,
             }
         }
         Err(e) => {
