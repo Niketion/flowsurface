@@ -452,6 +452,10 @@ impl KlineChart {
                 if matches!(self.kind, KlineChartKind::Candles)
                     && self.visual_config.volume_bubbles.enabled
                 {
+                    /// Maximum single-shot trade range for Bubbles to avoid
+                    /// hitting exchange rate limits with multi-hour fetches.
+                    const MAX_BUBBLE_FETCH_RANGE_MS: u64 = 15 * 60 * 1_000; // 15 min
+
                     if self.fetching_trades.0 {
                         log::debug!("CHART Bubbles | action=skip reason=already_fetching");
                     } else {
@@ -473,13 +477,43 @@ impl KlineChart {
                                 if let Some((fetch_from, fetch_to)) =
                                     self.subtract_covered_trade_ranges(fetch_from, fetch_to)
                                 {
-                                    log::info!(
-                                        "CHART Bubbles | action=fetch_trades session={:?} range={}",
-                                        session,
-                                        crate::connector::fetcher::format_time_range(
-                                            fetch_from, fetch_to
-                                        )
-                                    );
+                                    // Cap to the most recent portion to avoid
+                                    // huge single-shot Binance aggTrades fetches.
+                                    let range_ms =
+                                        fetch_to.as_u64().saturating_sub(fetch_from.as_u64());
+                                    let (fetch_from, fetch_to, was_capped) = if range_ms
+                                        > MAX_BUBBLE_FETCH_RANGE_MS
+                                    {
+                                        let capped_from = UnixMs::new(
+                                            fetch_to
+                                                .as_u64()
+                                                .saturating_sub(MAX_BUBBLE_FETCH_RANGE_MS),
+                                        );
+                                        log::info!(
+                                            "CHART Bubbles | action=range_capped \
+                                             original={orig} capped={capped} session={session:?}",
+                                            orig = crate::connector::fetcher::format_time_range(
+                                                fetch_from, fetch_to
+                                            ),
+                                            capped = crate::connector::fetcher::format_time_range(
+                                                capped_from,
+                                                fetch_to
+                                            ),
+                                        );
+                                        (capped_from, fetch_to, true)
+                                    } else {
+                                        (fetch_from, fetch_to, false)
+                                    };
+
+                                    if !was_capped {
+                                        log::info!(
+                                            "CHART Bubbles | action=fetch_trades session={:?} range={}",
+                                            session,
+                                            crate::connector::fetcher::format_time_range(
+                                                fetch_from, fetch_to
+                                            )
+                                        );
+                                    }
                                     let range = FetchRange::Trades(fetch_from, fetch_to);
                                     if let Some(action) =
                                         request_fetch(&mut self.request_handler, range)

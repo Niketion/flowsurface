@@ -71,6 +71,10 @@ pub struct Dashboard {
     /// Last live timestamp received per stream (trades & klines only).
     /// Used for historical gap backfill after WS disconnects.
     last_live_t: HashMap<StreamKind, UnixMs>,
+    /// Tracks recently-queued backfill ranges to prevent duplicate fetches
+    /// on repeated disconnects. Key is `(stream, from_ms, to_ms)`, value is
+    /// the `Instant` when the entry was inserted so stale entries can expire.
+    pending_backfills: HashMap<(StreamKind, u64, u64), std::time::Instant>,
 }
 
 impl Default for Dashboard {
@@ -82,6 +86,7 @@ impl Default for Dashboard {
             popout: HashMap::new(),
             layout_id: uuid::Uuid::new_v4(),
             last_live_t: HashMap::new(),
+            pending_backfills: HashMap::new(),
         }
     }
 }
@@ -150,6 +155,7 @@ impl Dashboard {
             popout,
             layout_id,
             last_live_t: HashMap::new(),
+            pending_backfills: HashMap::new(),
         }
     }
 
@@ -1051,7 +1057,17 @@ impl Dashboard {
         main_window: window::Id,
     ) -> Task<Message> {
         // Track last live timestamp for backfill on disconnect.
-        self.last_live_t.insert(*stream, kline.time);
+        if self
+            .last_live_t
+            .get(stream)
+            .is_none_or(|&prev| kline.time > prev)
+        {
+            self.last_live_t.insert(*stream, kline.time);
+            log::trace!(
+                "WS Backfill Track | stream={stream:?} last_seen={}",
+                fetcher::format_time_short(kline.time),
+            );
+        }
 
         let mut found_match = false;
 
@@ -1131,7 +1147,17 @@ impl Dashboard {
     ) -> Task<Message> {
         // Track last live timestamp for backfill on disconnect.
         let last_trade_t = buffer.last().map_or(update_t, |t| t.time);
-        self.last_live_t.insert(*stream, last_trade_t);
+        if self
+            .last_live_t
+            .get(stream)
+            .is_none_or(|&prev| last_trade_t > prev)
+        {
+            self.last_live_t.insert(*stream, last_trade_t);
+            log::trace!(
+                "WS Backfill Track | stream={stream:?} last_seen={}",
+                fetcher::format_time_short(last_trade_t),
+            );
+        }
 
         let mut found_match = false;
 
@@ -1391,8 +1417,16 @@ impl Dashboard {
     /// For each disconnected trade/kline stream, finds all panes that use it and
     /// requests a historical fetch from `last_seen + 1ms` to `now`. Skips depth
     /// streams (stateful snapshot, no gap fill needed).
+    ///
+    /// Every disconnected stream produces exactly one decision log:
+    /// - `WS Backfill Skip | reason=depth_not_supported`
+    /// - `WS Backfill Skip | reason=no_last_seen`
+    /// - `WS Backfill Skip | reason=gap_too_small`
+    /// - `WS Backfill Skip | reason=already_pending`
+    /// - `WS Backfill Queued`  (with range)
+    /// - `WS Backfill Capped`  (with original + capped range)
     pub fn backfill_disconnected_streams(
-        &self,
+        &mut self,
         handles: &exchange::adapter::AdapterHandles,
         main_window: window::Id,
         streams: &[StreamKind],
@@ -1402,51 +1436,80 @@ impl Dashboard {
         const MIN_BACKFILL_GAP_MS: u64 = 1_000;
         /// Maximum automatic backfill range to cap REST fetches after long downtime.
         const MAX_BACKFILL_RANGE_MS: u64 = 15 * 60 * 1_000;
+        /// Pending backfill entries older than this are pruned to allow re-fetching.
+        const PENDING_EXPIRY: std::time::Duration = std::time::Duration::from_secs(60);
+
+        // Prune stale pending entries.
+        self.pending_backfills
+            .retain(|_, inserted_at| inserted_at.elapsed() < PENDING_EXPIRY);
 
         let mut fetch_tasks: Vec<Task<Message>> = Vec::new();
 
         for stream in streams {
+            // Depth streams are stateful snapshots — no historical gap to fill.
+            if matches!(stream, StreamKind::Depth { .. }) {
+                log::info!("WS Backfill Skip | stream={stream:?} reason=depth_not_supported");
+                continue;
+            }
+
             let last_t = match self.last_live_t.get(stream) {
                 Some(&t) => t,
                 None => {
-                    log::debug!("WS Backfill Skip | stream={stream:?} reason=no_last_seen");
+                    log::info!("WS Backfill Skip | stream={stream:?} reason=no_last_seen");
                     continue;
                 }
             };
 
-            // Determine the fetch range depending on stream type.
-            let full_range = match stream {
-                StreamKind::Trades { .. } => (last_t.saturating_add(1), now),
-                StreamKind::Kline { .. } => (last_t.saturating_add(1), now),
-                StreamKind::Depth { .. } => continue, // no backfill for depth
-            };
-
-            let gap_ms = full_range.1.saturating_diff(full_range.0);
+            let full_from = last_t.saturating_add(1);
+            let full_to = now;
+            let gap_ms = full_to.saturating_diff(full_from);
 
             if gap_ms < MIN_BACKFILL_GAP_MS {
-                log::debug!(
+                log::info!(
                     "WS Backfill Skip | stream={stream:?} gap_ms={gap_ms} reason=gap_too_small"
                 );
                 continue;
             }
 
-            let (from, to, was_capped) = if gap_ms > MAX_BACKFILL_RANGE_MS {
-                let capped_from = full_range.1.saturating_sub(MAX_BACKFILL_RANGE_MS);
+            // Cap the range if it exceeds the maximum.
+            let (from, to) = if gap_ms > MAX_BACKFILL_RANGE_MS {
+                let capped_from = full_to.saturating_sub(MAX_BACKFILL_RANGE_MS);
                 log::info!(
-                    "WS Backfill Capped | stream={stream:?} original_range={}..{} capped_range={}..{}",
-                    fetcher::format_time_short(full_range.0),
-                    fetcher::format_time_short(full_range.1),
-                    fetcher::format_time_short(capped_from),
-                    fetcher::format_time_short(full_range.1),
+                    "WS Backfill Capped | stream={stream:?} \
+                     original_range={orig} capped_range={capped} \
+                     reason=disconnect",
+                    orig = fetcher::format_time_range(full_from, full_to),
+                    capped = fetcher::format_time_range(capped_from, full_to),
                 );
-                (capped_from, full_range.1, true)
+                (capped_from, full_to)
             } else {
-                (full_range.0, full_range.1, false)
+                (full_from, full_to)
             };
 
-            if !was_capped {
+            // Deduplicate: skip if an identical or overlapping range was
+            // recently queued (covers rapid repeated disconnects).
+            let dedupe_key = (*stream, from.as_u64(), to.as_u64());
+            let already_pending = self
+                .pending_backfills
+                .keys()
+                .any(|(s, ef, et)| *s == *stream && *ef <= to.as_u64() && *et >= from.as_u64());
+
+            if already_pending {
                 log::info!(
-                    "WS Backfill Queued | stream={stream:?} range={} reason=disconnect",
+                    "WS Backfill Skip | stream={stream:?} \
+                     range={} reason=already_pending",
+                    fetcher::format_time_range(from, to),
+                );
+                continue;
+            }
+
+            self.pending_backfills
+                .insert(dedupe_key, std::time::Instant::now());
+
+            if gap_ms <= MAX_BACKFILL_RANGE_MS {
+                log::info!(
+                    "WS Backfill Queued | stream={stream:?} \
+                     range={} reason=disconnect",
                     fetcher::format_time_range(from, to),
                 );
             }
@@ -1454,11 +1517,13 @@ impl Dashboard {
             let fetch = match stream {
                 StreamKind::Trades { .. } => FetchRange::Trades(from, to),
                 StreamKind::Kline { .. } => FetchRange::Kline(from, to),
+                // Already handled above; defensive guard.
                 _ => continue,
             };
 
             // Find all panes (main + popouts) that use this stream and enqueue
             // a backfill fetch for each one.
+            let mut dispatched = 0u32;
             for (_window, _pane, pane_state) in self.iter_all_panes(main_window) {
                 if !pane_state.matches_stream(stream) {
                     continue;
@@ -1470,8 +1535,9 @@ impl Dashboard {
                 let handles_clone = handles.clone();
                 let layout_id = self.layout_id;
 
-                log::debug!(
-                    "WS Backfill Dispatch | pane={} stream={stream:?} req={} range={}",
+                log::info!(
+                    "WS Backfill Dispatch | pane={} stream={stream:?} \
+                     req={} range={}",
                     fetcher::short_id(pane_id),
                     fetcher::short_id(req_id),
                     fetcher::format_time_range(from, to),
@@ -1489,6 +1555,15 @@ impl Dashboard {
                 );
 
                 fetch_tasks.push(task.map(Message::from));
+                dispatched += 1;
+            }
+
+            if dispatched == 0 {
+                log::info!(
+                    "WS Backfill Skip | stream={stream:?} \
+                     range={} reason=no_matching_pane",
+                    fetcher::format_time_range(from, to),
+                );
             }
         }
 
