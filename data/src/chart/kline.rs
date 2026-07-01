@@ -12,6 +12,9 @@ use serde::{Deserialize, Serialize};
 pub struct KlineDataPoint {
     pub kline: Kline,
     pub footprint: KlineTrades,
+    /// Whether trades have been fetched/checked for this kline bucket.
+    /// Prevents re-requesting the same empty range repeatedly.
+    pub trades_checked: bool,
 }
 
 impl KlineDataPoint {

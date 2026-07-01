@@ -250,6 +250,7 @@ impl TimeSeries<KlineDataPoint> {
                 .or_insert_with(|| KlineDataPoint {
                     kline: *kline,
                     footprint: KlineTrades::new(),
+                    trades_checked: false,
                 });
 
             entry.kline = *kline;
@@ -284,6 +285,7 @@ impl TimeSeries<KlineDataPoint> {
                         volume: Volume::empty_buy_sell(),
                     },
                     footprint: KlineTrades::new(),
+                    trades_checked: false,
                 });
 
             entry.add_trade(trade, self.tick_size);
@@ -310,6 +312,7 @@ impl TimeSeries<KlineDataPoint> {
                     updated_times.push(rounded_time);
                 }
                 entry.add_trade(trade, self.tick_size);
+                entry.trades_checked = true;
             }
         }
 
@@ -317,6 +320,15 @@ impl TimeSeries<KlineDataPoint> {
             if let Some(data_point) = self.datapoints.get_mut(&time) {
                 data_point.calculate_poc();
             }
+        }
+    }
+
+    /// Mark all kline buckets in a time range as trades_checked = true.
+    /// Used when a trade fetch completes with no/empty results to prevent
+    /// re-requesting the same empty range.
+    pub fn mark_range_trades_checked(&mut self, from: UnixMs, to: UnixMs) {
+        for (_, dp) in self.datapoints.range_mut(from..=to) {
+            dp.trades_checked = true;
         }
     }
 
@@ -434,7 +446,7 @@ impl TimeSeries<KlineDataPoint> {
             .datapoints
             .iter()
             .rev()
-            .find(|(_, dp)| dp.footprint.trades.is_empty())
+            .find(|(_, dp)| dp.footprint.trades.is_empty() && !dp.trades_checked)
             .map(|(&time, _)| time);
 
         if let Some(target_time) = empty_kline_time {

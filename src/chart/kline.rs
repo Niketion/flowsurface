@@ -164,6 +164,7 @@ pub struct KlineChart {
     chart: ViewState,
     data_source: PlotData<KlineDataPoint>,
     raw_trades: Vec<Trade>,
+    covered_trade_ranges: Vec<(UnixMs, UnixMs)>,
     indicators: EnumMap<KlineIndicator, Option<Box<dyn KlineIndicatorImpl>>>,
     fetching_trades: (bool, Option<Handle>),
     pub(crate) kind: KlineChartKind,
@@ -272,6 +273,7 @@ impl KlineChart {
                     visual_config,
                     data_source,
                     raw_trades,
+                    covered_trade_ranges: Vec::new(),
                     indicators,
                     fetching_trades: (false, None),
                     request_handler: RequestHandler::default(),
@@ -332,6 +334,7 @@ impl KlineChart {
                     visual_config,
                     data_source,
                     raw_trades,
+                    covered_trade_ranges: Vec::new(),
                     indicators,
                     fetching_trades: (false, None),
                     request_handler: RequestHandler::default(),
@@ -412,14 +415,29 @@ impl KlineChart {
                         if let Some((fetch_from, fetch_to)) = timeseries
                             .suggest_trade_fetch_range(visible_earliest_ms, visible_latest_ms)
                         {
-                            log::info!(
-                                "CHART Footprint | action=fetch_trades reason=missing_range range={}",
-                                crate::connector::fetcher::format_time_range(fetch_from, fetch_to)
-                            );
-                            let range = FetchRange::Trades(fetch_from, fetch_to);
-                            if let Some(action) = request_fetch(&mut self.request_handler, range) {
-                                self.fetching_trades = (true, None);
-                                return Some(action);
+                            if let Some((fetch_from, fetch_to)) =
+                                self.subtract_covered_trade_ranges(fetch_from, fetch_to)
+                            {
+                                log::info!(
+                                    "CHART Footprint | action=fetch_trades reason=missing_range range={}",
+                                    crate::connector::fetcher::format_time_range(
+                                        fetch_from, fetch_to
+                                    )
+                                );
+                                let range = FetchRange::Trades(fetch_from, fetch_to);
+                                if let Some(action) =
+                                    request_fetch(&mut self.request_handler, range)
+                                {
+                                    self.fetching_trades = (true, None);
+                                    return Some(action);
+                                }
+                            } else {
+                                log::debug!(
+                                    "CHART Footprint | action=skip reason=already_covered range={}",
+                                    crate::connector::fetcher::format_time_range(
+                                        fetch_from, fetch_to
+                                    )
+                                );
                             }
                         } else {
                             log::debug!("CHART Footprint | action=skip reason=no_missing_trades");
@@ -452,19 +470,30 @@ impl KlineChart {
                         {
                             let fetch_from = fetch_from.max(session_start);
                             if fetch_to > fetch_from {
-                                log::info!(
-                                    "CHART Bubbles | action=fetch_trades session={:?} range={}",
-                                    session,
-                                    crate::connector::fetcher::format_time_range(
-                                        fetch_from, fetch_to
-                                    )
-                                );
-                                let range = FetchRange::Trades(fetch_from, fetch_to);
-                                if let Some(action) =
-                                    request_fetch(&mut self.request_handler, range)
+                                if let Some((fetch_from, fetch_to)) =
+                                    self.subtract_covered_trade_ranges(fetch_from, fetch_to)
                                 {
-                                    self.fetching_trades = (true, None);
-                                    return Some(action);
+                                    log::info!(
+                                        "CHART Bubbles | action=fetch_trades session={:?} range={}",
+                                        session,
+                                        crate::connector::fetcher::format_time_range(
+                                            fetch_from, fetch_to
+                                        )
+                                    );
+                                    let range = FetchRange::Trades(fetch_from, fetch_to);
+                                    if let Some(action) =
+                                        request_fetch(&mut self.request_handler, range)
+                                    {
+                                        self.fetching_trades = (true, None);
+                                        return Some(action);
+                                    }
+                                } else {
+                                    log::debug!(
+                                        "CHART Bubbles | action=skip reason=already_covered range={}",
+                                        crate::connector::fetcher::format_time_range(
+                                            fetch_from, fetch_to
+                                        )
+                                    );
                                 }
                             } else {
                                 log::debug!(
@@ -534,6 +563,114 @@ impl KlineChart {
         log::info!("CHART Reset | reason=settings_changed");
         self.request_handler = RequestHandler::default();
         self.fetching_trades = (false, None);
+        self.covered_trade_ranges.clear();
+    }
+
+    pub fn mark_trade_request_completed(&mut self, req_id: uuid::Uuid) {
+        self.request_handler.mark_completed(req_id);
+    }
+
+    pub fn mark_trade_range_covered(&mut self, from: UnixMs, to: UnixMs) {
+        if to <= from {
+            return;
+        }
+
+        self.covered_trade_ranges.push((from, to));
+        self.covered_trade_ranges.sort_by_key(|(from, _)| *from);
+
+        let mut merged: Vec<(UnixMs, UnixMs)> = Vec::new();
+        for (range_from, range_to) in self.covered_trade_ranges.drain(..) {
+            if let Some((_, last_to)) = merged.last_mut()
+                && range_from <= *last_to
+            {
+                *last_to = (*last_to).max(range_to);
+                continue;
+            }
+
+            merged.push((range_from, range_to));
+        }
+
+        self.covered_trade_ranges = merged;
+        log::debug!(
+            "DATA Trades Covered | range={} covered_ranges={}",
+            crate::connector::fetcher::format_time_range(from, to),
+            self.covered_trade_ranges.len()
+        );
+    }
+
+    pub fn is_trade_range_covered(&self, from: UnixMs, to: UnixMs) -> bool {
+        self.covered_trade_ranges
+            .iter()
+            .any(|(covered_from, covered_to)| from >= *covered_from && to <= *covered_to)
+    }
+
+    pub fn subtract_covered_trade_ranges(
+        &self,
+        from: UnixMs,
+        to: UnixMs,
+    ) -> Option<(UnixMs, UnixMs)> {
+        if to <= from || self.is_trade_range_covered(from, to) {
+            return None;
+        }
+
+        let mut cursor = from;
+        for (covered_from, covered_to) in &self.covered_trade_ranges {
+            if *covered_to <= cursor {
+                continue;
+            }
+
+            if *covered_from > cursor {
+                return Some((cursor, (*covered_from).min(to)));
+            }
+
+            cursor = cursor.max(*covered_to);
+            if cursor >= to {
+                return None;
+            }
+        }
+
+        Some((cursor, to))
+    }
+
+    pub fn complete_trade_fetch(&mut self, req_id: Option<uuid::Uuid>, fetch: Option<FetchRange>) {
+        if let Some(id) = req_id {
+            self.mark_trade_request_completed(id);
+        }
+
+        if let Some(FetchRange::Trades(from, to)) = fetch {
+            self.mark_trade_range_covered(from, to);
+            self.mark_trade_buckets_checked(from, to);
+        }
+
+        self.fetching_trades = (false, None);
+    }
+
+    fn mark_trade_buckets_checked(&mut self, from: UnixMs, to: UnixMs) {
+        match &mut self.data_source {
+            PlotData::TimeBased(ts) => {
+                ts.mark_range_trades_checked(from, to);
+            }
+            PlotData::TickBased(_) => {}
+        }
+    }
+
+    /// Mark all klines in the visible range as trades_checked.
+    /// Called when a trade fetch completes with empty results to prevent
+    /// re-requesting the same range.
+    pub fn mark_visible_range_trades_checked(&mut self) {
+        let (visible_earliest, visible_latest) = match self.visible_timerange() {
+            Some(range) => range,
+            None => return,
+        };
+        let earliest_ms = exchange::UnixMs::new(visible_earliest);
+        let latest_ms = exchange::UnixMs::new(visible_latest);
+
+        match &mut self.data_source {
+            PlotData::TimeBased(ts) => {
+                ts.mark_range_trades_checked(earliest_ms, latest_ms);
+            }
+            PlotData::TickBased(_) => {}
+        }
     }
 
     pub fn raw_trades(&self) -> Vec<Trade> {
@@ -773,12 +910,13 @@ impl KlineChart {
 
     pub fn insert_raw_trades(&mut self, raw_trades: Vec<Trade>, is_batches_done: bool) {
         let batch_size = raw_trades.len();
-        let total_after = self.raw_trades.len() + batch_size;
+        let raw_before = self.raw_trades.len();
         let earliest = raw_trades.first().map(|t| t.time);
         let latest = raw_trades.last().map(|t| t.time);
 
         log::debug!(
-            "DATA Trades | batch={batch_size} total={total_after} done={is_batches_done} earliest={} latest={}",
+            "DATA Trades | fetched_batch={batch_size} inserted_raw={batch_size} total_raw_after={} is_batches_done={is_batches_done} earliest={} latest={}",
+            raw_before + batch_size,
             earliest.map_or(
                 "-".to_string(),
                 crate::connector::fetcher::format_time_short
@@ -808,9 +946,14 @@ impl KlineChart {
         if is_batches_done {
             self.fetching_trades = (false, None);
             log::info!(
-                "DATA Trades Done | total_raw={} final_batch={batch_size}",
+                "DATA Trades Done | total_raw={} final_batch={batch_size} is_batches_done={is_batches_done}",
                 self.raw_trades.len()
             );
+            if batch_size == 0 {
+                log::info!(
+                    "DATA Trades Done | final_batch=0 reason=no_trades_within_requested_until_or_already_filtered"
+                );
+            }
         }
 
         self.invalidate(None);

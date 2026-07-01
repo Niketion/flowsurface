@@ -94,6 +94,7 @@ pub enum FetchedData {
     Trades {
         batch: Vec<Trade>,
         until_time: UnixMs,
+        req_id: Option<uuid::Uuid>,
     },
     Klines {
         data: Vec<Kline>,
@@ -109,8 +110,6 @@ pub enum FetchedData {
 pub enum ReqError {
     #[error("Request is already failed: {0}")]
     Failed(String),
-    #[error("Request overlaps with an existing request")]
-    Overlaps,
 }
 
 #[derive(PartialEq, Debug)]
@@ -129,6 +128,55 @@ impl RequestHandler {
     pub fn add_request(&mut self, fetch: FetchRange) -> Result<Option<Uuid>, ReqError> {
         let request = FetchRequest::new(fetch);
         let id = Uuid::new_v4();
+        let now = chrono::Utc::now().timestamp_millis() as u64;
+
+        if let FetchRange::Trades(new_from, new_to) = fetch {
+            for (existing_id, existing_req) in &self.requests {
+                let FetchRange::Trades(exist_from, exist_to) = existing_req.fetch_type else {
+                    continue;
+                };
+
+                let exact = new_from == exist_from && new_to == exist_to;
+                let contained = trades_contained(new_from, new_to, exist_from, exist_to);
+                let overlaps = new_from < exist_to && new_to > exist_from;
+
+                match &existing_req.status {
+                    RequestStatus::Pending if exact || contained || overlaps => {
+                        let reason = if contained {
+                            "contained_pending"
+                        } else {
+                            "overlap_pending"
+                        };
+                        log::debug!(
+                            "FETCH Skipped | reason={reason} {} pending_req={} pending_range={}",
+                            format_fetch_range(&fetch),
+                            short_id(*existing_id),
+                            format_time_range(exist_from, exist_to)
+                        );
+                        return Ok(None);
+                    }
+                    RequestStatus::Completed(ts) if (exact || contained) && now - ts <= 30_000 => {
+                        log::debug!(
+                            "FETCH Skipped | reason=already_completed {} completed_req={} completed_range={}",
+                            format_fetch_range(&fetch),
+                            short_id(*existing_id),
+                            format_time_range(exist_from, exist_to)
+                        );
+                        return Ok(None);
+                    }
+                    RequestStatus::Failed(error_msg) if exact => {
+                        log::warn!(
+                            "CACHE Failed | {} req={} prev_error={}",
+                            format_fetch_range(&fetch),
+                            short_id(*existing_id),
+                            error_msg
+                        );
+                        return Err(ReqError::Failed(error_msg.clone()));
+                    }
+                    _ => {}
+                }
+            }
+        }
 
         if let Some((existing_id, existing_req)) = self.requests.iter().find_map(|(k, v)| {
             if v.same_with(&request) {
@@ -165,35 +213,12 @@ impl RequestHandler {
                     }
                 }
                 RequestStatus::Pending => {
-                    match &fetch {
-                        FetchRange::Trades(new_from, new_to) => {
-                            if let FetchRange::Trades(exist_from, exist_to) =
-                                existing_req.fetch_type
-                            {
-                                if trades_contained(*new_from, *new_to, exist_from, exist_to) {
-                                    log::debug!(
-                                        "CACHE Duplicate | Trades {} contained in pending req={}",
-                                        format_time_range(*new_from, *new_to),
-                                        short_id(existing_id)
-                                    );
-                                } else {
-                                    log::debug!(
-                                        "CACHE Overlap | Trades {} overlaps pending req={}",
-                                        format_time_range(*new_from, *new_to),
-                                        short_id(existing_id)
-                                    );
-                                }
-                            }
-                        }
-                        _ => {
-                            log::debug!(
-                                "CACHE Pending | {} req={} already in flight",
-                                format_fetch_range(&fetch),
-                                short_id(existing_id)
-                            );
-                        }
-                    }
-                    Err(ReqError::Overlaps)
+                    log::debug!(
+                        "FETCH Skipped | reason=overlap_pending {} req={} already in flight",
+                        format_fetch_range(&fetch),
+                        short_id(existing_id)
+                    );
+                    Ok(None)
                 }
             };
         }
@@ -306,7 +331,10 @@ pub enum InfoKind {
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub enum FetchTaskStatus {
     Loading(InfoKind),
-    Completed,
+    Completed {
+        req_id: Option<Uuid>,
+        fetch: Option<FetchRange>,
+    },
 }
 
 #[derive(Debug, Clone)]
@@ -464,6 +492,7 @@ pub fn request_fetch(
                             let data = FetchedData::Trades {
                                 batch,
                                 until_time: to_time,
+                                req_id: Some(req_id),
                             };
 
                             FetchUpdate::Data {
@@ -483,7 +512,10 @@ pub fn request_fetch(
                                 );
                                 FetchUpdate::Status {
                                     pane_id,
-                                    status: FetchTaskStatus::Completed,
+                                    status: FetchTaskStatus::Completed {
+                                        req_id: Some(req_id),
+                                        fetch: Some(FetchRange::Trades(from_time, to_time)),
+                                    },
                                 }
                             }
                             Err(err) => {
@@ -797,7 +829,7 @@ pub fn fetch_trades_batched(
         }
 
         log::info!(
-            "TRADE Worker Done | {venue} {symbol} range={} requests={request_count} trades={total_trades} duration={}",
+            "TRADE Worker Done | {venue} {symbol} range={} requests={request_count} returned_trades={total_trades} duration={}",
             format_time_range(from_time, to_time),
             format_duration_ms(started.elapsed().as_millis() as u64)
         );
