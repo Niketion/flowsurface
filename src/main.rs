@@ -39,6 +39,10 @@ use iced::{
 };
 use std::{borrow::Cow, collections::HashMap, time::Duration, vec};
 
+/// Set to `true` to emit window focus/unfocus and tick diagnostic logs.
+/// These are useful for debugging multi-window issues but noisy in normal use.
+const DEBUG_WINDOW_DIAGNOSTICS: bool = false;
+
 const DEBUG_TERMINAL_VSCROLL_ID: &str = "debug-terminal-vscroll";
 const DEBUG_TERMINAL_HSCROLL_ID: &str = "debug-terminal-hscroll";
 
@@ -90,7 +94,7 @@ struct Flowsurface {
     debug_terminal_enabled: bool,
     debug_terminal_window: Option<window::Id>,
     debug_terminal_logs: Vec<String>,
-    debug_terminal_filter: DebugTerminalFilter,
+    debug_terminal_level_filter: DebugLevelFilter,
     debug_terminal_category_filter: DebugLogCategory,
     debug_terminal_search: String,
     debug_terminal_auto_scroll: bool,
@@ -124,8 +128,9 @@ enum Message {
     DebugTerminalRefresh,
     DebugTerminalClear,
     DebugTerminalCopyAll,
+    DebugTerminalCopyVisible,
     DebugTerminalSearchChanged(String),
-    DebugTerminalFilterChanged(DebugTerminalFilter),
+    DebugTerminalToggleLevel(DebugLogLevel, bool),
     DebugTerminalToggleAutoScroll(bool),
     DebugTerminalCategoryFilterChanged(DebugLogCategory),
     DebugTerminalToggleAppOnly(bool),
@@ -139,34 +144,47 @@ enum Message {
     AudioStream(modal::audio::Message),
 }
 
+/// Multi-level filter for the Debug Terminal.
+/// Each level can be independently enabled/disabled.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum DebugTerminalFilter {
-    All,
-    Error,
-    Warn,
-    Info,
-    Debug,
-    Trace,
+struct DebugLevelFilter {
+    error: bool,
+    warn: bool,
+    info: bool,
+    debug: bool,
+    trace: bool,
 }
 
-impl DebugTerminalFilter {
-    const ALL: [Self; 6] = [
-        Self::All,
-        Self::Error,
-        Self::Warn,
-        Self::Info,
-        Self::Debug,
-        Self::Trace,
-    ];
+impl DebugLevelFilter {
+    /// Default levels: ERROR, WARN, INFO enabled; DEBUG, TRACE disabled.
+    const DEFAULT: Self = Self {
+        error: true,
+        warn: true,
+        info: true,
+        debug: false,
+        trace: false,
+    };
 
     fn matches(self, line: &str) -> bool {
-        match self {
-            Self::All => true,
-            Self::Error => debug_line_level(line) == Some(DebugLogLevel::Error),
-            Self::Warn => debug_line_level(line) == Some(DebugLogLevel::Warn),
-            Self::Info => debug_line_level(line) == Some(DebugLogLevel::Info),
-            Self::Debug => debug_line_level(line) == Some(DebugLogLevel::Debug),
-            Self::Trace => debug_line_level(line) == Some(DebugLogLevel::Trace),
+        let level = debug_line_level(line);
+        match level {
+            Some(DebugLogLevel::Error) => self.error,
+            Some(DebugLogLevel::Warn) => self.warn,
+            Some(DebugLogLevel::Info) => self.info,
+            Some(DebugLogLevel::Debug) => self.debug,
+            Some(DebugLogLevel::Trace) => self.trace,
+            // Unknown-level logs show when INFO is enabled (simpler than an extra toggle).
+            None => self.info,
+        }
+    }
+
+    fn toggle(&mut self, level: DebugLogLevel, enabled: bool) {
+        match level {
+            DebugLogLevel::Error => self.error = enabled,
+            DebugLogLevel::Warn => self.warn = enabled,
+            DebugLogLevel::Info => self.info = enabled,
+            DebugLogLevel::Debug => self.debug = enabled,
+            DebugLogLevel::Trace => self.trace = enabled,
         }
     }
 }
@@ -212,10 +230,9 @@ fn debug_log_text_style(
     }
 }
 
-impl std::fmt::Display for DebugTerminalFilter {
+impl std::fmt::Display for DebugLogLevel {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
-            Self::All => write!(f, "All"),
             Self::Error => write!(f, "Error"),
             Self::Warn => write!(f, "Warn"),
             Self::Info => write!(f, "Info"),
@@ -477,7 +494,7 @@ impl Flowsurface {
             debug_terminal_enabled: saved_state.debug_terminal_enabled,
             debug_terminal_window: None,
             debug_terminal_logs: logger::debug_terminal_snapshot(),
-            debug_terminal_filter: DebugTerminalFilter::All,
+            debug_terminal_level_filter: DebugLevelFilter::DEFAULT,
             debug_terminal_category_filter: DebugLogCategory::All,
             debug_terminal_search: String::new(),
             debug_terminal_auto_scroll: true,
@@ -582,19 +599,21 @@ impl Flowsurface {
             }
             Message::Tick(now) => {
                 // Throttled tick debug logging (once every 2 seconds)
-                static LAST_TICK_LOG: std::sync::Mutex<Option<std::time::Instant>> =
-                    std::sync::Mutex::new(None);
-                if let Ok(mut last) = LAST_TICK_LOG.lock()
-                    && last.is_none_or(|t| t.elapsed() > Duration::from_secs(2))
-                {
-                    let popout_count = self.active_dashboard().popout.len();
-                    log::info!(
-                        "[tick] main={:?}, debug_term={:?}, popouts={}",
-                        self.main_window.id,
-                        self.debug_terminal_window,
-                        popout_count
-                    );
-                    *last = Some(now);
+                if DEBUG_WINDOW_DIAGNOSTICS {
+                    static LAST_TICK_LOG: std::sync::Mutex<Option<std::time::Instant>> =
+                        std::sync::Mutex::new(None);
+                    if let Ok(mut last) = LAST_TICK_LOG.lock()
+                        && last.is_none_or(|t| t.elapsed() > Duration::from_secs(2))
+                    {
+                        let popout_count = self.active_dashboard().popout.len();
+                        log::trace!(
+                            "[tick] main={:?}, debug_term={:?}, popouts={}",
+                            self.main_window.id,
+                            self.debug_terminal_window,
+                            popout_count
+                        );
+                        *last = Some(now);
+                    }
                 }
 
                 let main_window_id = self.main_window.id;
@@ -634,18 +653,22 @@ impl Flowsurface {
                     return window::collect_window_specs(active_windows, Message::ExitRequested);
                 }
                 window::Event::Focused(id) => {
-                    log::info!(
-                        "[window] Focused: id={:?} ({})",
-                        id,
-                        self.debug_window_label(id)
-                    );
+                    if DEBUG_WINDOW_DIAGNOSTICS {
+                        log::debug!(
+                            "[window] Focused: id={:?} ({})",
+                            id,
+                            self.debug_window_label(id)
+                        );
+                    }
                 }
                 window::Event::Unfocused(id) => {
-                    log::info!(
-                        "[window] Unfocused: id={:?} ({})",
-                        id,
-                        self.debug_window_label(id)
-                    );
+                    if DEBUG_WINDOW_DIAGNOSTICS {
+                        log::debug!(
+                            "[window] Unfocused: id={:?} ({})",
+                            id,
+                            self.debug_window_label(id)
+                        );
+                    }
                 }
             },
             Message::ExitRequested(windows) => {
@@ -854,11 +877,19 @@ impl Flowsurface {
             Message::DebugTerminalCopyAll => {
                 return iced::clipboard::write(self.debug_terminal_logs.join("\n"));
             }
+            Message::DebugTerminalCopyVisible => {
+                let visible: Vec<String> = self
+                    .filtered_debug_terminal_entries()
+                    .into_iter()
+                    .map(|e| e.raw)
+                    .collect();
+                return iced::clipboard::write(visible.join("\n"));
+            }
             Message::DebugTerminalSearchChanged(value) => {
                 self.debug_terminal_search = value;
             }
-            Message::DebugTerminalFilterChanged(filter) => {
-                self.debug_terminal_filter = filter;
+            Message::DebugTerminalToggleLevel(level, enabled) => {
+                self.debug_terminal_level_filter.toggle(level, enabled);
             }
             Message::DebugTerminalToggleAutoScroll(enabled) => {
                 self.debug_terminal_auto_scroll = enabled;
@@ -1305,6 +1336,7 @@ impl Flowsurface {
             button(text("Clear")).on_press(Message::DebugTerminalClear),
             button(text("Refresh")).on_press(Message::DebugTerminalRefresh),
             button(text("Copy all")).on_press(Message::DebugTerminalCopyAll),
+            button(text("Copy visible")).on_press(Message::DebugTerminalCopyVisible),
             button(text("Open data folder")).on_press(Message::DataFolderRequested),
             iced::widget::checkbox(self.debug_terminal_auto_scroll)
                 .label("Auto-scroll")
@@ -1320,16 +1352,31 @@ impl Flowsurface {
         .spacing(8);
 
         // Filter row
+        let level_checkboxes = row![
+            iced::widget::checkbox(self.debug_terminal_level_filter.error)
+                .label("Error")
+                .on_toggle(|on| Message::DebugTerminalToggleLevel(DebugLogLevel::Error, on)),
+            iced::widget::checkbox(self.debug_terminal_level_filter.warn)
+                .label("Warn")
+                .on_toggle(|on| Message::DebugTerminalToggleLevel(DebugLogLevel::Warn, on)),
+            iced::widget::checkbox(self.debug_terminal_level_filter.info)
+                .label("Info")
+                .on_toggle(|on| Message::DebugTerminalToggleLevel(DebugLogLevel::Info, on)),
+            iced::widget::checkbox(self.debug_terminal_level_filter.debug)
+                .label("Debug")
+                .on_toggle(|on| Message::DebugTerminalToggleLevel(DebugLogLevel::Debug, on)),
+            iced::widget::checkbox(self.debug_terminal_level_filter.trace)
+                .label("Trace")
+                .on_toggle(|on| Message::DebugTerminalToggleLevel(DebugLogLevel::Trace, on)),
+        ]
+        .align_y(Alignment::Center)
+        .spacing(8);
+
         let filters = row![
             text_input("Search logs...", &self.debug_terminal_search)
                 .on_input(Message::DebugTerminalSearchChanged)
                 .width(Length::Fill),
-            pick_list(
-                DebugTerminalFilter::ALL,
-                Some(self.debug_terminal_filter),
-                Message::DebugTerminalFilterChanged,
-            )
-            .width(100),
+            level_checkboxes,
             pick_list(
                 DebugLogCategory::ALL,
                 Some(self.debug_terminal_category_filter),
@@ -1399,7 +1446,7 @@ impl Flowsurface {
 
         self.debug_terminal_logs
             .iter()
-            .filter(|line| self.debug_terminal_filter.matches(line))
+            .filter(|line| self.debug_terminal_level_filter.matches(line))
             .filter(|line| {
                 if self.debug_terminal_app_only {
                     let entry = parse_debug_log_entry(line);
