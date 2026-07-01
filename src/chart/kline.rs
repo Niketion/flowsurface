@@ -173,6 +173,13 @@ pub struct KlineChart {
     visual_config: Config,
 }
 
+#[derive(Debug, Clone, Copy)]
+pub struct VolumeBubbleQtyScale {
+    pub min: f64,
+    pub max: f64,
+    pub step: f64,
+}
+
 impl KlineChart {
     pub fn new(
         layout: ViewConfig,
@@ -541,6 +548,20 @@ impl KlineChart {
 
     pub fn visual_config(&self) -> Config {
         self.visual_config
+    }
+
+    pub fn volume_bubble_qty_scale(&self) -> VolumeBubbleQtyScale {
+        let session_start = current_volume_bubble_session_start_ms(
+            chrono::Utc::now(),
+            self.visual_config.volume_bubbles.session,
+        )
+        .as_u64();
+
+        volume_bubble_qty_scale(max_bubble_qty_in_range(
+            &self.data_source,
+            session_start,
+            u64::MAX,
+        ))
     }
 
     pub fn set_visual_config(&mut self, visual_config: Config) {
@@ -1481,8 +1502,18 @@ fn visible_max_bubble_qty(
     latest: u64,
     min_qty: f64,
 ) -> f64 {
+    max_bubble_qty_in_range(data_source, earliest, latest)
+        .filter(|qty| *qty >= min_qty)
+        .unwrap_or_default()
+}
+
+fn max_bubble_qty_in_range(
+    data_source: &PlotData<KlineDataPoint>,
+    earliest: u64,
+    latest: u64,
+) -> Option<f64> {
     if latest < earliest {
-        return 0.0;
+        return None;
     }
 
     let max_from_trades = |trades: &KlineTrades| {
@@ -1490,9 +1521,8 @@ fn visible_max_bubble_qty(
             .trades
             .values()
             .map(|group| group.total_qty().to_f64())
-            .filter(|qty| *qty > 0.0 && *qty >= min_qty)
+            .filter(|qty| *qty > 0.0)
             .max_by(f64::total_cmp)
-            .unwrap_or_default()
     };
 
     match data_source {
@@ -1505,17 +1535,72 @@ fn visible_max_bubble_qty(
                 .iter()
                 .enumerate()
                 .filter(|(index, _)| *index >= earliest && *index <= latest)
-                .map(|(_, dp)| max_from_trades(&dp.footprint))
+                .filter_map(|(_, dp)| max_from_trades(&dp.footprint))
                 .max_by(f64::total_cmp)
-                .unwrap_or_default()
         }
         PlotData::TimeBased(timeseries) => timeseries
             .datapoints
             .range(UnixMs::new(earliest)..=UnixMs::new(latest))
-            .map(|(_, dp)| max_from_trades(&dp.footprint))
-            .max_by(f64::total_cmp)
-            .unwrap_or_default(),
+            .filter_map(|(_, dp)| max_from_trades(&dp.footprint))
+            .max_by(f64::total_cmp),
     }
+}
+
+fn volume_bubble_qty_scale(max_qty: Option<f64>) -> VolumeBubbleQtyScale {
+    let max = max_qty
+        .filter(|value| value.is_finite() && *value > 0.0)
+        .map(|value| nice_ceiling(value * 1.1))
+        .unwrap_or(100.0)
+        .max(1.0);
+    let step = nice_step(max / 100.0);
+
+    VolumeBubbleQtyScale {
+        min: 0.0,
+        max,
+        step,
+    }
+}
+
+fn nice_ceiling(value: f64) -> f64 {
+    if !value.is_finite() || value <= 0.0 {
+        return 1.0;
+    }
+
+    let magnitude = 10.0f64.powf(value.log10().floor());
+    let normalized = value / magnitude;
+    let nice = if normalized <= 1.0 {
+        1.0
+    } else if normalized <= 2.0 {
+        2.0
+    } else if normalized <= 2.5 {
+        2.5
+    } else if normalized <= 5.0 {
+        5.0
+    } else {
+        10.0
+    };
+
+    nice * magnitude
+}
+
+fn nice_step(value: f64) -> f64 {
+    if !value.is_finite() || value <= 0.0 {
+        return 1.0;
+    }
+
+    let magnitude = 10.0f64.powf(value.log10().floor());
+    let normalized = value / magnitude;
+    let nice = if normalized <= 1.0 {
+        1.0
+    } else if normalized <= 2.0 {
+        2.0
+    } else if normalized <= 5.0 {
+        5.0
+    } else {
+        10.0
+    };
+
+    nice * magnitude
 }
 
 fn render_data_source<F>(

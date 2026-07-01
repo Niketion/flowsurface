@@ -1,4 +1,5 @@
 use crate::chart::comparison::ComparisonChart;
+use crate::chart::kline::VolumeBubbleQtyScale;
 use crate::screen::dashboard::pane::{Event, Message};
 use crate::screen::dashboard::panel::timeandsales;
 use crate::split_column;
@@ -600,6 +601,7 @@ pub fn kline_cfg_view<'a>(
     kind: &'a KlineChartKind,
     pane: pane_grid::Pane,
     basis: data::chart::Basis,
+    volume_bubble_qty_scale: VolumeBubbleQtyScale,
 ) -> Element<'a, Message> {
     let display_readout_section = {
         let data_labels_checkbox = tooltip(
@@ -670,8 +672,10 @@ pub fn kline_cfg_view<'a>(
 
                 let min_qty_slider = labeled_slider(
                     "Min volume",
-                    0.0..=100_000.0,
-                    bubbles_cfg.min_qty,
+                    volume_bubble_qty_scale.min..=volume_bubble_qty_scale.max,
+                    bubbles_cfg
+                        .min_qty
+                        .clamp(volume_bubble_qty_scale.min, volume_bubble_qty_scale.max),
                     move |value| {
                         Message::VisualConfigChanged(
                             pane,
@@ -686,7 +690,7 @@ pub fn kline_cfg_view<'a>(
                         )
                     },
                     |value| format_with_commas(*value),
-                    Some(100.0),
+                    Some(volume_bubble_qty_scale.step),
                 );
 
                 let min_radius_slider = labeled_slider(
