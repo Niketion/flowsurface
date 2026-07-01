@@ -10,7 +10,7 @@ use crate::{
     chart,
     connector::{
         ResolvedStream,
-        fetcher::{self, FetchedData, InfoKind},
+        fetcher::{self, FetchRange, FetchedData, InfoKind},
     },
     screen::dashboard::tickers_table::TickersTable,
     style,
@@ -68,6 +68,9 @@ pub struct Dashboard {
     pub popout: HashMap<window::Id, (pane_grid::State<pane::State>, WindowSpec)>,
     pub streams: UniqueStreams,
     layout_id: uuid::Uuid,
+    /// Last live timestamp received per stream (trades & klines only).
+    /// Used for historical gap backfill after WS disconnects.
+    last_live_t: HashMap<StreamKind, UnixMs>,
 }
 
 impl Default for Dashboard {
@@ -78,6 +81,7 @@ impl Default for Dashboard {
             streams: UniqueStreams::default(),
             popout: HashMap::new(),
             layout_id: uuid::Uuid::new_v4(),
+            last_live_t: HashMap::new(),
         }
     }
 }
@@ -145,6 +149,7 @@ impl Dashboard {
             streams: UniqueStreams::default(),
             popout,
             layout_id,
+            last_live_t: HashMap::new(),
         }
     }
 
@@ -1045,6 +1050,9 @@ impl Dashboard {
         kline: &Kline,
         main_window: window::Id,
     ) -> Task<Message> {
+        // Track last live timestamp for backfill on disconnect.
+        self.last_live_t.insert(*stream, kline.time);
+
         let mut found_match = false;
 
         self.iter_all_panes_mut(main_window)
@@ -1121,6 +1129,10 @@ impl Dashboard {
         update_t: UnixMs,
         main_window: window::Id,
     ) -> Task<Message> {
+        // Track last live timestamp for backfill on disconnect.
+        let last_trade_t = buffer.last().map_or(update_t, |t| t.time);
+        self.last_live_t.insert(*stream, last_trade_t);
+
         let mut found_match = false;
 
         self.iter_all_panes_mut(main_window)
@@ -1372,6 +1384,115 @@ impl Dashboard {
         self.streams = UniqueStreams::from(all_pane_streams);
 
         Task::none()
+    }
+
+    /// Historical gap backfill after WS disconnect.
+    ///
+    /// For each disconnected trade/kline stream, finds all panes that use it and
+    /// requests a historical fetch from `last_seen + 1ms` to `now`. Skips depth
+    /// streams (stateful snapshot, no gap fill needed).
+    pub fn backfill_disconnected_streams(
+        &self,
+        handles: &exchange::adapter::AdapterHandles,
+        main_window: window::Id,
+        streams: &[StreamKind],
+        now: UnixMs,
+    ) -> Task<Message> {
+        /// Minimum gap (ms) to bother backfilling; avoids tiny useless fetches.
+        const MIN_BACKFILL_GAP_MS: u64 = 1_000;
+        /// Maximum automatic backfill range to cap REST fetches after long downtime.
+        const MAX_BACKFILL_RANGE_MS: u64 = 15 * 60 * 1_000;
+
+        let mut fetch_tasks: Vec<Task<Message>> = Vec::new();
+
+        for stream in streams {
+            let last_t = match self.last_live_t.get(stream) {
+                Some(&t) => t,
+                None => {
+                    log::debug!("WS Backfill Skip | stream={stream:?} reason=no_last_seen");
+                    continue;
+                }
+            };
+
+            // Determine the fetch range depending on stream type.
+            let full_range = match stream {
+                StreamKind::Trades { .. } => (last_t.saturating_add(1), now),
+                StreamKind::Kline { .. } => (last_t.saturating_add(1), now),
+                StreamKind::Depth { .. } => continue, // no backfill for depth
+            };
+
+            let gap_ms = full_range.1.saturating_diff(full_range.0);
+
+            if gap_ms < MIN_BACKFILL_GAP_MS {
+                log::debug!(
+                    "WS Backfill Skip | stream={stream:?} gap_ms={gap_ms} reason=gap_too_small"
+                );
+                continue;
+            }
+
+            let (from, to, was_capped) = if gap_ms > MAX_BACKFILL_RANGE_MS {
+                let capped_from = full_range.1.saturating_sub(MAX_BACKFILL_RANGE_MS);
+                log::info!(
+                    "WS Backfill Capped | stream={stream:?} original_range={}..{} capped_range={}..{}",
+                    fetcher::format_time_short(full_range.0),
+                    fetcher::format_time_short(full_range.1),
+                    fetcher::format_time_short(capped_from),
+                    fetcher::format_time_short(full_range.1),
+                );
+                (capped_from, full_range.1, true)
+            } else {
+                (full_range.0, full_range.1, false)
+            };
+
+            if !was_capped {
+                log::info!(
+                    "WS Backfill Queued | stream={stream:?} range={} reason=disconnect",
+                    fetcher::format_time_range(from, to),
+                );
+            }
+
+            let fetch = match stream {
+                StreamKind::Trades { .. } => FetchRange::Trades(from, to),
+                StreamKind::Kline { .. } => FetchRange::Kline(from, to),
+                _ => continue,
+            };
+
+            // Find all panes (main + popouts) that use this stream and enqueue
+            // a backfill fetch for each one.
+            for (_window, _pane, pane_state) in self.iter_all_panes(main_window) {
+                if !pane_state.matches_stream(stream) {
+                    continue;
+                }
+
+                let pane_id = pane_state.unique_id();
+                let ready_streams = vec![*stream];
+                let req_id = uuid::Uuid::new_v4();
+                let handles_clone = handles.clone();
+                let layout_id = self.layout_id;
+
+                log::debug!(
+                    "WS Backfill Dispatch | pane={} stream={stream:?} req={} range={}",
+                    fetcher::short_id(pane_id),
+                    fetcher::short_id(req_id),
+                    fetcher::format_time_range(from, to),
+                );
+
+                let task = fetcher::request_fetch(
+                    handles_clone,
+                    pane_id,
+                    &ready_streams,
+                    layout_id,
+                    req_id,
+                    fetch,
+                    Some(*stream),
+                    &mut |_handle| {},
+                );
+
+                fetch_tasks.push(task.map(Message::from));
+            }
+        }
+
+        Task::batch(fetch_tasks)
     }
 }
 

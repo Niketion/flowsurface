@@ -557,11 +557,22 @@ impl Flowsurface {
                 match event {
                     exchange::Event::Connected(_streams) => {}
                     exchange::Event::Disconnected(streams, reason) => {
-                        log::info!("a stream disconnected from WS: {reason:?}");
-                        log::warn!(
-                            "WS Backfill TODO | reason={reason:?} streams={} action=historical_gap_backfill_not_yet_wired",
+                        log::info!(
+                            "WS Disconnected | reason={reason:?} streams={}",
                             streams.len()
                         );
+
+                        let now = exchange::UnixMs::now();
+                        let main_window_id = self.main_window.id;
+                        let handles = self.handles.clone();
+                        let dashboard = self.active_dashboard_mut();
+
+                        return dashboard
+                            .backfill_disconnected_streams(&handles, main_window_id, &streams, now)
+                            .map(move |msg| Message::Dashboard {
+                                layout_id: None,
+                                event: msg,
+                            });
                     }
                     exchange::Event::DepthReceived(stream, update_t, depth) => {
                         let task = dashboard
