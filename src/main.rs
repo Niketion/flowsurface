@@ -31,13 +31,16 @@ use widget::{
 };
 
 use iced::{
-    Alignment, Element, Subscription, Task, keyboard, padding,
+    Alignment, Element, Length, Subscription, Task, keyboard, padding,
     widget::{
-        button, column, container, pane_grid, pick_list, row, rule, scrollable, text,
+        button, column, container, pane_grid, pick_list, row, rule, scrollable, text, text_input,
         tooltip::Position as TooltipPosition,
     },
 };
-use std::{borrow::Cow, collections::HashMap, vec};
+use std::{borrow::Cow, collections::HashMap, time::Duration, vec};
+
+const DEBUG_TERMINAL_VSCROLL_ID: &str = "debug-terminal-vscroll";
+const DEBUG_TERMINAL_HSCROLL_ID: &str = "debug-terminal-hscroll";
 
 fn main() {
     logger::install_panic_hook();
@@ -84,6 +87,15 @@ struct Flowsurface {
     timezone: data::UserTimezone,
     theme: data::Theme,
     notifications: Notifications,
+    debug_terminal_enabled: bool,
+    debug_terminal_window: Option<window::Id>,
+    debug_terminal_logs: Vec<String>,
+    debug_terminal_filter: DebugTerminalFilter,
+    debug_terminal_category_filter: DebugLogCategory,
+    debug_terminal_search: String,
+    debug_terminal_auto_scroll: bool,
+    debug_terminal_app_only: bool,
+    debug_terminal_compact_mode: bool,
 }
 
 #[derive(Debug, Clone)]
@@ -107,6 +119,17 @@ enum Message {
     ScaleFactorChanged(data::ScaleFactor),
     SetTimezone(data::UserTimezone),
     ToggleTradeFetch(bool),
+    ToggleDebugTerminal(bool),
+    DebugTerminalOpened(window::Id),
+    DebugTerminalRefresh,
+    DebugTerminalClear,
+    DebugTerminalCopyAll,
+    DebugTerminalSearchChanged(String),
+    DebugTerminalFilterChanged(DebugTerminalFilter),
+    DebugTerminalToggleAutoScroll(bool),
+    DebugTerminalCategoryFilterChanged(DebugLogCategory),
+    DebugTerminalToggleAppOnly(bool),
+    DebugTerminalToggleCompactMode(bool),
     ApplyVolumeSizeUnit(exchange::SizeUnit),
     RemoveNotification(usize),
     ToggleDialogModal(Option<screen::ConfirmDialog<Message>>),
@@ -114,6 +137,303 @@ enum Message {
     NetworkManager(modal::network_manager::Message),
     Layouts(modal::layout_manager::Message),
     AudioStream(modal::audio::Message),
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum DebugTerminalFilter {
+    All,
+    Error,
+    Warn,
+    Info,
+    Debug,
+    Trace,
+}
+
+impl DebugTerminalFilter {
+    const ALL: [Self; 6] = [
+        Self::All,
+        Self::Error,
+        Self::Warn,
+        Self::Info,
+        Self::Debug,
+        Self::Trace,
+    ];
+
+    fn matches(self, line: &str) -> bool {
+        match self {
+            Self::All => true,
+            Self::Error => debug_line_level(line) == Some(DebugLogLevel::Error),
+            Self::Warn => debug_line_level(line) == Some(DebugLogLevel::Warn),
+            Self::Info => debug_line_level(line) == Some(DebugLogLevel::Info),
+            Self::Debug => debug_line_level(line) == Some(DebugLogLevel::Debug),
+            Self::Trace => debug_line_level(line) == Some(DebugLogLevel::Trace),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum DebugLogLevel {
+    Error,
+    Warn,
+    Info,
+    Debug,
+    Trace,
+}
+
+fn debug_line_level(line: &str) -> Option<DebugLogLevel> {
+    let level_start = line.find("] [")? + 3;
+    let level_end = line[level_start..].find(']')? + level_start;
+
+    match line[level_start..level_end].trim() {
+        "ERROR" | "FATAL" => Some(DebugLogLevel::Error),
+        "WARN" => Some(DebugLogLevel::Warn),
+        "INFO" => Some(DebugLogLevel::Info),
+        "DEBUG" => Some(DebugLogLevel::Debug),
+        "TRACE" => Some(DebugLogLevel::Trace),
+        _ => None,
+    }
+}
+
+fn debug_log_text_style(
+    level: Option<DebugLogLevel>,
+) -> impl Fn(&iced::Theme) -> iced::widget::text::Style {
+    move |theme| {
+        let palette = theme.extended_palette();
+        let color = match level {
+            Some(DebugLogLevel::Error) => Some(palette.danger.base.color),
+            Some(DebugLogLevel::Warn) => Some(palette.primary.strong.color),
+            Some(DebugLogLevel::Info) => None,
+            Some(DebugLogLevel::Debug) => Some(palette.secondary.strong.color),
+            Some(DebugLogLevel::Trace) => Some(palette.background.strongest.color),
+            None => None,
+        };
+
+        iced::widget::text::Style { color }
+    }
+}
+
+impl std::fmt::Display for DebugTerminalFilter {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::All => write!(f, "All"),
+            Self::Error => write!(f, "Error"),
+            Self::Warn => write!(f, "Warn"),
+            Self::Info => write!(f, "Info"),
+            Self::Debug => write!(f, "Debug"),
+            Self::Trace => write!(f, "Trace"),
+        }
+    }
+}
+
+// ── Debug log entry parsing ─────────────────────────────────────────────────
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum DebugLogCategory {
+    All,
+    Fetch,
+    Cache,
+    Ws,
+    Chart,
+    Bubbles,
+    Footprint,
+    Kline,
+    Oi,
+    Data,
+    Ui,
+    App,
+    ThirdParty,
+}
+
+impl DebugLogCategory {
+    const ALL: [Self; 13] = [
+        Self::All,
+        Self::Fetch,
+        Self::Cache,
+        Self::Ws,
+        Self::Chart,
+        Self::Bubbles,
+        Self::Footprint,
+        Self::Kline,
+        Self::Oi,
+        Self::Data,
+        Self::Ui,
+        Self::App,
+        Self::ThirdParty,
+    ];
+}
+
+impl std::fmt::Display for DebugLogCategory {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::All => write!(f, "All"),
+            Self::Fetch => write!(f, "Fetch"),
+            Self::Cache => write!(f, "Cache"),
+            Self::Ws => write!(f, "WS"),
+            Self::Chart => write!(f, "Chart"),
+            Self::Bubbles => write!(f, "Bubbles"),
+            Self::Footprint => write!(f, "Footprint"),
+            Self::Kline => write!(f, "Kline"),
+            Self::Oi => write!(f, "OI"),
+            Self::Data => write!(f, "Data"),
+            Self::Ui => write!(f, "UI"),
+            Self::App => write!(f, "App"),
+            Self::ThirdParty => write!(f, "Third-party"),
+        }
+    }
+}
+
+#[derive(Debug, Clone)]
+struct DebugLogEntry {
+    raw: String,
+    timestamp: Option<String>,
+    level: Option<DebugLogLevel>,
+    target: Option<String>,
+    category: DebugLogCategory,
+    event: String,
+    summary: String,
+}
+
+fn parse_debug_log_entry(line: &str) -> DebugLogEntry {
+    let raw = line.to_string();
+    let mut timestamp = None;
+    let mut level = None;
+    let mut target = None;
+
+    // Parse format: [timestamp] [LEVEL] [target] message
+    let mut remaining = line;
+
+    // Extract timestamp
+    if let Some(start) = remaining.find('[')
+        && let Some(end) = remaining[start + 1..].find(']')
+    {
+        timestamp = Some(remaining[start + 1..start + 1 + end].to_string());
+        remaining = &remaining[start + 1 + end + 1..];
+    }
+
+    // Extract level
+    if let Some(start) = remaining.find('[')
+        && let Some(end) = remaining[start + 1..].find(']')
+    {
+        let level_str = remaining[start + 1..start + 1 + end].trim();
+        level = match level_str {
+            "ERROR" | "FATAL" => Some(DebugLogLevel::Error),
+            "WARN" => Some(DebugLogLevel::Warn),
+            "INFO" => Some(DebugLogLevel::Info),
+            "DEBUG" => Some(DebugLogLevel::Debug),
+            "TRACE" => Some(DebugLogLevel::Trace),
+            _ => None,
+        };
+        remaining = &remaining[start + 1 + end + 1..];
+    }
+
+    // Extract target
+    if let Some(start) = remaining.find('[')
+        && let Some(end) = remaining[start + 1..].find(']')
+    {
+        target = Some(remaining[start + 1..start + 1 + end].to_string());
+        remaining = &remaining[start + 1 + end + 1..];
+    }
+
+    let message = remaining.trim();
+    let (category, event, summary) = classify_log_message(message, target.as_deref());
+
+    DebugLogEntry {
+        raw,
+        timestamp,
+        level,
+        target,
+        category,
+        event,
+        summary,
+    }
+}
+
+fn classify_log_message(message: &str, target: Option<&str>) -> (DebugLogCategory, String, String) {
+    // Check for our structured log format: CATEGORY Event | key=value ...
+    if let Some(pipe_pos) = message.find('|') {
+        let prefix = message[..pipe_pos].trim();
+        let details = message[pipe_pos + 1..].trim();
+
+        let parts: Vec<&str> = prefix.split_whitespace().collect();
+        if parts.len() >= 2 {
+            let cat_str = parts[0];
+            let event = parts[1..].join(" ");
+
+            let category = match cat_str {
+                "FETCH" | "TRADE" | "KLINE" | "OI" => DebugLogCategory::Fetch,
+                "CACHE" => DebugLogCategory::Cache,
+                "WS" => DebugLogCategory::Ws,
+                "CHART" => DebugLogCategory::Chart,
+                "DATA" => DebugLogCategory::Data,
+                _ => DebugLogCategory::App,
+            };
+
+            // Extract key info for summary
+            let summary = extract_summary(details, cat_str);
+            return (category, event, summary);
+        }
+    }
+
+    // Fallback: classify by target
+    let category = match target {
+        Some(t) if t.starts_with("flowsurface") || t.starts_with("flowsurface_") => {
+            if t.contains("exchange") {
+                DebugLogCategory::Fetch
+            } else {
+                DebugLogCategory::App
+            }
+        }
+        Some(t) if t == "iced_wgpu" || t.contains("wgpu") || t.contains("winit") => {
+            DebugLogCategory::ThirdParty
+        }
+        Some("panic") => DebugLogCategory::App,
+        Some(_) => DebugLogCategory::ThirdParty,
+        None => DebugLogCategory::App,
+    };
+
+    (category, String::new(), message.to_string())
+}
+
+fn extract_summary(details: &str, cat_str: &str) -> String {
+    let mut summary_parts = Vec::new();
+
+    for part in details.split_whitespace() {
+        if let Some((key, value)) = part.split_once('=') {
+            match key {
+                "symbol" | "venue" | "range" | "records" | "trades" | "duration" | "requests"
+                | "session" | "reason" | "error" => {
+                    summary_parts.push(format!("{key}={value}"));
+                }
+                _ => {}
+            }
+        }
+    }
+
+    if summary_parts.is_empty() {
+        // For TRADE/KLINE/OI, try to extract symbol and venue from details
+        if matches!(cat_str, "TRADE" | "KLINE" | "OI") {
+            for part in details.split_whitespace() {
+                if let Some(("venue" | "symbol" | "records" | "duration", value)) =
+                    part.split_once('=')
+                {
+                    summary_parts.push(value.to_string());
+                }
+            }
+        }
+
+        if summary_parts.is_empty() {
+            return details.to_string();
+        }
+    }
+
+    summary_parts.join(" ")
+}
+
+fn is_app_target(target: Option<&str>) -> bool {
+    match target {
+        Some(t) => t.starts_with("flowsurface") || t.starts_with("flowsurface_") || t == "panic",
+        None => true,
+    }
 }
 
 impl Flowsurface {
@@ -154,6 +474,15 @@ impl Flowsurface {
             theme: saved_state.theme,
             notifications: Notifications::new(),
             network: NetworkManager::new(saved_state.proxy_cfg),
+            debug_terminal_enabled: saved_state.debug_terminal_enabled,
+            debug_terminal_window: None,
+            debug_terminal_logs: logger::debug_terminal_snapshot(),
+            debug_terminal_filter: DebugTerminalFilter::All,
+            debug_terminal_category_filter: DebugLogCategory::All,
+            debug_terminal_search: String::new(),
+            debug_terminal_auto_scroll: true,
+            debug_terminal_app_only: true,
+            debug_terminal_compact_mode: true,
         };
 
         if let Some(err) = audio_init_err {
@@ -186,12 +515,19 @@ impl Flowsurface {
                 Task::none()
             });
 
+        let debug_terminal = if state.debug_terminal_enabled {
+            state.open_debug_terminal()
+        } else {
+            Task::none()
+        };
+
         (
             state,
             open_main_window
                 .discard()
                 .chain(load_layout)
-                .chain(launch_sidebar.map(Message::Sidebar)),
+                .chain(launch_sidebar.map(Message::Sidebar))
+                .chain(debug_terminal),
         )
     }
 
@@ -254,6 +590,12 @@ impl Flowsurface {
             }
             Message::WindowEvent(event) => match event {
                 window::Event::CloseRequested(window) => {
+                    if self.debug_terminal_window == Some(window) {
+                        self.debug_terminal_window = None;
+                        self.debug_terminal_enabled = false;
+                        return window::close(window);
+                    }
+
                     let main_window = self.main_window.id;
                     let dashboard = self.active_dashboard_mut();
 
@@ -445,6 +787,59 @@ impl Flowsurface {
                 if checked {
                     self.confirm_dialog = None;
                 }
+            }
+            Message::ToggleDebugTerminal(enabled) => {
+                self.debug_terminal_enabled = enabled;
+
+                if enabled {
+                    self.debug_terminal_logs = logger::debug_terminal_snapshot();
+                    return self.open_debug_terminal();
+                } else if let Some(window) = self.debug_terminal_window.take() {
+                    return window::close(window);
+                }
+            }
+            Message::DebugTerminalOpened(window) => {
+                self.debug_terminal_window = Some(window);
+                self.debug_terminal_logs = logger::debug_terminal_snapshot();
+                if self.debug_terminal_auto_scroll {
+                    return self.scroll_debug_terminal_to_bottom();
+                }
+            }
+            Message::DebugTerminalRefresh => {
+                if self.debug_terminal_enabled || self.debug_terminal_window.is_some() {
+                    self.debug_terminal_logs = logger::debug_terminal_snapshot();
+                    if self.debug_terminal_auto_scroll {
+                        return self.scroll_debug_terminal_to_bottom();
+                    }
+                }
+            }
+            Message::DebugTerminalClear => {
+                logger::clear_debug_terminal();
+                self.debug_terminal_logs.clear();
+            }
+            Message::DebugTerminalCopyAll => {
+                return iced::clipboard::write(self.debug_terminal_logs.join("\n"));
+            }
+            Message::DebugTerminalSearchChanged(value) => {
+                self.debug_terminal_search = value;
+            }
+            Message::DebugTerminalFilterChanged(filter) => {
+                self.debug_terminal_filter = filter;
+            }
+            Message::DebugTerminalToggleAutoScroll(enabled) => {
+                self.debug_terminal_auto_scroll = enabled;
+                if enabled {
+                    return self.scroll_debug_terminal_to_bottom();
+                }
+            }
+            Message::DebugTerminalCategoryFilterChanged(category) => {
+                self.debug_terminal_category_filter = category;
+            }
+            Message::DebugTerminalToggleAppOnly(app_only) => {
+                self.debug_terminal_app_only = app_only;
+            }
+            Message::DebugTerminalToggleCompactMode(compact) => {
+                self.debug_terminal_compact_mode = compact;
             }
             Message::ToggleDialogModal(dialog) => {
                 self.confirm_dialog = dialog;
@@ -660,6 +1055,10 @@ impl Flowsurface {
     }
 
     fn view(&self, id: window::Id) -> Element<'_, Message> {
+        if self.debug_terminal_window == Some(id) {
+            return self.debug_terminal_view();
+        }
+
         let dashboard = self.active_dashboard();
         let sidebar_pos = self.sidebar.position();
 
@@ -745,6 +1144,10 @@ impl Flowsurface {
     }
 
     fn title(&self, _window: window::Id) -> String {
+        if self.debug_terminal_window == Some(_window) {
+            return "Flowsurface Debug Terminal".to_string();
+        }
+
         if let Some(id) = self.layout_manager.active_layout_id() {
             format!("Flowsurface [{}]", id.name)
         } else {
@@ -766,6 +1169,12 @@ impl Flowsurface {
             .map(Message::MarketWsEvent);
 
         let tick = iced::window::frames().map(Message::Tick);
+        let debug_terminal = if self.debug_terminal_enabled || self.debug_terminal_window.is_some()
+        {
+            iced::time::every(Duration::from_millis(500)).map(|_| Message::DebugTerminalRefresh)
+        } else {
+            Subscription::none()
+        };
 
         let hotkeys = keyboard::listen().filter_map(|event| {
             let keyboard::Event::KeyPressed { key, .. } = event else {
@@ -782,8 +1191,213 @@ impl Flowsurface {
             sidebar,
             window_events,
             tick,
+            debug_terminal,
             hotkeys,
         ])
+    }
+
+    fn open_debug_terminal(&self) -> Task<Message> {
+        if self.debug_terminal_window.is_some() {
+            return Task::none();
+        }
+
+        let config = window::Settings {
+            size: iced::Size::new(920.0, 520.0),
+            position: window::Position::Centered,
+            exit_on_close_request: false,
+            min_size: Some(iced::Size::new(560.0, 320.0)),
+            ..Default::default()
+        };
+
+        let (id, open) = window::open(config);
+        open.map(move |_| Message::DebugTerminalOpened(id))
+    }
+
+    fn debug_terminal_view(&self) -> Element<'_, Message> {
+        let filtered = self.filtered_debug_terminal_entries();
+        let total = self.debug_terminal_logs.len();
+        let visible = filtered.len();
+        let error_count = filtered
+            .iter()
+            .filter(|e| e.level == Some(DebugLogLevel::Error))
+            .count();
+        let warn_count = filtered
+            .iter()
+            .filter(|e| e.level == Some(DebugLogLevel::Warn))
+            .count();
+
+        // Top row: title + stats
+        let header = row![
+            text("Debug terminal")
+                .size(crate::style::text_size::SECTION)
+                .width(Length::Fill),
+            text(format!("{visible} visible / {total} total")).size(crate::style::text_size::SMALL),
+            if error_count > 0 {
+                text(format!(" {error_count} errors"))
+                    .size(crate::style::text_size::SMALL)
+                    .style(|theme: &iced::Theme| iced::widget::text::Style {
+                        color: Some(theme.extended_palette().danger.base.color),
+                    })
+            } else {
+                text("")
+            },
+            if warn_count > 0 {
+                text(format!(" {warn_count} warnings"))
+                    .size(crate::style::text_size::SMALL)
+                    .style(|theme: &iced::Theme| iced::widget::text::Style {
+                        color: Some(theme.extended_palette().primary.strong.color),
+                    })
+            } else {
+                text("")
+            },
+        ]
+        .align_y(Alignment::Center)
+        .spacing(12);
+
+        // Toolbar row
+        let toolbar = row![
+            button(text("Clear")).on_press(Message::DebugTerminalClear),
+            button(text("Refresh")).on_press(Message::DebugTerminalRefresh),
+            button(text("Copy all")).on_press(Message::DebugTerminalCopyAll),
+            button(text("Open data folder")).on_press(Message::DataFolderRequested),
+            iced::widget::checkbox(self.debug_terminal_auto_scroll)
+                .label("Auto-scroll")
+                .on_toggle(Message::DebugTerminalToggleAutoScroll),
+            iced::widget::checkbox(self.debug_terminal_app_only)
+                .label("App only")
+                .on_toggle(Message::DebugTerminalToggleAppOnly),
+            iced::widget::checkbox(self.debug_terminal_compact_mode)
+                .label("Compact")
+                .on_toggle(Message::DebugTerminalToggleCompactMode),
+        ]
+        .align_y(Alignment::Center)
+        .spacing(8);
+
+        // Filter row
+        let filters = row![
+            text_input("Search logs...", &self.debug_terminal_search)
+                .on_input(Message::DebugTerminalSearchChanged)
+                .width(Length::Fill),
+            pick_list(
+                DebugTerminalFilter::ALL,
+                Some(self.debug_terminal_filter),
+                Message::DebugTerminalFilterChanged,
+            )
+            .width(100),
+            pick_list(
+                DebugLogCategory::ALL,
+                Some(self.debug_terminal_category_filter),
+                Message::DebugTerminalCategoryFilterChanged,
+            )
+            .width(110),
+        ]
+        .align_y(Alignment::Center)
+        .spacing(8);
+
+        // Log body
+        let log_body: Element<'static, Message> = if filtered.is_empty() {
+            text("No logs captured yet")
+                .size(crate::style::text_size::SMALL)
+                .font(iced::Font::MONOSPACE)
+                .into()
+        } else if self.debug_terminal_compact_mode {
+            // Compact mode: structured rows
+            let mut log_rows = column![].spacing(1);
+            for entry in filtered {
+                log_rows = log_rows.push(compact_log_row(entry));
+            }
+            log_rows.into()
+        } else {
+            // Raw mode: full lines
+            let mut log_lines = column![].spacing(1);
+            for entry in filtered {
+                log_lines = log_lines.push(
+                    text(entry.raw)
+                        .size(crate::style::text_size::SMALL)
+                        .font(iced::Font::MONOSPACE)
+                        .wrapping(iced::widget::text::Wrapping::None)
+                        .style(debug_log_text_style(entry.level)),
+                );
+            }
+            log_lines.into()
+        };
+
+        // Horizontal scrollable wraps the log body
+        let h_scroll = scrollable::Scrollable::with_direction(
+            container(log_body).width(Length::Shrink).padding(12),
+            scrollable::Direction::Horizontal(
+                scrollable::Scrollbar::new().width(8).scroller_width(6),
+            ),
+        )
+        .id(DEBUG_TERMINAL_HSCROLL_ID);
+
+        // Vertical scrollable wraps the horizontal one
+        let v_scroll = scrollable::Scrollable::with_direction(
+            h_scroll,
+            scrollable::Direction::Vertical(
+                scrollable::Scrollbar::new().width(8).scroller_width(6),
+            ),
+        )
+        .id(DEBUG_TERMINAL_VSCROLL_ID);
+
+        container(column![header, toolbar, filters, v_scroll].spacing(8))
+            .width(Length::Fill)
+            .height(Length::Fill)
+            .padding(16)
+            .style(style::dashboard_modal)
+            .into()
+    }
+
+    fn filtered_debug_terminal_entries(&self) -> Vec<DebugLogEntry> {
+        let search = self.debug_terminal_search.trim().to_lowercase();
+
+        self.debug_terminal_logs
+            .iter()
+            .filter(|line| self.debug_terminal_filter.matches(line))
+            .filter(|line| {
+                if self.debug_terminal_app_only {
+                    let entry = parse_debug_log_entry(line);
+                    is_app_target(entry.target.as_deref())
+                } else {
+                    true
+                }
+            })
+            .filter(|line| {
+                if self.debug_terminal_category_filter != DebugLogCategory::All {
+                    let entry = parse_debug_log_entry(line);
+                    entry.category == self.debug_terminal_category_filter
+                } else {
+                    true
+                }
+            })
+            .filter(|line| {
+                if search.is_empty() {
+                    true
+                } else {
+                    let entry = parse_debug_log_entry(line);
+                    entry.raw.to_lowercase().contains(&search)
+                        || entry.summary.to_lowercase().contains(&search)
+                        || entry.event.to_lowercase().contains(&search)
+                        || entry
+                            .target
+                            .as_deref()
+                            .unwrap_or("")
+                            .to_lowercase()
+                            .contains(&search)
+                        || format!("{}", entry.category)
+                            .to_lowercase()
+                            .contains(&search)
+                }
+            })
+            .map(|line| parse_debug_log_entry(line))
+            .collect()
+    }
+
+    fn scroll_debug_terminal_to_bottom(&self) -> Task<Message> {
+        iced::widget::operation::snap_to(
+            DEBUG_TERMINAL_VSCROLL_ID,
+            iced::widget::scrollable::RelativeOffset { x: 0.0, y: 1.0 },
+        )
     }
 
     fn active_dashboard(&self) -> &Dashboard {
@@ -976,6 +1590,18 @@ impl Flowsurface {
                         )
                     };
 
+                    let debug_terminal_checkbox = {
+                        let checkbox = iced::widget::checkbox(self.debug_terminal_enabled)
+                            .label("Debug terminal")
+                            .on_toggle(Message::ToggleDebugTerminal);
+
+                        tooltip(
+                            checkbox,
+                            Some("Open a popup terminal with detailed application logs"),
+                            TooltipPosition::Top,
+                        )
+                    };
+
                     let open_data_folder = {
                         let button =
                             button(text("Open data folder")).on_press(Message::DataFolderRequested);
@@ -1048,7 +1674,13 @@ impl Flowsurface {
                         column![text("Interface scale").size(crate::style::text_size::SECTION), scale_factor,].spacing(12),
                         column![
                             text("Experimental").size(crate::style::text_size::SECTION),
-                            column![trade_fetch_checkbox, toggle_theme_editor, toggle_network_editor].spacing(8),
+                            column![
+                                trade_fetch_checkbox,
+                                debug_terminal_checkbox,
+                                toggle_theme_editor,
+                                toggle_network_editor
+                            ]
+                            .spacing(8),
                         ]
                         .spacing(12),
                         footer,
@@ -1340,6 +1972,7 @@ impl Flowsurface {
             connector::fetcher::is_trade_fetch_enabled(),
             self.volume_size_unit,
             proxy_cfg_persisted,
+            self.debug_terminal_enabled,
         );
 
         match serde_json::to_string(&state) {
@@ -1372,4 +2005,72 @@ impl Flowsurface {
 
         close_windows.chain(init_task)
     }
+}
+
+fn compact_log_row(entry: DebugLogEntry) -> Element<'static, Message> {
+    let time_text = entry
+        .timestamp
+        .as_deref()
+        .and_then(|ts| ts.split_whitespace().last())
+        .unwrap_or("")
+        .to_string();
+
+    let level_str = match entry.level {
+        Some(DebugLogLevel::Error) => "ERR",
+        Some(DebugLogLevel::Warn) => "WRN",
+        Some(DebugLogLevel::Info) => "INF",
+        Some(DebugLogLevel::Debug) => "DBG",
+        Some(DebugLogLevel::Trace) => "TRC",
+        None => "---",
+    };
+
+    let level = entry.level;
+    let category = entry.category;
+    let cat_str = format!("{}", category);
+    let event_str = if entry.event.is_empty() {
+        "-".to_string()
+    } else {
+        entry.event
+    };
+    let summary_str = entry.summary;
+
+    row![
+        text(time_text)
+            .size(crate::style::text_size::SMALL)
+            .font(iced::Font::MONOSPACE)
+            .width(Length::Fixed(100.0)),
+        text(level_str)
+            .size(crate::style::text_size::SMALL)
+            .font(iced::Font::MONOSPACE)
+            .width(Length::Fixed(32.0))
+            .style(debug_log_text_style(level)),
+        text(cat_str)
+            .size(crate::style::text_size::SMALL)
+            .font(iced::Font::MONOSPACE)
+            .width(Length::Fixed(72.0))
+            .style(move |theme: &iced::Theme| {
+                let palette = theme.extended_palette();
+                let color = match category {
+                    DebugLogCategory::Fetch => Some(palette.primary.strong.color),
+                    DebugLogCategory::Cache => Some(palette.secondary.strong.color),
+                    DebugLogCategory::Ws => Some(palette.warning.strong.color),
+                    DebugLogCategory::Chart => Some(palette.success.strong.color),
+                    DebugLogCategory::Data => Some(palette.primary.base.color),
+                    DebugLogCategory::ThirdParty => Some(palette.background.strongest.color),
+                    _ => None,
+                };
+                iced::widget::text::Style { color }
+            }),
+        text(event_str)
+            .size(crate::style::text_size::SMALL)
+            .font(iced::Font::MONOSPACE)
+            .width(Length::Fixed(80.0)),
+        text(summary_str)
+            .size(crate::style::text_size::SMALL)
+            .font(iced::Font::MONOSPACE)
+            .wrapping(iced::widget::text::Wrapping::None),
+    ]
+    .align_y(Alignment::Center)
+    .spacing(8)
+    .into()
 }

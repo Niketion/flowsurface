@@ -1,4 +1,5 @@
 use crate::chart::comparison::ComparisonChart;
+use crate::chart::kline::VolumeBubbleQtyScale;
 use crate::screen::dashboard::pane::{Event, Message};
 use crate::screen::dashboard::panel::timeandsales;
 use crate::split_column;
@@ -6,7 +7,7 @@ use crate::widget::{classic_slider_row, labeled_slider};
 use crate::{style, tooltip, widget::scrollable_content};
 
 use data::chart::heatmap::HeatmapStudy;
-use data::chart::kline::FootprintStudy;
+use data::chart::kline::{BubbleColorMode, FootprintStudy, VolumeBubbleSession};
 use data::chart::{
     KlineChartKind,
     heatmap::{self, CoalesceKind},
@@ -600,6 +601,7 @@ pub fn kline_cfg_view<'a>(
     kind: &'a KlineChartKind,
     pane: pane_grid::Pane,
     basis: data::chart::Basis,
+    volume_bubble_qty_scale: VolumeBubbleQtyScale,
 ) -> Element<'a, Message> {
     let display_readout_section = {
         let data_labels_checkbox = tooltip(
@@ -610,6 +612,7 @@ pub fn kline_cfg_view<'a>(
                         pane,
                         VisualConfig::Kline(data::chart::kline::Config {
                             data_labels_always_visible: value,
+                            ..cfg
                         }),
                         false,
                     )
@@ -626,8 +629,190 @@ pub fn kline_cfg_view<'a>(
 
     let content = match kind {
         KlineChartKind::Candles => {
+            let bubbles_cfg = cfg.volume_bubbles;
+            let volume_bubbles_section = {
+                let enabled_checkbox = tooltip(
+                    checkbox(bubbles_cfg.enabled)
+                        .label("Show volume bubbles")
+                        .on_toggle(move |value| {
+                            Message::VisualConfigChanged(
+                                pane,
+                                VisualConfig::Kline(data::chart::kline::Config {
+                                    volume_bubbles: data::chart::kline::VolumeBubbleConfig {
+                                        enabled: value,
+                                        ..bubbles_cfg
+                                    },
+                                    ..cfg
+                                }),
+                                false,
+                            )
+                        }),
+                    Some("Draw order-flow bubbles on the main candlestick chart"),
+                    TooltipPosition::Top,
+                );
+
+                let max_bubbles_slider = slider(
+                    1.0..=10.0,
+                    bubbles_cfg.max_bubbles_per_bar as f32,
+                    move |value| {
+                        Message::VisualConfigChanged(
+                            pane,
+                            VisualConfig::Kline(data::chart::kline::Config {
+                                volume_bubbles: data::chart::kline::VolumeBubbleConfig {
+                                    max_bubbles_per_bar: value as usize,
+                                    ..bubbles_cfg
+                                },
+                                ..cfg
+                            }),
+                            false,
+                        )
+                    },
+                )
+                .step(1.0);
+
+                let min_qty_slider = labeled_slider(
+                    "Min volume",
+                    volume_bubble_qty_scale.min..=volume_bubble_qty_scale.max,
+                    bubbles_cfg
+                        .min_qty
+                        .clamp(volume_bubble_qty_scale.min, volume_bubble_qty_scale.max),
+                    move |value| {
+                        Message::VisualConfigChanged(
+                            pane,
+                            VisualConfig::Kline(data::chart::kline::Config {
+                                volume_bubbles: data::chart::kline::VolumeBubbleConfig {
+                                    min_qty: value,
+                                    ..bubbles_cfg
+                                },
+                                ..cfg
+                            }),
+                            false,
+                        )
+                    },
+                    |value| format_with_commas(*value),
+                    Some(volume_bubble_qty_scale.step),
+                );
+
+                let min_radius_slider = labeled_slider(
+                    "Min size",
+                    1.0..=20.0,
+                    bubbles_cfg.min_radius_px,
+                    move |value| {
+                        Message::VisualConfigChanged(
+                            pane,
+                            VisualConfig::Kline(data::chart::kline::Config {
+                                volume_bubbles: data::chart::kline::VolumeBubbleConfig {
+                                    min_radius_px: value,
+                                    ..bubbles_cfg
+                                },
+                                ..cfg
+                            }),
+                            false,
+                        )
+                    },
+                    |value| format!("{value:.0}px"),
+                    Some(1.0),
+                );
+
+                let max_radius_slider = labeled_slider(
+                    "Max size",
+                    4.0..=40.0,
+                    bubbles_cfg.max_radius_px,
+                    move |value| {
+                        Message::VisualConfigChanged(
+                            pane,
+                            VisualConfig::Kline(data::chart::kline::Config {
+                                volume_bubbles: data::chart::kline::VolumeBubbleConfig {
+                                    max_radius_px: value,
+                                    ..bubbles_cfg
+                                },
+                                ..cfg
+                            }),
+                            false,
+                        )
+                    },
+                    |value| format!("{value:.0}px"),
+                    Some(1.0),
+                );
+
+                let labels_checkbox = checkbox(bubbles_cfg.show_labels)
+                    .label("Show bubble labels")
+                    .on_toggle(move |value| {
+                        Message::VisualConfigChanged(
+                            pane,
+                            VisualConfig::Kline(data::chart::kline::Config {
+                                volume_bubbles: data::chart::kline::VolumeBubbleConfig {
+                                    show_labels: value,
+                                    ..bubbles_cfg
+                                },
+                                ..cfg
+                            }),
+                            false,
+                        )
+                    });
+
+                let color_mode_picklist = pick_list(
+                    BubbleColorMode::ALL,
+                    Some(bubbles_cfg.color_mode),
+                    move |value| {
+                        Message::VisualConfigChanged(
+                            pane,
+                            VisualConfig::Kline(data::chart::kline::Config {
+                                volume_bubbles: data::chart::kline::VolumeBubbleConfig {
+                                    color_mode: value,
+                                    ..bubbles_cfg
+                                },
+                                ..cfg
+                            }),
+                            false,
+                        )
+                    },
+                );
+
+                let session_picklist = pick_list(
+                    VolumeBubbleSession::ALL,
+                    Some(bubbles_cfg.session),
+                    move |value| {
+                        Message::VisualConfigChanged(
+                            pane,
+                            VisualConfig::Kline(data::chart::kline::Config {
+                                volume_bubbles: data::chart::kline::VolumeBubbleConfig {
+                                    session: value,
+                                    ..bubbles_cfg
+                                },
+                                ..cfg
+                            }),
+                            false,
+                        )
+                    },
+                );
+
+                column![
+                    text("Volume bubbles").size(crate::style::text_size::SECTION),
+                    enabled_checkbox,
+                    text("Uses fetched trade data when enabled.")
+                        .size(crate::style::text_size::SMALL),
+                    session_picklist,
+                    column![
+                        text(format!(
+                            "Max per candle: {}",
+                            bubbles_cfg.max_bubbles_per_bar
+                        )),
+                        max_bubbles_slider,
+                    ]
+                    .spacing(4),
+                    min_qty_slider,
+                    min_radius_slider,
+                    max_radius_slider,
+                    labels_checkbox,
+                    color_mode_picklist,
+                ]
+                .spacing(8)
+            };
+
             split_column![
                 display_readout_section,
+                volume_bubbles_section,
                 row![
                     space::horizontal(),
                     sync_all_button(pane, VisualConfig::Kline(cfg))
@@ -644,6 +829,23 @@ pub fn kline_cfg_view<'a>(
                 pick_list(ClusterKind::ALL, Some(clusters), move |new_cluster_kind| {
                     Message::PaneEvent(pane, Event::ClusterKindSelected(new_cluster_kind))
                 });
+
+            let footprint_summary_checkbox = tooltip(
+                checkbox(cfg.show_footprint_summary)
+                    .label("Show footprint summary")
+                    .on_toggle(move |value| {
+                        Message::VisualConfigChanged(
+                            pane,
+                            VisualConfig::Kline(data::chart::kline::Config {
+                                show_footprint_summary: value,
+                                ..cfg
+                            }),
+                            false,
+                        )
+                    }),
+                Some("Show per-bar volume and delta below footprint candles"),
+                TooltipPosition::Top,
+            );
 
             let scaling = {
                 let picklist = pick_list(
@@ -676,24 +878,62 @@ pub fn kline_cfg_view<'a>(
                 }
             };
 
-            let study_cfg = study_config.view(studies, basis).map(move |msg| {
-                Message::PaneEvent(
-                    pane,
-                    Event::StudyConfigurator(study::StudyMessage::Footprint(msg)),
-                )
-            });
+            let available_studies: Vec<_> = data::chart::kline::FootprintStudy::ALL
+                .iter()
+                .copied()
+                .filter(|study| clusters.allows_study(study))
+                .collect();
 
-            split_column![
+            let active_studies: Vec<_> = studies
+                .iter()
+                .copied()
+                .filter(|study| {
+                    available_studies
+                        .iter()
+                        .any(|available| available.is_same_type(study))
+                })
+                .collect();
+
+            let study_cfg = study_config
+                .view_available(&active_studies, basis, available_studies)
+                .map(move |msg| {
+                    Message::PaneEvent(
+                        pane,
+                        Event::StudyConfigurator(study::StudyMessage::Footprint(msg)),
+                    )
+                });
+
+            let mut content = split_column![
                 display_readout_section,
+                column![text("Footprint summary").size(crate::style::text_size::SECTION), footprint_summary_checkbox].spacing(8),
                 column![text("Cluster type").size(crate::style::text_size::SECTION), cluster_picklist].spacing(8),
-                column![text("Cluster scaling").size(crate::style::text_size::SECTION), scaling].spacing(8),
-                column![text("Studies").size(crate::style::text_size::SECTION), study_cfg].spacing(8),
-                row![
+                ; spacing = 12, align_x = Alignment::Start
+            ];
+
+            if *clusters != data::chart::kline::ClusterKind::Table {
+                content = content.push(
+                    column![
+                        text("Cluster scaling").size(crate::style::text_size::SECTION),
+                        scaling
+                    ]
+                    .spacing(8),
+                );
+            }
+
+            content = content
+                .push(
+                    column![
+                        text("Studies").size(crate::style::text_size::SECTION),
+                        study_cfg
+                    ]
+                    .spacing(8),
+                )
+                .push(row![
                     space::horizontal(),
                     sync_all_button(pane, VisualConfig::Kline(cfg))
-                ],
-                ; spacing = 12, align_x = Alignment::Start
-            ]
+                ]);
+
+            content
         }
     };
 
@@ -1082,12 +1322,21 @@ pub mod study {
 
         pub fn view<'a>(
             &self,
-            active_studies: &'a [S],
+            active_studies: &[S],
             basis: data::chart::Basis,
+        ) -> Element<'a, Message<S>> {
+            self.view_available(active_studies, basis, S::all())
+        }
+
+        pub fn view_available<'a>(
+            &self,
+            active_studies: &[S],
+            basis: data::chart::Basis,
+            available_studies: Vec<S>,
         ) -> Element<'a, Message<S>> {
             let mut content = column![].spacing(4);
 
-            for available_study in S::all() {
+            for available_study in available_studies {
                 content =
                     content.push(self.create_study_row(available_study, active_studies, basis));
             }
@@ -1098,7 +1347,7 @@ pub mod study {
         fn create_study_row<'a>(
             &self,
             study: S,
-            active_studies: &'a [S],
+            active_studies: &[S],
             basis: data::chart::Basis,
         ) -> Element<'a, Message<S>> {
             let (is_selected, study_config) = {

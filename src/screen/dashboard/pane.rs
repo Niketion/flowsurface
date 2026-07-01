@@ -200,6 +200,12 @@ impl State {
             let trades_stream = |derived_plan: &PaneSetup| StreamKind::Trades {
                 ticker_info: derived_plan.ticker_info,
             };
+            let volume_bubbles_enabled = self
+                .settings
+                .visual_config
+                .as_ref()
+                .and_then(|cfg| cfg.kline())
+                .is_some_and(|cfg| cfg.volume_bubbles.enabled);
 
             match kind {
                 ContentKind::HeatmapChart => {
@@ -249,7 +255,13 @@ impl State {
                         )
                     };
 
-                    let time_basis_stream = |tf| vec![kline_stream(derived_plan.ticker_info, tf)];
+                    let time_basis_stream = |tf| {
+                        let mut streams = vec![kline_stream(derived_plan.ticker_info, tf)];
+                        if volume_bubbles_enabled {
+                            streams.push(trades_stream(&derived_plan));
+                        }
+                        streams
+                    };
                     let tick_basis_stream = || {
                         let depth_aggr = derived_plan
                             .ticker_info
@@ -938,6 +950,7 @@ impl State {
                             chart_kind,
                             id,
                             chart.basis(),
+                            chart.volume_bubble_qty_scale(),
                         )
                     };
 
@@ -1373,10 +1386,18 @@ impl State {
                                                     };
                                                     let mut streams = vec![kline_stream];
 
-                                                    if matches!(
+                                                    let needs_trades = matches!(
                                                         c.kind,
                                                         data::chart::KlineChartKind::Footprint { .. }
-                                                    ) {
+                                                    ) || (matches!(
+                                                        c.kind,
+                                                        data::chart::KlineChartKind::Candles
+                                                    ) && c
+                                                        .visual_config()
+                                                        .volume_bubbles
+                                                        .enabled);
+
+                                                    if needs_trades {
                                                         streams.push(StreamKind::Trades {
                                                             ticker_info: base_ticker,
                                                         });
@@ -1959,7 +1980,9 @@ impl Content {
                 |indis| {
                     indis
                         .into_iter()
-                        .filter(|i| available.contains(i))
+                        .filter(|i| {
+                            available.contains(i) && determined_chart_kind.allows_indicator(*i)
+                        })
                         .collect()
                 },
             )
@@ -2102,13 +2125,19 @@ impl Content {
             }
             (
                 Content::Kline {
-                    chart, indicators, ..
+                    chart,
+                    indicators,
+                    kind,
+                    ..
                 },
                 UiIndicator::Kline(ind),
             ) => {
                 let Some(chart) = chart else {
                     return;
                 };
+                if !kind.allows_indicator(ind) {
+                    return;
+                }
 
                 if indicators.contains(&ind) {
                     indicators.retain(|i| i != &ind);
@@ -2152,27 +2181,42 @@ impl Content {
         }
     }
 
-    pub fn change_visual_config(&mut self, config: VisualConfig) {
+    pub fn change_visual_config(&mut self, config: VisualConfig) -> bool {
         match (self, config) {
-            (Content::Kline { chart: Some(c), .. }, VisualConfig::Kline(cfg)) => {
+            (
+                Content::Kline {
+                    chart: Some(c),
+                    kind,
+                    ..
+                },
+                VisualConfig::Kline(cfg),
+            ) => {
+                let should_refresh_streams = matches!(kind, data::chart::KlineChartKind::Candles)
+                    && c.visual_config().volume_bubbles.enabled != cfg.volume_bubbles.enabled;
                 c.set_visual_config(cfg);
+                should_refresh_streams
             }
             (Content::Heatmap { chart: Some(c), .. }, VisualConfig::Heatmap(cfg)) => {
                 c.set_visual_config(cfg);
+                false
             }
             (Content::ShaderHeatmap { chart: Some(c), .. }, VisualConfig::Heatmap(cfg)) => {
                 c.set_visual_config(cfg);
+                false
             }
             (Content::Comparison(Some(chart)), VisualConfig::Comparison(cfg)) => {
                 chart.config = cfg;
+                false
             }
             (Content::TimeAndSales(Some(panel)), VisualConfig::TimeAndSales(cfg)) => {
                 panel.config = cfg;
+                false
             }
             (Content::Ladder(Some(panel)), VisualConfig::Ladder(cfg)) => {
                 panel.config = cfg;
+                false
             }
-            _ => {}
+            _ => false,
         }
     }
 
@@ -2227,15 +2271,13 @@ impl Content {
                 *previous = studies;
             }
             (Content::Kline { chart, kind, .. }, data::chart::Study::Footprint(studies)) => {
-                chart
-                    .as_mut()
-                    .expect("kline chart not initialized")
-                    .set_studies(studies.clone());
+                let chart = chart.as_mut().expect("kline chart not initialized");
+                chart.set_studies(studies.clone());
                 if let data::chart::KlineChartKind::Footprint {
                     studies: k_studies, ..
                 } = kind
                 {
-                    *k_studies = studies;
+                    *k_studies = chart.studies().unwrap_or_default();
                 }
             }
             _ => {}
@@ -2272,6 +2314,18 @@ impl Content {
             Content::Ladder(panel) => panel.is_some(),
             Content::Comparison(chart) => chart.is_some(),
             Content::Starter => true,
+        }
+    }
+
+    pub fn allows_indicator(&self, indicator: UiIndicator) -> bool {
+        match (self, indicator) {
+            (Content::Kline { kind, .. }, UiIndicator::Kline(indicator)) => {
+                kind.allows_indicator(indicator)
+            }
+            (Content::Heatmap { .. } | Content::ShaderHeatmap { .. }, UiIndicator::Heatmap(_)) => {
+                true
+            }
+            _ => false,
         }
     }
 }
