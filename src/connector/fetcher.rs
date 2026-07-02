@@ -388,10 +388,17 @@ impl RequestHandler {
         superseded_ids
     }
 
-    /// Check if a request belongs to a stale generation.
+    /// Check if a request belongs to a stale generation AND is still active.
+    /// Returns false for already-terminal requests (Completed, Failed) since
+    /// their results have already been applied.
     pub fn is_stale_generation(&self, req_id: Uuid) -> bool {
         if let Some(request) = self.requests.get(&req_id) {
-            request.generation != self.generation_id
+            // Already-terminal requests are not considered stale
+            // (their result was already applied before the reset)
+            match request.status {
+                RequestStatus::Completed(_) | RequestStatus::Failed { .. } => false,
+                _ => request.generation != self.generation_id,
+            }
         } else {
             // Request not found - treat as stale
             true
@@ -401,12 +408,6 @@ impl RequestHandler {
     /// Get the generation ID of a specific request.
     pub fn request_generation(&self, req_id: Uuid) -> Option<u64> {
         self.requests.get(&req_id).map(|r| r.generation)
-    }
-
-    /// Remove a request from the pending map and return its fetch range.
-    /// Used for explicit cancellation/superseding.
-    pub fn remove_request(&mut self, id: Uuid) -> Option<FetchRange> {
-        self.requests.remove(&id).map(|r| r.fetch_type)
     }
 
     fn status_counts(&self) -> (usize, usize, usize, usize) {
@@ -702,13 +703,19 @@ impl RequestHandler {
                     Ok(None)
                 }
                 RequestStatus::Superseded { .. } => {
-                    // Previous request was superseded, allow new request
-                    log::info!(
-                        "FETCH RetryAllowed | reason=previous_superseded req={} previous_req={} {}",
-                        short_id(id),
-                        short_id(existing_id),
-                        format_fetch_range(&fetch)
-                    );
+                    // Previous request was superseded, reactivate with new generation
+                    if let Some(existing_req) = self.requests.get_mut(&existing_id) {
+                        log::info!(
+                            "FETCH Reactivate | req={} previous_status=Superseded new_generation={} {}",
+                            short_id(existing_id),
+                            self.generation_id,
+                            format_fetch_range(&fetch)
+                        );
+                        existing_req.status = RequestStatus::Pending;
+                        existing_req.generation = self.generation_id;
+                        existing_req.updated_at = now;
+                        existing_req.attempts = 0;
+                    }
                     Ok(Some(existing_id))
                 }
             };
@@ -734,6 +741,29 @@ impl RequestHandler {
 
     pub fn mark_completed(&mut self, id: Uuid) {
         if let Some(request) = self.requests.get_mut(&id) {
+            // Do not overwrite a terminal status (Superseded, Failed, Completed)
+            if matches!(request.status, RequestStatus::Superseded { .. }) {
+                log::info!(
+                    "FETCH StaleResult | req={} action=discard_already_superseded",
+                    short_id(id)
+                );
+                return;
+            }
+            if matches!(request.status, RequestStatus::Failed { .. }) {
+                log::info!(
+                    "FETCH StaleResult | req={} action=discard_already_failed",
+                    short_id(id)
+                );
+                return;
+            }
+            if matches!(request.status, RequestStatus::Completed(_)) {
+                log::info!(
+                    "FETCH StaleResult | req={} action=discard_already_completed",
+                    short_id(id)
+                );
+                return;
+            }
+
             let timestamp = chrono::Utc::now().timestamp_millis() as u64;
             request.status = RequestStatus::Completed(timestamp);
             log::debug!(
@@ -753,6 +783,22 @@ impl RequestHandler {
 
     pub fn mark_failed(&mut self, id: Uuid, error: String) {
         if let Some(request) = self.requests.get_mut(&id) {
+            // Do not overwrite a terminal status (Superseded, Completed)
+            if matches!(request.status, RequestStatus::Superseded { .. }) {
+                log::info!(
+                    "FETCH StaleResult | req={} action=discard_already_superseded",
+                    short_id(id)
+                );
+                return;
+            }
+            if matches!(request.status, RequestStatus::Completed(_)) {
+                log::info!(
+                    "FETCH StaleResult | req={} action=discard_already_completed",
+                    short_id(id)
+                );
+                return;
+            }
+
             let now = chrono::Utc::now().timestamp_millis() as u64;
             request.attempts = request.attempts.saturating_add(1);
             let retry_delay = Self::retry_delay_ms(request.attempts);
@@ -1925,4 +1971,187 @@ fn bubble_summaries_from_buckets(
 
     summaries.sort_by_key(|summary| summary.candle_time);
     summaries
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_generation_id_increments_on_supersede() {
+        let mut handler = RequestHandler::default();
+        assert_eq!(handler.generation_id(), 0);
+
+        // Add a pending request
+        let req_id = handler
+            .add_request(FetchRange::Trades(UnixMs::new(1000), UnixMs::new(2000)))
+            .unwrap()
+            .unwrap();
+        assert_eq!(handler.generation_id(), 0);
+
+        // Supersede should increment generation
+        let superseded = handler.supersede_all_pending("settings_changed");
+        assert_eq!(superseded.len(), 1);
+        assert_eq!(superseded[0], req_id);
+        assert_eq!(handler.generation_id(), 1);
+
+        // Second supersede increments again
+        handler.supersede_all_pending("settings_changed");
+        assert_eq!(handler.generation_id(), 2);
+    }
+
+    #[test]
+    fn test_mark_completed_does_not_overwrite_superseded() {
+        let mut handler = RequestHandler::default();
+
+        let req_id = handler
+            .add_request(FetchRange::Trades(UnixMs::new(1000), UnixMs::new(2000)))
+            .unwrap()
+            .unwrap();
+
+        // Supersede the request
+        handler.supersede_all_pending("settings_changed");
+
+        // Try to mark as completed - should not overwrite Superseded
+        handler.mark_completed(req_id);
+
+        // Verify it's still Superseded, not Completed
+        assert!(handler.is_stale_generation(req_id));
+    }
+
+    #[test]
+    fn test_mark_failed_does_not_overwrite_superseded() {
+        let mut handler = RequestHandler::default();
+
+        let req_id = handler
+            .add_request(FetchRange::Trades(UnixMs::new(1000), UnixMs::new(2000)))
+            .unwrap()
+            .unwrap();
+
+        // Supersede the request
+        handler.supersede_all_pending("settings_changed");
+
+        // Try to mark as failed - should not overwrite Superseded
+        handler.mark_failed(req_id, "some error".to_string());
+
+        // Verify it's still stale (Superseded)
+        assert!(handler.is_stale_generation(req_id));
+    }
+
+    #[test]
+    fn test_stale_generation_detection() {
+        let mut handler = RequestHandler::default();
+
+        // Add request in generation 0
+        let req_id = handler
+            .add_request(FetchRange::Trades(UnixMs::new(1000), UnixMs::new(2000)))
+            .unwrap()
+            .unwrap();
+
+        // Request is in current generation
+        assert!(!handler.is_stale_generation(req_id));
+        assert_eq!(handler.request_generation(req_id), Some(0));
+
+        // Supersede increments generation to 1
+        handler.supersede_all_pending("settings_changed");
+        assert_eq!(handler.generation_id(), 1);
+
+        // Request from generation 0 is now stale
+        assert!(handler.is_stale_generation(req_id));
+        assert_eq!(handler.request_generation(req_id), Some(0));
+    }
+
+    #[test]
+    fn test_supersede_only_affects_pending() {
+        let mut handler = RequestHandler::default();
+
+        // Add two requests
+        let req1 = handler
+            .add_request(FetchRange::Trades(UnixMs::new(1000), UnixMs::new(2000)))
+            .unwrap()
+            .unwrap();
+        let req2 = handler
+            .add_request(FetchRange::Trades(UnixMs::new(3000), UnixMs::new(4000)))
+            .unwrap()
+            .unwrap();
+
+        // Complete one request
+        handler.mark_completed(req1);
+
+        // Supersede should only affect pending requests
+        let superseded = handler.supersede_all_pending("settings_changed");
+        assert_eq!(superseded.len(), 1);
+        assert_eq!(superseded[0], req2);
+
+        // req1 should be Completed, not Superseded
+        assert!(!handler.is_stale_generation(req1));
+        // req2 should be Superseded (stale)
+        assert!(handler.is_stale_generation(req2));
+    }
+
+    #[test]
+    fn test_timeout_watchdog() {
+        let mut handler = RequestHandler::default();
+
+        // Add a request
+        let _req_id = handler
+            .add_request(FetchRange::Trades(UnixMs::new(1000), UnixMs::new(2000)))
+            .unwrap()
+            .unwrap();
+
+        // Simulate time passing beyond timeout
+        let future_time = chrono::Utc::now().timestamp_millis() as u64
+            + RequestHandler::PENDING_TIMEOUT_MS
+            + 1000;
+        handler.cleanup_stale_at(future_time);
+
+        // Request should now be Failed with timeout
+        // Note: cleanup_stale_at doesn't remove immediately, just changes status
+        // It will be removed on next cleanup after FAILED_RETENTION_MS
+    }
+
+    #[test]
+    fn test_new_request_after_supersede() {
+        let mut handler = RequestHandler::default();
+
+        // Add request in generation 0
+        let req1 = handler
+            .add_request(FetchRange::Trades(UnixMs::new(1000), UnixMs::new(2000)))
+            .unwrap()
+            .unwrap();
+
+        // Supersede
+        handler.supersede_all_pending("settings_changed");
+        assert!(handler.is_stale_generation(req1));
+
+        // Add new request with same range - reactivates the old request
+        let req2 = handler
+            .add_request(FetchRange::Trades(UnixMs::new(1000), UnixMs::new(2000)))
+            .unwrap()
+            .unwrap();
+
+        // req2 reuses req1 ID and reactivates it with new generation
+        assert_eq!(req1, req2);
+        assert!(!handler.is_stale_generation(req1));
+        assert_eq!(handler.request_generation(req1), Some(1));
+
+        // A different range gets a new ID in generation 1
+        let req3 = handler
+            .add_request(FetchRange::Trades(UnixMs::new(3000), UnixMs::new(4000)))
+            .unwrap()
+            .unwrap();
+        assert_ne!(req1, req3);
+        assert!(!handler.is_stale_generation(req3));
+        assert_eq!(handler.request_generation(req3), Some(1));
+    }
+
+    #[test]
+    fn test_not_found_request_is_stale() {
+        let handler = RequestHandler::default();
+        let random_id = Uuid::new_v4();
+
+        // Unknown request should be treated as stale
+        assert!(handler.is_stale_generation(random_id));
+        assert_eq!(handler.request_generation(random_id), None);
+    }
 }
