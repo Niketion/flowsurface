@@ -11,12 +11,12 @@ pub mod util;
 
 use std::fs::File;
 use std::io::{Read, Write};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 pub use audio::AudioStream;
 pub use config::ScaleFactor;
 pub use config::sidebar::{self, Sidebar};
-pub use config::state::{Layouts, State};
+pub use config::state::{CURRENT_SAVED_STATE_VERSION, Layouts, State};
 pub use config::theme::Theme;
 pub use config::timezone::UserTimezone;
 
@@ -24,6 +24,55 @@ use ::log::{error, info, warn};
 pub use layout::{Dashboard, Layout, Pane};
 
 pub const SAVED_STATE_PATH: &str = "saved-state.json";
+const SAVED_STATE_BACKUP_PATH: &str = "saved-state.backup.json";
+const SAVED_STATE_BACKUP_RETENTION: usize = 5;
+
+#[derive(Debug, Clone)]
+pub struct MigrationReport {
+    pub from_version: u32,
+    pub to_version: u32,
+    pub warnings: Vec<String>,
+}
+
+impl MigrationReport {
+    fn new(from_version: u32) -> Self {
+        Self {
+            from_version,
+            to_version: CURRENT_SAVED_STATE_VERSION,
+            warnings: Vec::new(),
+        }
+    }
+
+    pub fn migrated(&self) -> bool {
+        self.from_version != self.to_version
+    }
+
+    pub fn recovered(&self) -> bool {
+        !self.warnings.is_empty()
+    }
+}
+
+#[derive(Clone)]
+pub enum StateLoadOutcome {
+    Loaded(State),
+    Migrated {
+        state: State,
+        from_version: u32,
+        to_version: u32,
+        backup_path: Option<PathBuf>,
+    },
+    Recovered {
+        state: State,
+        warnings: Vec<String>,
+        backup_path: Option<PathBuf>,
+    },
+    Corrupt {
+        error: String,
+        original_path: PathBuf,
+        backup_path: Option<PathBuf>,
+    },
+    MissingDefault(State),
+}
 
 #[derive(thiserror::Error, Debug, Clone)]
 pub enum InternalError {
@@ -97,6 +146,568 @@ pub fn read_from_file(file_name: &str) -> Result<State, Box<dyn std::error::Erro
     }
 }
 
+pub fn load_saved_state_file() -> StateLoadOutcome {
+    let path = data_path(Some(SAVED_STATE_PATH));
+    load_saved_state_from_path(&path)
+}
+
+pub fn load_saved_state_from_path(path: &Path) -> StateLoadOutcome {
+    info!("SAVED_STATE LoadStart | path={}", path.display());
+
+    let raw = match std::fs::read_to_string(path) {
+        Ok(raw) => raw,
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => {
+            info!("SAVED_STATE Missing | action=default");
+            return StateLoadOutcome::MissingDefault(State::default());
+        }
+        Err(err) => {
+            error!("SAVED_STATE ReadFailed | error={err}");
+            return StateLoadOutcome::Corrupt {
+                error: err.to_string(),
+                original_path: path.to_path_buf(),
+                backup_path: backup_saved_state(path, "corrupt").ok(),
+            };
+        }
+    };
+
+    let mut value: serde_json::Value = match serde_json::from_str(&raw) {
+        Ok(value) => value,
+        Err(err) => {
+            error!("SAVED_STATE ParseFailed | error={err}");
+            let backup_path = backup_saved_state(path, "corrupt").ok();
+            return StateLoadOutcome::Corrupt {
+                error: err.to_string(),
+                original_path: path.to_path_buf(),
+                backup_path,
+            };
+        }
+    };
+
+    let report = migrate_saved_state_value(&mut value);
+    if report.migrated() {
+        info!(
+            "SAVED_STATE MigrateStart | from_version={} to_version={}",
+            report.from_version, report.to_version
+        );
+    }
+
+    if report.from_version > CURRENT_SAVED_STATE_VERSION {
+        let error = format!(
+            "saved state version {} is newer than supported version {}",
+            report.from_version, CURRENT_SAVED_STATE_VERSION
+        );
+        error!("SAVED_STATE Incompatible | error={error}");
+        return StateLoadOutcome::Corrupt {
+            error,
+            original_path: path.to_path_buf(),
+            backup_path: backup_saved_state(path, "incompatible").ok(),
+        };
+    }
+
+    let mut state: State = match serde_json::from_value(value) {
+        Ok(state) => state,
+        Err(err) => {
+            error!("SAVED_STATE DeserializeFailed | error={err}");
+            let backup_path = backup_saved_state(path, "corrupt").ok();
+            return StateLoadOutcome::Corrupt {
+                error: err.to_string(),
+                original_path: path.to_path_buf(),
+                backup_path,
+            };
+        }
+    };
+
+    let migrated = report.migrated();
+    let from_version = report.from_version;
+    let to_version = report.to_version;
+    state.saved_state_version = CURRENT_SAVED_STATE_VERSION;
+    let mut warnings = report.warnings;
+    sanitize_state(&mut state, &mut warnings);
+
+    if migrated {
+        let backup_path = backup_saved_state(path, "v0").ok();
+        match serde_json::to_string(&state)
+            .map_err(std::io::Error::other)
+            .and_then(|json| write_json_to_file_atomic_at(&json, path))
+        {
+            Ok(()) => {
+                info!(
+                    "SAVED_STATE Migrated | from_version={} to_version={} backup={}",
+                    from_version,
+                    to_version,
+                    backup_path
+                        .as_ref()
+                        .map(|p| p.display().to_string())
+                        .unwrap_or_else(|| "none".to_string())
+                );
+            }
+            Err(err) => warn!("SAVED_STATE MigratedWriteFailed | error={err}"),
+        }
+
+        return StateLoadOutcome::Migrated {
+            state,
+            from_version,
+            to_version,
+            backup_path,
+        };
+    }
+
+    if !warnings.is_empty() {
+        let backup_path = backup_saved_state(path, "recovered").ok();
+        warn!("SAVED_STATE Recovered | warnings={}", warnings.join("; "));
+        return StateLoadOutcome::Recovered {
+            state,
+            warnings,
+            backup_path,
+        };
+    }
+
+    StateLoadOutcome::Loaded(state)
+}
+
+pub fn save_saved_state_atomic(state: &State) -> std::io::Result<()> {
+    let path = data_path(Some(SAVED_STATE_PATH));
+    let json = serde_json::to_string(state).map_err(std::io::Error::other)?;
+    write_json_to_file_atomic_at(&json, &path)
+}
+
+pub fn write_json_to_file_atomic_at(json: &str, path: &Path) -> std::io::Result<()> {
+    info!("SAVED_STATE SaveStart | path={}", path.display());
+    let parent = path.parent().ok_or_else(|| {
+        std::io::Error::new(std::io::ErrorKind::InvalidInput, "Invalid state file path")
+    })?;
+
+    if !parent.exists() {
+        std::fs::create_dir_all(parent)?;
+    }
+
+    let tmp_path = path.with_extension("json.tmp");
+    info!(
+        "SAVED_STATE SaveAtomic | tmp={} final={}",
+        tmp_path.display(),
+        path.display()
+    );
+
+    {
+        let mut file = File::create(&tmp_path)?;
+        file.write_all(json.as_bytes())?;
+        file.flush()?;
+        file.sync_all()?;
+    }
+
+    if path.exists() {
+        let rolling_backup = parent.join(SAVED_STATE_BACKUP_PATH);
+        std::fs::copy(path, &rolling_backup)?;
+    }
+
+    #[cfg(target_os = "windows")]
+    {
+        if path.exists() {
+            std::fs::remove_file(path)?;
+        }
+    }
+
+    std::fs::rename(&tmp_path, path).inspect_err(|_| {
+        let _ = std::fs::remove_file(&tmp_path);
+    })?;
+
+    if let Ok(dir) = File::open(parent) {
+        let _ = dir.sync_all();
+    }
+
+    cleanup_saved_state_backups(parent);
+    info!("SAVED_STATE SaveComplete | path={}", path.display());
+    Ok(())
+}
+
+fn backup_saved_state(path: &Path, reason: &str) -> std::io::Result<PathBuf> {
+    if !path.exists() {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::NotFound,
+            "saved state file does not exist",
+        ));
+    }
+
+    let parent = path.parent().ok_or_else(|| {
+        std::io::Error::new(std::io::ErrorKind::InvalidInput, "Invalid state file path")
+    })?;
+    let backup_path = parent.join(format!(
+        "saved-state.{reason}.{}.json",
+        chrono::Local::now().format("%Y-%m-%d_%H-%M-%S")
+    ));
+    std::fs::copy(path, &backup_path)?;
+    info!("SAVED_STATE BackupCreated | path={}", backup_path.display());
+    Ok(backup_path)
+}
+
+fn migrate_saved_state_value(value: &mut serde_json::Value) -> MigrationReport {
+    let from_version = value
+        .get("saved_state_version")
+        .and_then(serde_json::Value::as_u64)
+        .and_then(|version| u32::try_from(version).ok())
+        .unwrap_or(0);
+    let mut report = MigrationReport::new(from_version);
+
+    if !value.is_object() {
+        report
+            .warnings
+            .push("saved state root was not an object; using defaults".to_string());
+        *value = serde_json::json!({});
+    }
+
+    let root = value
+        .as_object_mut()
+        .expect("root object after normalization");
+    root.insert(
+        "saved_state_version".to_string(),
+        serde_json::json!(CURRENT_SAVED_STATE_VERSION),
+    );
+
+    if let Some(layout_manager) = root.get_mut("layout_manager") {
+        sanitize_layout_manager(layout_manager, &mut report.warnings);
+    }
+
+    report
+}
+
+fn sanitize_state(state: &mut State, warnings: &mut Vec<String>) {
+    if state.layout_manager.layouts.is_empty() {
+        warnings.push("saved state contained no layouts; added default layout".to_string());
+        state.layout_manager.layouts.push(Layout::default());
+        state.layout_manager.active_layout = Some("Default".to_string());
+    }
+
+    if let Some(active) = &state.layout_manager.active_layout
+        && !state
+            .layout_manager
+            .layouts
+            .iter()
+            .any(|layout| layout.name == *active)
+    {
+        warnings.push(format!(
+            "active layout '{active}' was missing; selected first available layout"
+        ));
+        state.layout_manager.active_layout = state
+            .layout_manager
+            .layouts
+            .first()
+            .map(|layout| layout.name.clone());
+    }
+}
+
+fn sanitize_layout_manager(value: &mut serde_json::Value, warnings: &mut Vec<String>) {
+    let Some(layout_manager) = value.as_object_mut() else {
+        warnings.push("layout manager was invalid; using default layout".to_string());
+        *value =
+            serde_json::json!({ "layouts": [default_layout_value()], "active_layout": "Default" });
+        return;
+    };
+
+    match layout_manager
+        .get_mut("layouts")
+        .and_then(serde_json::Value::as_array_mut)
+    {
+        Some(layouts) => {
+            for layout in layouts {
+                sanitize_layout(layout, warnings);
+            }
+        }
+        None => {
+            warnings.push("layouts list was missing; added default layout".to_string());
+            layout_manager.insert(
+                "layouts".to_string(),
+                serde_json::json!([default_layout_value()]),
+            );
+        }
+    }
+}
+
+fn sanitize_layout(value: &mut serde_json::Value, warnings: &mut Vec<String>) {
+    let Some(layout) = value.as_object_mut() else {
+        warnings.push("layout entry was invalid; replaced with default layout".to_string());
+        *value = default_layout_value();
+        return;
+    };
+
+    if !layout.get("name").is_some_and(serde_json::Value::is_string) {
+        layout.insert("name".to_string(), serde_json::json!("Recovered"));
+    }
+
+    let dashboard = layout
+        .entry("dashboard")
+        .or_insert_with(|| serde_json::json!({}));
+    sanitize_dashboard(dashboard, warnings);
+}
+
+fn sanitize_dashboard(value: &mut serde_json::Value, warnings: &mut Vec<String>) {
+    let Some(dashboard) = value.as_object_mut() else {
+        warnings.push("dashboard was invalid; replaced with starter pane".to_string());
+        *value = serde_json::json!({ "pane": default_pane_value(), "popout": [] });
+        return;
+    };
+
+    sanitize_pane(
+        dashboard.entry("pane").or_insert_with(default_pane_value),
+        warnings,
+    );
+
+    match dashboard
+        .get_mut("popout")
+        .and_then(serde_json::Value::as_array_mut)
+    {
+        Some(popouts) => {
+            popouts.retain_mut(|entry| {
+                let Some(pair) = entry.as_array_mut() else {
+                    warnings.push("dropped invalid popout entry".to_string());
+                    return false;
+                };
+                if pair.len() != 2 {
+                    warnings.push("dropped invalid popout tuple".to_string());
+                    return false;
+                }
+                sanitize_pane(&mut pair[0], warnings);
+                true
+            });
+        }
+        None => {
+            dashboard.insert("popout".to_string(), serde_json::json!([]));
+        }
+    }
+}
+
+fn sanitize_pane(value: &mut serde_json::Value, warnings: &mut Vec<String>) {
+    let Some(object) = value.as_object_mut() else {
+        warnings.push("pane was invalid; replaced with starter pane".to_string());
+        *value = default_pane_value();
+        return;
+    };
+
+    if object.len() != 1 {
+        warnings.push("pane had invalid tagged form; replaced with starter pane".to_string());
+        *value = default_pane_value();
+        return;
+    }
+
+    let tag = object.keys().next().cloned().unwrap_or_default();
+    match tag.as_str() {
+        "Split" => {
+            let Some(split) = object
+                .get_mut("Split")
+                .and_then(serde_json::Value::as_object_mut)
+            else {
+                warnings.push("split pane was invalid; replaced with starter pane".to_string());
+                *value = default_pane_value();
+                return;
+            };
+            if !matches!(
+                split.get("axis").and_then(serde_json::Value::as_str),
+                Some("Horizontal" | "Vertical")
+            ) {
+                split.insert("axis".to_string(), serde_json::json!("Horizontal"));
+                warnings.push("split pane axis was invalid; defaulted to horizontal".to_string());
+            }
+            let ratio = split
+                .get("ratio")
+                .and_then(serde_json::Value::as_f64)
+                .unwrap_or(0.5)
+                .clamp(0.05, 0.95);
+            split.insert("ratio".to_string(), serde_json::json!(ratio));
+            sanitize_pane(
+                split.entry("a").or_insert_with(default_pane_value),
+                warnings,
+            );
+            sanitize_pane(
+                split.entry("b").or_insert_with(default_pane_value),
+                warnings,
+            );
+        }
+        "Starter" => {}
+        "HeatmapChart" | "ShaderHeatmap" => {
+            if let Some(pane) = object
+                .get_mut(&tag)
+                .and_then(serde_json::Value::as_object_mut)
+            {
+                sanitize_vec_tagged_enum(
+                    pane.get_mut("indicators"),
+                    &["Volume"],
+                    warnings,
+                    "heatmap indicator",
+                );
+                sanitize_vec_tagged_enum(
+                    pane.get_mut("stream_type"),
+                    &["Kline", "Depth", "Trades", "DepthAndTrades"],
+                    warnings,
+                    "stream",
+                );
+                sanitize_settings(
+                    pane.entry("settings")
+                        .or_insert_with(|| serde_json::json!({})),
+                    warnings,
+                );
+            }
+        }
+        "KlineChart" => {
+            if let Some(pane) = object
+                .get_mut("KlineChart")
+                .and_then(serde_json::Value::as_object_mut)
+            {
+                sanitize_vec_tagged_enum(
+                    pane.get_mut("indicators"),
+                    &["Volume", "BarAnalysis", "CumulativeDelta", "OpenInterest"],
+                    warnings,
+                    "kline indicator",
+                );
+                sanitize_vec_tagged_enum(
+                    pane.get_mut("stream_type"),
+                    &["Kline", "Depth", "Trades", "DepthAndTrades"],
+                    warnings,
+                    "stream",
+                );
+                sanitize_kline_kind(
+                    pane.entry("kind")
+                        .or_insert_with(|| serde_json::json!("Candles")),
+                    warnings,
+                );
+                sanitize_settings(
+                    pane.entry("settings")
+                        .or_insert_with(|| serde_json::json!({})),
+                    warnings,
+                );
+            }
+        }
+        "ComparisonChart" | "TimeAndSales" | "Ladder" => {
+            if let Some(pane) = object
+                .get_mut(&tag)
+                .and_then(serde_json::Value::as_object_mut)
+            {
+                sanitize_vec_tagged_enum(
+                    pane.get_mut("stream_type"),
+                    &["Kline", "Depth", "Trades", "DepthAndTrades"],
+                    warnings,
+                    "stream",
+                );
+                sanitize_settings(
+                    pane.entry("settings")
+                        .or_insert_with(|| serde_json::json!({})),
+                    warnings,
+                );
+            }
+        }
+        _ => {
+            warnings.push(format!(
+                "unknown pane type '{tag}' replaced with starter pane"
+            ));
+            *value = default_pane_value();
+        }
+    }
+}
+
+fn sanitize_settings(value: &mut serde_json::Value, warnings: &mut Vec<String>) {
+    let Some(settings) = value.as_object_mut() else {
+        warnings.push("pane settings were invalid; reset to defaults".to_string());
+        *value = serde_json::json!({});
+        return;
+    };
+
+    if let Some(visual_config) = settings.get_mut("visual_config")
+        && !is_known_tagged_enum(
+            visual_config,
+            &["Heatmap", "TimeAndSales", "Kline", "Ladder", "Comparison"],
+        )
+    {
+        settings.remove("visual_config");
+        warnings.push("unknown visual config dropped".to_string());
+    }
+}
+
+fn sanitize_kline_kind(value: &mut serde_json::Value, warnings: &mut Vec<String>) {
+    if value.as_str() == Some("Candles") || is_known_tagged_enum(value, &["Footprint"]) {
+        return;
+    }
+
+    *value = serde_json::json!("Candles");
+    warnings.push("unknown kline chart kind defaulted to Candles".to_string());
+}
+
+fn sanitize_vec_tagged_enum(
+    value: Option<&mut serde_json::Value>,
+    allowed: &[&str],
+    warnings: &mut Vec<String>,
+    label: &str,
+) {
+    let Some(value) = value else {
+        return;
+    };
+    let Some(values) = value.as_array_mut() else {
+        *value = serde_json::json!([]);
+        warnings.push(format!("{label} list was invalid; reset to empty"));
+        return;
+    };
+
+    values.retain(|entry| {
+        let keep = entry.as_str().is_some_and(|tag| allowed.contains(&tag))
+            || is_known_tagged_enum(entry, allowed);
+        if !keep {
+            warnings.push(format!("dropped unknown {label}"));
+        }
+        keep
+    });
+}
+
+fn is_known_tagged_enum(value: &serde_json::Value, allowed: &[&str]) -> bool {
+    if let Some(tag) = value.as_str() {
+        return allowed.contains(&tag);
+    }
+
+    let Some(object) = value.as_object() else {
+        return false;
+    };
+    object.len() == 1
+        && object
+            .keys()
+            .next()
+            .is_some_and(|tag| allowed.contains(&tag.as_str()))
+}
+
+fn default_layout_value() -> serde_json::Value {
+    serde_json::json!({
+        "name": "Default",
+        "dashboard": {
+            "pane": default_pane_value(),
+            "popout": []
+        }
+    })
+}
+
+fn default_pane_value() -> serde_json::Value {
+    serde_json::json!({ "Starter": { "link_group": null } })
+}
+
+fn cleanup_saved_state_backups(parent: &Path) {
+    let Ok(entries) = std::fs::read_dir(parent) else {
+        return;
+    };
+
+    let mut backups = entries
+        .filter_map(Result::ok)
+        .filter_map(|entry| {
+            let path = entry.path();
+            let name = path.file_name()?.to_str()?;
+            if name.starts_with("saved-state.") && name.ends_with(".json") {
+                Some((path, entry.metadata().and_then(|m| m.modified()).ok()))
+            } else {
+                None
+            }
+        })
+        .collect::<Vec<_>>();
+
+    backups.sort_by_key(|(_, modified)| *modified);
+    let remove_count = backups.len().saturating_sub(SAVED_STATE_BACKUP_RETENTION);
+    for (path, _) in backups.into_iter().take(remove_count) {
+        let _ = std::fs::remove_file(path);
+    }
+}
+
 pub fn open_data_folder() -> Result<(), InternalError> {
     let pathbuf = data_path(None);
 
@@ -132,7 +743,12 @@ pub fn open_url(url: &str) -> Result<(), InternalError> {
 
 pub fn data_path(path_name: Option<&str>) -> PathBuf {
     if let Ok(path) = std::env::var("FLOWSURFACE_DATA_PATH") {
-        PathBuf::from(path)
+        let base = PathBuf::from(path);
+        if let Some(path_name) = path_name {
+            base.join(path_name)
+        } else {
+            base
+        }
     } else {
         let data_dir = dirs_next::data_dir().unwrap_or_else(|| PathBuf::from("."));
         if let Some(path_name) = path_name {
@@ -208,4 +824,211 @@ pub fn cleanup_old_market_data() -> usize {
 
     info!("File cleanup completed. Deleted {} files", total_deleted);
     total_deleted
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::time::{SystemTime, UNIX_EPOCH};
+
+    fn temp_state_path(name: &str) -> PathBuf {
+        let unique = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("system clock after unix epoch")
+            .as_nanos();
+        let dir = std::env::temp_dir().join(format!(
+            "flowsurface-saved-state-test-{}-{unique}",
+            std::process::id()
+        ));
+        std::fs::create_dir_all(&dir).expect("create test data dir");
+        dir.join(name)
+    }
+
+    fn valid_state() -> State {
+        let mut state = State::default();
+        state.layout_manager.layouts.push(Layout::default());
+        state.layout_manager.active_layout = Some("Default".to_string());
+        state
+    }
+
+    #[test]
+    fn missing_saved_state_returns_default() {
+        let path = temp_state_path("missing.json");
+
+        match load_saved_state_from_path(&path) {
+            StateLoadOutcome::MissingDefault(state) => {
+                assert_eq!(state.saved_state_version, CURRENT_SAVED_STATE_VERSION);
+            }
+            _ => panic!("unexpected outcome"),
+        }
+    }
+
+    #[test]
+    fn valid_current_saved_state_loads_cleanly() {
+        let path = temp_state_path("saved-state.json");
+        let state = valid_state();
+        std::fs::write(&path, serde_json::to_string(&state).unwrap()).unwrap();
+
+        match load_saved_state_from_path(&path) {
+            StateLoadOutcome::Loaded(loaded) => {
+                assert_eq!(loaded.saved_state_version, CURRENT_SAVED_STATE_VERSION);
+                assert_eq!(loaded.layout_manager.layouts.len(), 1);
+            }
+            _ => panic!("unexpected outcome"),
+        }
+    }
+
+    #[test]
+    fn legacy_saved_state_without_version_is_migrated() {
+        let path = temp_state_path("saved-state.json");
+        let mut value = serde_json::to_value(valid_state()).unwrap();
+        value.as_object_mut().unwrap().remove("saved_state_version");
+        std::fs::write(&path, serde_json::to_string(&value).unwrap()).unwrap();
+
+        match load_saved_state_from_path(&path) {
+            StateLoadOutcome::Migrated {
+                state,
+                from_version,
+                to_version,
+                backup_path,
+            } => {
+                assert_eq!(from_version, 0);
+                assert_eq!(to_version, CURRENT_SAVED_STATE_VERSION);
+                assert_eq!(state.saved_state_version, CURRENT_SAVED_STATE_VERSION);
+                assert!(backup_path.is_some_and(|path| path.exists()));
+            }
+            _ => panic!("unexpected outcome"),
+        }
+    }
+
+    #[test]
+    fn missing_current_fields_use_defaults() {
+        let path = temp_state_path("saved-state.json");
+        let value = serde_json::json!({
+            "saved_state_version": CURRENT_SAVED_STATE_VERSION,
+            "layout_manager": {
+                "layouts": [{
+                    "name": "Default",
+                    "dashboard": {
+                        "pane": { "Starter": {} }
+                    }
+                }],
+                "active_layout": "Default"
+            }
+        });
+        std::fs::write(&path, serde_json::to_string(&value).unwrap()).unwrap();
+
+        match load_saved_state_from_path(&path) {
+            StateLoadOutcome::Loaded(state) => {
+                assert_eq!(state.layout_manager.layouts.len(), 1);
+            }
+            _ => panic!("unexpected outcome"),
+        }
+    }
+
+    #[test]
+    fn unknown_pane_enum_recovers_without_panic() {
+        let path = temp_state_path("saved-state.json");
+        let value = serde_json::json!({
+            "saved_state_version": CURRENT_SAVED_STATE_VERSION,
+            "layout_manager": {
+                "layouts": [{
+                    "name": "Default",
+                    "dashboard": {
+                        "pane": { "RemovedPaneType": { "old": true } },
+                        "popout": []
+                    }
+                }],
+                "active_layout": "Default"
+            }
+        });
+        std::fs::write(&path, serde_json::to_string(&value).unwrap()).unwrap();
+
+        match load_saved_state_from_path(&path) {
+            StateLoadOutcome::Recovered {
+                state, warnings, ..
+            } => {
+                assert_eq!(state.layout_manager.layouts.len(), 1);
+                assert!(
+                    warnings
+                        .iter()
+                        .any(|warning| warning.contains("unknown pane"))
+                );
+            }
+            _ => panic!("unexpected outcome"),
+        }
+    }
+
+    #[test]
+    fn unknown_indicator_is_dropped_without_panic() {
+        let path = temp_state_path("saved-state.json");
+        let value = serde_json::json!({
+            "saved_state_version": CURRENT_SAVED_STATE_VERSION,
+            "layout_manager": {
+                "layouts": [{
+                    "name": "Default",
+                    "dashboard": {
+                        "pane": {
+                            "KlineChart": {
+                                "layout": { "splits": [], "autoscale": null },
+                                "kind": "Candles",
+                                "stream_type": [],
+                                "settings": {},
+                                "indicators": ["Volume", "RemovedIndicator"],
+                                "link_group": null
+                            }
+                        },
+                        "popout": []
+                    }
+                }],
+                "active_layout": "Default"
+            }
+        });
+        std::fs::write(&path, serde_json::to_string(&value).unwrap()).unwrap();
+
+        match load_saved_state_from_path(&path) {
+            StateLoadOutcome::Recovered { warnings, .. } => {
+                assert!(warnings.iter().any(|warning| warning.contains("indicator")));
+            }
+            _ => panic!("unexpected outcome"),
+        }
+    }
+
+    #[test]
+    fn invalid_json_is_corrupt_and_backed_up_without_overwrite() {
+        let path = temp_state_path("saved-state.json");
+        std::fs::write(&path, "{ not json").unwrap();
+
+        match load_saved_state_from_path(&path) {
+            StateLoadOutcome::Corrupt {
+                backup_path,
+                original_path,
+                ..
+            } => {
+                assert_eq!(original_path, path);
+                assert_eq!(
+                    std::fs::read_to_string(&original_path).unwrap(),
+                    "{ not json"
+                );
+                assert!(backup_path.is_some_and(|path| path.exists()));
+            }
+            _ => panic!("unexpected outcome"),
+        }
+    }
+
+    #[test]
+    fn atomic_save_creates_final_file_and_rolling_backup() {
+        let path = temp_state_path("saved-state.json");
+        std::fs::write(&path, "previous").unwrap();
+        let json = serde_json::to_string(&valid_state()).unwrap();
+
+        write_json_to_file_atomic_at(&json, &path).unwrap();
+
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), json);
+        assert_eq!(
+            std::fs::read_to_string(path.parent().unwrap().join(SAVED_STATE_BACKUP_PATH)).unwrap(),
+            "previous"
+        );
+        assert!(!path.with_extension("json.tmp").exists());
+    }
 }

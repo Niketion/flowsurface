@@ -41,7 +41,7 @@ use iced::{
         tooltip::Position as TooltipPosition,
     },
 };
-use std::{borrow::Cow, collections::HashMap, sync::Arc, time::Duration, vec};
+use std::{borrow::Cow, collections::HashMap, path::PathBuf, sync::Arc, time::Duration, vec};
 use windowing::WindowingMode;
 
 /// Set to `true` to emit window focus/unfocus and tick diagnostic logs.
@@ -103,6 +103,8 @@ struct Flowsurface {
     network: NetworkManager,
     audio_stream: AudioStream,
     confirm_dialog: Option<screen::ConfirmDialog<Message>>,
+    startup_warning: Option<StartupWarning>,
+    save_state_enabled: bool,
     volume_size_unit: exchange::SizeUnit,
     ui_scale_factor: data::ScaleFactor,
     timezone: data::UserTimezone,
@@ -122,6 +124,24 @@ struct Flowsurface {
     debug_terminal_auto_scroll: bool,
     debug_terminal_app_only: bool,
     debug_terminal_compact_mode: bool,
+}
+
+#[derive(Debug, Clone)]
+enum StartupWarning {
+    SavedStateCorrupt {
+        error: String,
+        original_path: PathBuf,
+        backup_path: Option<PathBuf>,
+    },
+    SavedStateRecovered {
+        warnings: Vec<String>,
+        backup_path: Option<PathBuf>,
+    },
+    SavedStateMigrated {
+        from_version: u32,
+        to_version: u32,
+        backup_path: Option<PathBuf>,
+    },
 }
 
 #[derive(Debug, Clone)]
@@ -159,6 +179,9 @@ enum Message {
     DebugTerminalToggleCompactMode(bool),
     ApplyVolumeSizeUnit(exchange::SizeUnit),
     RemoveNotification(usize),
+    StartupContinueWithDefault,
+    StartupExitWithoutOverwrite,
+    StartupWarningNoop,
     ToggleDialogModal(Option<screen::ConfirmDialog<Message>>),
     ThemeEditor(modal::theme_editor::Message),
     NetworkManager(modal::network_manager::Message),
@@ -491,7 +514,50 @@ fn is_app_target(target: Option<&str>) -> bool {
 
 impl Flowsurface {
     fn new() -> (Self, Task<Message>) {
-        let saved_state = layout::load_saved_state();
+        let load_outcome = layout::load_saved_state();
+        let (saved_state, startup_warning, save_state_enabled) = match load_outcome {
+            layout::SavedStateLoadOutcome::Loaded(state)
+            | layout::SavedStateLoadOutcome::MissingDefault(state) => (state, None, true),
+            layout::SavedStateLoadOutcome::Migrated {
+                state,
+                from_version,
+                to_version,
+                backup_path,
+            } => (
+                state,
+                Some(StartupWarning::SavedStateMigrated {
+                    from_version,
+                    to_version,
+                    backup_path,
+                }),
+                true,
+            ),
+            layout::SavedStateLoadOutcome::Recovered {
+                state,
+                warnings,
+                backup_path,
+            } => (
+                state,
+                Some(StartupWarning::SavedStateRecovered {
+                    warnings,
+                    backup_path,
+                }),
+                true,
+            ),
+            layout::SavedStateLoadOutcome::Corrupt {
+                error,
+                original_path,
+                backup_path,
+            } => (
+                layout::SavedState::default(),
+                Some(StartupWarning::SavedStateCorrupt {
+                    error,
+                    original_path,
+                    backup_path,
+                }),
+                false,
+            ),
+        };
 
         let (main_window_id, open_main_window) = {
             let (position, size) = saved_state.window();
@@ -537,6 +603,8 @@ impl Flowsurface {
             sidebar,
             handles,
             confirm_dialog: None,
+            startup_warning,
+            save_state_enabled,
             timezone: saved_state.timezone,
             ui_scale_factor: saved_state.scale_factor,
             volume_size_unit: saved_state.volume_size_unit,
@@ -563,6 +631,32 @@ impl Flowsurface {
             state
                 .notifications
                 .push(Toast::error(format!("Audio disabled: {err}")));
+        }
+
+        match &state.startup_warning {
+            Some(StartupWarning::SavedStateMigrated {
+                from_version,
+                to_version,
+                backup_path,
+            }) => state.notifications.push(Toast::info(format!(
+                "Saved layout migrated from version {from_version} to {to_version}. Backup: {}",
+                backup_path
+                    .as_ref()
+                    .map(|p| p.display().to_string())
+                    .unwrap_or_else(|| "none".to_string())
+            ))),
+            Some(StartupWarning::SavedStateRecovered {
+                warnings,
+                backup_path,
+            }) => state.notifications.push(Toast::warn(format!(
+                "Saved layout was repaired: {} Backup: {}",
+                warnings.join("; "),
+                backup_path
+                    .as_ref()
+                    .map(|p| p.display().to_string())
+                    .unwrap_or_else(|| "none".to_string())
+            ))),
+            Some(StartupWarning::SavedStateCorrupt { .. }) | None => {}
         }
 
         if state.layout_manager.layouts.is_empty() {
@@ -812,15 +906,33 @@ impl Flowsurface {
                 }
             },
             Message::ExitRequested(windows) => {
-                self.save_state_to_disk(&windows);
+                if self.save_state_enabled {
+                    self.save_state_to_disk(&windows);
+                } else {
+                    log::warn!(
+                        "SAVED_STATE SaveSkipped | reason=awaiting_corrupt_state_confirmation"
+                    );
+                }
                 power_guard::windows_power::cleanup();
                 return iced::exit();
             }
             Message::SaveStateRequested(windows) => {
-                self.save_state_to_disk(&windows);
+                if self.save_state_enabled {
+                    self.save_state_to_disk(&windows);
+                } else {
+                    log::warn!(
+                        "SAVED_STATE SaveSkipped | reason=awaiting_corrupt_state_confirmation"
+                    );
+                }
             }
             Message::RestartRequested(Some(windows)) => {
-                self.save_state_to_disk(&windows);
+                if self.save_state_enabled {
+                    self.save_state_to_disk(&windows);
+                } else {
+                    log::warn!(
+                        "SAVED_STATE SaveSkipped | reason=awaiting_corrupt_state_confirmation"
+                    );
+                }
                 return self.restart();
             }
             Message::RestartRequested(None) => {
@@ -974,6 +1086,19 @@ impl Flowsurface {
             Message::RemoveNotification(index) => {
                 self.notifications.remove(index);
             }
+            Message::StartupContinueWithDefault => {
+                self.save_state_enabled = true;
+                self.startup_warning = None;
+                self.notifications.push(Toast::warn(
+                    "Default layout is active. The next save will overwrite saved-state.json; the backup remains available.",
+                ));
+            }
+            Message::StartupExitWithoutOverwrite => {
+                self.save_state_enabled = false;
+                power_guard::windows_power::cleanup();
+                return iced::exit();
+            }
+            Message::StartupWarningNoop => {}
             Message::SetTimezone(tz) => {
                 self.timezone = tz;
             }
@@ -1370,6 +1495,17 @@ impl Flowsurface {
             .into()
         };
 
+        let content = if let Some(StartupWarning::SavedStateCorrupt { .. }) = &self.startup_warning
+        {
+            main_dialog_modal(
+                content,
+                self.startup_warning_modal(),
+                Message::StartupWarningNoop,
+            )
+        } else {
+            content
+        };
+
         toast::Manager::new(
             content,
             self.notifications.toasts(),
@@ -1379,6 +1515,54 @@ impl Flowsurface {
             },
             Message::RemoveNotification,
         )
+        .into()
+    }
+
+    fn startup_warning_modal(&self) -> Element<'_, Message> {
+        let Some(StartupWarning::SavedStateCorrupt {
+            error,
+            original_path,
+            backup_path,
+        }) = &self.startup_warning
+        else {
+            return container(column![]).into();
+        };
+
+        let backup_text = backup_path
+            .as_ref()
+            .map(|path| path.display().to_string())
+            .unwrap_or_else(|| "Backup could not be created.".to_string());
+
+        let body = format!(
+            "FlowSurface could not load your saved layout.\n\nOriginal file:\n{}\n\nBackup:\n{}\n\nError:\n{}\n\nYou can continue with a default layout. If you continue, the next save will overwrite saved-state.json. Your backup will remain available.",
+            original_path.display(),
+            backup_text,
+            error
+        );
+
+        container(
+            column![
+                text("Saved layout corrupted").size(crate::style::text_size::TITLE),
+                text(body)
+                    .wrapping(iced::widget::text::Wrapping::Word)
+                    .width(Length::Fill),
+                row![
+                    button(text("Open backup folder")).on_press(Message::DataFolderRequested),
+                    button(text("Exit without overwriting"))
+                        .style(|theme, status| style::button::transparent(theme, status, false))
+                        .on_press(Message::StartupExitWithoutOverwrite),
+                    button(text("Continue with default layout"))
+                        .on_press(Message::StartupContinueWithDefault),
+                ]
+                .spacing(8)
+                .align_y(Alignment::Center),
+            ]
+            .spacing(16)
+            .width(Length::Fill),
+        )
+        .width(Length::Fixed(620.0))
+        .padding(24)
+        .style(style::dashboard_modal)
         .into()
     }
 
@@ -2260,16 +2444,13 @@ impl Flowsurface {
             self.debug_terminal_enabled,
         );
 
-        match serde_json::to_string(&state) {
-            Ok(layout_str) => {
-                let file_name = data::SAVED_STATE_PATH;
-                if let Err(e) = data::write_json_to_file(&layout_str, file_name) {
-                    log::error!("Failed to write layout state to file: {}", e);
-                } else {
-                    log::info!("Persisted state to {file_name}");
-                }
+        match data::save_saved_state_atomic(&state) {
+            Ok(()) => {
+                log::info!("Persisted state to {}", data::SAVED_STATE_PATH);
             }
-            Err(e) => log::error!("Failed to serialize layout: {}", e),
+            Err(e) => {
+                log::error!("SAVED_STATE SaveFailed | error={e}");
+            }
         }
     }
 
