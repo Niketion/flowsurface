@@ -63,6 +63,7 @@ enum-map.workspace = true
 url.workspace = true
 fern = "0.7.1"
 rodio = { version = "0.22.2", default-features = false, features = [ "playback", "wav" ]}
+tokio = { version = "1.52", default-features = false, features = ["time"] }
 
 bytemuck = "1.25.0"
 iced_wgpu = "0.14.0"

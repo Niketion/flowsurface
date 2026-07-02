@@ -250,6 +250,8 @@ enum DebugLogCategory {
     Fetch,
     Cache,
     Ws,
+    Stream,
+    Backfill,
     Chart,
     Bubbles,
     Footprint,
@@ -262,11 +264,13 @@ enum DebugLogCategory {
 }
 
 impl DebugLogCategory {
-    const ALL: [Self; 13] = [
+    const ALL: [Self; 15] = [
         Self::All,
         Self::Fetch,
         Self::Cache,
         Self::Ws,
+        Self::Stream,
+        Self::Backfill,
         Self::Chart,
         Self::Bubbles,
         Self::Footprint,
@@ -286,6 +290,8 @@ impl std::fmt::Display for DebugLogCategory {
             Self::Fetch => write!(f, "Fetch"),
             Self::Cache => write!(f, "Cache"),
             Self::Ws => write!(f, "WS"),
+            Self::Stream => write!(f, "Stream"),
+            Self::Backfill => write!(f, "Backfill"),
             Self::Chart => write!(f, "Chart"),
             Self::Bubbles => write!(f, "Bubbles"),
             Self::Footprint => write!(f, "Footprint"),
@@ -377,9 +383,16 @@ fn classify_log_message(message: &str, target: Option<&str>) -> (DebugLogCategor
             let event = parts[1..].join(" ");
 
             let category = match cat_str {
-                "FETCH" | "TRADE" | "KLINE" | "OI" => DebugLogCategory::Fetch,
+                "FETCH" | "TRADE" => DebugLogCategory::Fetch,
+                "KLINE" => DebugLogCategory::Kline,
+                "OI" => DebugLogCategory::Oi,
                 "CACHE" => DebugLogCategory::Cache,
+                "WS" if event.contains("Backfill") => DebugLogCategory::Backfill,
                 "WS" => DebugLogCategory::Ws,
+                "STREAM" => DebugLogCategory::Stream,
+                "BACKFILL" => DebugLogCategory::Backfill,
+                "CHART" if event.contains("Bubbles") => DebugLogCategory::Bubbles,
+                "CHART" if event.contains("Footprint") => DebugLogCategory::Footprint,
                 "CHART" => DebugLogCategory::Chart,
                 "DATA" => DebugLogCategory::Data,
                 _ => DebugLogCategory::App,
@@ -417,8 +430,9 @@ fn extract_summary(details: &str, cat_str: &str) -> String {
     for part in details.split_whitespace() {
         if let Some((key, value)) = part.split_once('=') {
             match key {
-                "symbol" | "venue" | "range" | "records" | "trades" | "duration" | "requests"
-                | "session" | "reason" | "error" => {
+                "symbol" | "venue" | "stream" | "range" | "records" | "raw_records"
+                | "retained_records" | "trades" | "duration" | "requests" | "session"
+                | "reason" | "error" | "req" | "pane" | "panes" | "gap_ms" => {
                     summary_parts.push(format!("{key}={value}"));
                 }
                 _ => {}
@@ -555,14 +569,29 @@ impl Flowsurface {
                 let dashboard = self.active_dashboard_mut();
 
                 match event {
-                    exchange::Event::Connected(_streams) => {}
+                    exchange::Event::Connected(streams) => {
+                        log::info!("WS Connected | streams={}", streams.len());
+                        for (idx, stream) in streams.iter().enumerate() {
+                            log::debug!(
+                                "WS ConnectedStream | idx={idx} stream={}",
+                                crate::connector::fetcher::format_stream(stream)
+                            );
+                        }
+                    }
                     exchange::Event::Disconnected(streams, reason) => {
-                        log::info!(
-                            "WS Disconnected | reason={reason:?} streams={}",
-                            streams.len()
-                        );
-
                         let now = exchange::UnixMs::now();
+                        log::info!(
+                            "WS Disconnected | reason={reason:?} streams={} now={}",
+                            streams.len(),
+                            crate::connector::fetcher::format_time_short(now)
+                        );
+                        for (idx, stream) in streams.iter().enumerate() {
+                            log::debug!(
+                                "WS DisconnectedStream | idx={idx} stream={}",
+                                crate::connector::fetcher::format_stream(stream)
+                            );
+                        }
+
                         let main_window_id = self.main_window.id;
                         let handles = self.handles.clone();
                         let dashboard = self.active_dashboard_mut();
@@ -575,6 +604,11 @@ impl Flowsurface {
                             });
                     }
                     exchange::Event::DepthReceived(stream, update_t, depth) => {
+                        log::trace!(
+                            "WS DepthReceived | stream={} update_t={} routed=true",
+                            crate::connector::fetcher::format_stream(&stream),
+                            crate::connector::fetcher::format_time_short(update_t)
+                        );
                         let task = dashboard
                             .ingest_depth(&stream, update_t, &depth, main_window_id)
                             .map(move |msg| Message::Dashboard {
@@ -585,6 +619,18 @@ impl Flowsurface {
                         return task;
                     }
                     exchange::Event::TradesReceived(stream, update_t, buffer) => {
+                        let now = exchange::UnixMs::now();
+                        let first_trade_t = buffer.first().map(|trade| trade.time);
+                        let last_trade_t = buffer.last().map(|trade| trade.time);
+                        log::trace!(
+                            "WS TradesReceived | stream={} update_t={} batch_len={} first_trade_t={} last_trade_t={} lag_ms={}",
+                            crate::connector::fetcher::format_stream(&stream),
+                            crate::connector::fetcher::format_time_short(update_t),
+                            buffer.len(),
+                            crate::connector::fetcher::format_optional_time(first_trade_t),
+                            crate::connector::fetcher::format_optional_time(last_trade_t),
+                            now.saturating_diff(last_trade_t.unwrap_or(update_t))
+                        );
                         let task = dashboard
                             .ingest_trades(&stream, &buffer, update_t, main_window_id)
                             .map(move |msg| Message::Dashboard {
@@ -599,6 +645,18 @@ impl Flowsurface {
                         return task;
                     }
                     exchange::Event::KlineReceived(stream, kline) => {
+                        let now = exchange::UnixMs::now();
+                        log::trace!(
+                            "WS KlineReceived | stream={} kline_t={} open={:?} high={:?} low={:?} close={:?} volume={:?} lag_ms={}",
+                            crate::connector::fetcher::format_stream(&stream),
+                            crate::connector::fetcher::format_time_short(kline.time),
+                            kline.open,
+                            kline.high,
+                            kline.low,
+                            kline.close,
+                            kline.volume,
+                            now.saturating_diff(kline.time)
+                        );
                         return dashboard
                             .update_latest_klines(&stream, &kline, main_window_id)
                             .map(move |msg| Message::Dashboard {

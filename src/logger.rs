@@ -5,13 +5,11 @@ use std::{
     io::{self, Write},
     panic::PanicHookInfo,
     path::PathBuf,
-    process,
     sync::{Mutex, Once, mpsc},
     thread::{self, JoinHandle},
 };
 
-const MAX_LOG_FILE_SIZE: u64 = 50 * 1024 * 1024; // 50 MB
-const MAX_DEBUG_LINES: usize = 2_000;
+const DEFAULT_MAX_DEBUG_LINES: usize = 10_000;
 
 static DEBUG_LOGS: Mutex<VecDeque<String>> = Mutex::new(VecDeque::new());
 static DEBUG_PENDING_LINE: Mutex<String> = Mutex::new(String::new());
@@ -29,7 +27,8 @@ pub fn setup(is_debug: bool) -> Result<(), data::log::Error> {
         log::Level::Info
     };
 
-    let level_filter = std::env::var("RUST_LOG")
+    let level_filter = std::env::var("FLOWSURFACE_LOG_LEVEL")
+        .or_else(|_| std::env::var("RUST_LOG"))
         .ok()
         .as_deref()
         .map(str::parse::<log::Level>)
@@ -38,11 +37,19 @@ pub fn setup(is_debug: bool) -> Result<(), data::log::Error> {
         .to_level_filter();
 
     let mut io_sink = fern::Dispatch::new();
-
-    if is_debug {
-        io_sink = io_sink.chain(std::io::stdout());
+    let log_to_file = env_flag("FLOWSURFACE_LOG_TO_FILE", true);
+    let log_to_console = env_flag("FLOWSURFACE_LOG_CONSOLE", false);
+    let log_path = if log_to_file {
+        Some(data::log::path()?)
     } else {
-        let log_path = data::log::path()?;
+        None
+    };
+
+    if log_to_console {
+        io_sink = io_sink.chain(std::io::stdout());
+    }
+
+    if let Some(log_path) = log_path.clone() {
         initial_rotation(&log_path)?;
 
         let logger: Box<dyn Write + Send> = Box::new(BackgroundLogger::new(log_path)?);
@@ -85,7 +92,28 @@ pub fn setup(is_debug: bool) -> Result<(), data::log::Error> {
         .chain(Box::new(DebugTerminalLogger) as Box<dyn Write + Send>)
         .apply()?;
 
+    log::info!(
+        "LOG Startup | file={} console_enabled={} level={}",
+        log_path
+            .as_ref()
+            .map_or("disabled".to_string(), |path| path.display().to_string()),
+        log_to_console,
+        level_filter
+    );
+
     Ok(())
+}
+
+fn env_flag(name: &str, default: bool) -> bool {
+    std::env::var(name)
+        .ok()
+        .map(|value| {
+            matches!(
+                value.trim().to_ascii_lowercase().as_str(),
+                "1" | "true" | "yes" | "on"
+            )
+        })
+        .unwrap_or(default)
 }
 
 pub fn debug_terminal_snapshot() -> Vec<String> {
@@ -111,7 +139,13 @@ fn push_debug_line(line: String) {
     }
 
     if let Ok(mut lines) = DEBUG_LOGS.lock() {
-        if lines.len() >= MAX_DEBUG_LINES {
+        let max_debug_lines = std::env::var("FLOWSURFACE_DEBUG_LINES")
+            .ok()
+            .and_then(|value| value.parse::<usize>().ok())
+            .filter(|value| *value > 0)
+            .unwrap_or(DEFAULT_MAX_DEBUG_LINES);
+
+        while lines.len() >= max_debug_lines {
             lines.pop_front();
         }
 
@@ -200,7 +234,9 @@ impl BackgroundLogger {
                 let mut logger = match Logger::new(&path) {
                     Ok(logger) => logger,
                     Err(e) => {
-                        eprintln!("Failed to initialize logger: {}", e);
+                        if env_flag("FLOWSURFACE_LOG_CONSOLE", false) {
+                            eprintln!("Failed to initialize logger: {}", e);
+                        }
                         return;
                     }
                 };
@@ -208,12 +244,16 @@ impl BackgroundLogger {
                 loop {
                     match receiver.recv() {
                         Ok(LogMessage::Content(data)) => {
-                            if let Err(e) = logger.write_all(&data) {
+                            if let Err(e) = logger.write_all(&data)
+                                && env_flag("FLOWSURFACE_LOG_CONSOLE", false)
+                            {
                                 eprintln!("Logging error: {}", e);
                             }
                         }
                         Ok(LogMessage::Flush) => {
-                            if let Err(e) = logger.flush() {
+                            if let Err(e) = logger.flush()
+                                && env_flag("FLOWSURFACE_LOG_CONSOLE", false)
+                            {
                                 eprintln!("Error flushing logs: {}", e);
                             }
                         }
@@ -251,6 +291,7 @@ impl Drop for BackgroundLogger {
         let _ = self.sender.send(LogMessage::Shutdown);
         if let Some(handle) = self.thread_handle.take()
             && let Err(err) = handle.join()
+            && env_flag("FLOWSURFACE_LOG_CONSOLE", false)
         {
             eprintln!("Background logger thread panicked: {err:?}");
         }
@@ -259,7 +300,6 @@ impl Drop for BackgroundLogger {
 
 struct Logger {
     file: fs::File,
-    current_size: u64,
 }
 
 impl Logger {
@@ -269,38 +309,13 @@ impl Logger {
             .append(true)
             .open(path)?;
 
-        let size = file.metadata()?.len();
-
-        Ok(Logger {
-            file,
-            current_size: size,
-        })
+        Ok(Logger { file })
     }
 }
 
 impl Write for Logger {
     fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
-        let buf_len = buf.len() as u64;
-
-        if self.current_size + buf_len > MAX_LOG_FILE_SIZE {
-            let timestamp = chrono::Local::now().format("%H:%M:%S%.3f");
-            let error_msg = format!(
-                "\n{}:FATAL -- Log file size would exceed the maximum allowed size of {} bytes\n",
-                timestamp, MAX_LOG_FILE_SIZE
-            );
-
-            eprintln!("{error_msg}");
-
-            let _ = self.file.write_all(error_msg.as_bytes());
-            let _ = self.file.flush();
-
-            process::abort();
-        }
-
-        let bytes = self.file.write(buf)?;
-        self.current_size += bytes as u64;
-
-        Ok(bytes)
+        self.file.write(buf)
     }
 
     fn flush(&mut self) -> io::Result<()> {
@@ -320,21 +335,29 @@ pub fn install_panic_hook() {
             log::error!(target: "panic", "{report}");
             log::logger().flush();
 
-            if let Err(err) = append_stderr_log_line(&report) {
+            if let Err(err) = append_stderr_log_line(&report)
+                && env_flag("FLOWSURFACE_LOG_CONSOLE", false)
+            {
                 eprintln!("Failed to persist panic report: {err}");
             }
 
-            previous(panic_info);
+            if env_flag("FLOWSURFACE_LOG_CONSOLE", false) {
+                previous(panic_info);
+            }
         }));
     });
 }
 
 pub fn report_stderr(message: &str) {
-    if let Err(err) = append_stderr_log_line(message) {
+    if let Err(err) = append_stderr_log_line(message)
+        && env_flag("FLOWSURFACE_LOG_CONSOLE", false)
+    {
         eprintln!("Failed to persist std log entry: {err}");
     }
 
-    eprintln!("{message}");
+    if env_flag("FLOWSURFACE_LOG_CONSOLE", false) {
+        eprintln!("{message}");
+    }
 }
 
 fn format_panic_report(info: &PanicHookInfo<'_>) -> String {

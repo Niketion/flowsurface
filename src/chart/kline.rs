@@ -3,14 +3,17 @@ use super::{
     indicator, request_fetch, scale::linear::PriceInfoLabel,
 };
 use crate::chart::indicator::kline::KlineIndicatorImpl;
-use crate::connector::fetcher::{FetchRange, RequestHandler, is_trade_fetch_enabled};
+use crate::connector::fetcher::{
+    self, FetchRange, ReqError, RequestHandler, is_trade_fetch_enabled,
+};
 use crate::{modal::pane::settings::study, style};
 use data::aggr::ticks::TickAggr;
 use data::aggr::time::TimeSeries;
 use data::chart::indicator::{Indicator, KlineIndicator};
 use data::chart::kline::{
-    BubbleColorMode, ClusterKind, ClusterScaling, Config, FootprintStudy, FootprintSummary,
-    KlineDataPoint, KlineTrades, NPoc, PointOfControl, VolumeBubbleConfig, VolumeBubbleSession,
+    BubbleCandidate, BubbleColorMode, BubbleVolumeSummary, ClusterKind, ClusterScaling, Config,
+    FootprintStudy, FootprintSummary, KlineDataPoint, KlineTrades, NPoc, PointOfControl,
+    VolumeBubbleConfig, VolumeBubbleSession,
 };
 use data::chart::{Autoscale, KlineChartKind, ViewConfig};
 
@@ -25,6 +28,7 @@ use iced::{Alignment, Color, Element, Point, Rectangle, Renderer, Size, Theme, V
 
 use chrono::{Datelike, TimeZone, Timelike};
 use enum_map::EnumMap;
+use rustc_hash::FxHashMap;
 use std::time::Instant;
 
 impl Chart for KlineChart {
@@ -165,6 +169,7 @@ pub struct KlineChart {
     data_source: PlotData<KlineDataPoint>,
     raw_trades: Vec<Trade>,
     covered_trade_ranges: Vec<(UnixMs, UnixMs)>,
+    covered_bubble_summary_ranges: Vec<(UnixMs, UnixMs)>,
     indicators: EnumMap<KlineIndicator, Option<Box<dyn KlineIndicatorImpl>>>,
     fetching_trades: (bool, Option<Handle>),
     pub(crate) kind: KlineChartKind,
@@ -172,6 +177,7 @@ pub struct KlineChart {
     study_configurator: study::Configurator<FootprintStudy>,
     last_tick: Instant,
     visual_config: Config,
+    bubble_auto_fetch_at: Option<Instant>,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -274,12 +280,14 @@ impl KlineChart {
                     data_source,
                     raw_trades,
                     covered_trade_ranges: Vec::new(),
+                    covered_bubble_summary_ranges: Vec::new(),
                     indicators,
                     fetching_trades: (false, None),
                     request_handler: RequestHandler::default(),
                     kind: kind.clone(),
                     study_configurator: study::Configurator::new(),
                     last_tick: Instant::now(),
+                    bubble_auto_fetch_at: None,
                 }
             }
             Basis::Tick(interval) => {
@@ -335,12 +343,14 @@ impl KlineChart {
                     data_source,
                     raw_trades,
                     covered_trade_ranges: Vec::new(),
+                    covered_bubble_summary_ranges: Vec::new(),
                     indicators,
                     fetching_trades: (false, None),
                     request_handler: RequestHandler::default(),
                     kind: kind.clone(),
                     study_configurator: study::Configurator::new(),
                     last_tick: Instant::now(),
+                    bubble_auto_fetch_at: None,
                 }
             }
         }
@@ -349,6 +359,7 @@ impl KlineChart {
     pub fn update_latest_kline(&mut self, kline: &Kline) {
         match self.data_source {
             PlotData::TimeBased(ref mut timeseries) => {
+                let previous_latest_x = self.chart.latest_x;
                 timeseries.insert_klines(&[*kline]);
 
                 self.indicators
@@ -358,13 +369,29 @@ impl KlineChart {
 
                 let chart = self.mut_state();
 
-                if kline.time.as_u64() > chart.latest_x {
+                let relation = if kline.time.as_u64() > chart.latest_x {
                     chart.latest_x = kline.time.as_u64();
-                }
+                    "newer"
+                } else if kline.time.as_u64() == chart.latest_x {
+                    "equal"
+                } else {
+                    "older"
+                };
 
                 chart.last_price = Some(PriceInfoLabel::new(kline.close, kline.open));
+                log::trace!(
+                    "KLINE UpdateLatest | kline_t={} previous_latest_x={} new_latest_x={} relation={relation}",
+                    fetcher::format_time_short(kline.time),
+                    previous_latest_x,
+                    chart.latest_x
+                );
             }
-            PlotData::TickBased(_) => {}
+            PlotData::TickBased(_) => {
+                log::trace!(
+                    "KLINE UpdateLatest | kline_t={} reason=tick_based_ignored",
+                    fetcher::format_time_short(kline.time)
+                );
+            }
         }
     }
 
@@ -373,6 +400,27 @@ impl KlineChart {
     }
 
     fn fetch_missing_data(&mut self) -> Option<Action> {
+        self.request_handler.cleanup_stale();
+        if self.fetching_trades.0 && !self.request_handler.has_pending_trade_requests() {
+            log::warn!("CHART Footprint | action=clear_fetching reason=no_pending_trade_request");
+            self.fetching_trades = (false, None);
+        }
+
+        log::debug!(
+            "CHART FetchMissingStart | kind={:?} basis={:?} datapoints={} raw_trades={} covered_trade_ranges={} fetching_trades={} bubbles_enabled={} bubbles_session={:?} trade_fetch_enabled={}",
+            self.kind,
+            self.chart.basis,
+            match &self.data_source {
+                PlotData::TimeBased(timeseries) => timeseries.datapoints.len(),
+                PlotData::TickBased(tick_aggr) => tick_aggr.datapoints.len(),
+            },
+            self.raw_trades.len(),
+            self.covered_trade_ranges.len(),
+            self.fetching_trades.0,
+            self.visual_config.volume_bubbles.enabled,
+            self.visual_config.volume_bubbles.session,
+            is_trade_fetch_enabled()
+        );
         match &self.data_source {
             PlotData::TimeBased(timeseries) => {
                 let timeframe_ms = timeseries.interval.to_milliseconds();
@@ -383,30 +431,67 @@ impl KlineChart {
 
                     let range = FetchRange::Kline(UnixMs::new(earliest), UnixMs::new(latest));
                     log::info!(
-                        "CHART Initial | reason=empty_data range={}",
-                        crate::connector::fetcher::format_time_range(
-                            UnixMs::new(earliest),
-                            UnixMs::new(latest)
-                        )
+                        "KLINE InitialFetch | reason=empty_data range={}",
+                        fetcher::format_time_range(UnixMs::new(earliest), UnixMs::new(latest))
                     );
                     if let Some(action) = request_fetch(&mut self.request_handler, range) {
+                        log::info!(
+                            "KLINE InitialFetchQueued | range={}",
+                            fetcher::format_time_range(UnixMs::new(earliest), UnixMs::new(latest))
+                        );
                         return Some(action);
+                    } else {
+                        log::debug!(
+                            "KLINE InitialFetchSuppressed | range={} reason=request_handler",
+                            fetcher::format_time_range(UnixMs::new(earliest), UnixMs::new(latest))
+                        );
                     }
                 }
 
-                let (visible_earliest, visible_latest) = self.visible_timerange()?;
+                let Some((visible_earliest, visible_latest)) = self.visible_timerange() else {
+                    log::debug!(
+                        "CHART FetchMissingSkip | kind={:?} reason=visible_timerange_none bounds={:?}",
+                        self.kind,
+                        self.chart.bounds
+                    );
+                    return None;
+                };
                 let (kline_earliest, kline_latest) = timeseries.timerange();
                 let visible_earliest_ms = UnixMs::new(visible_earliest);
                 let visible_latest_ms = UnixMs::new(visible_latest);
                 let visible_span = visible_latest.saturating_sub(visible_earliest);
                 let prefetch_earliest = visible_earliest.saturating_sub(visible_span);
+                log::debug!(
+                    "CHART FetchMissingRange | visible_range={} kline_range={} visible_span_ms={} prefetch_earliest={}",
+                    fetcher::format_time_range(visible_earliest_ms, visible_latest_ms),
+                    fetcher::format_time_range(kline_earliest, kline_latest),
+                    visible_span,
+                    fetcher::format_time_short(UnixMs::new(prefetch_earliest))
+                );
 
                 // priority 1, initial klines for visible range
                 if visible_earliest_ms < kline_earliest {
                     let range = FetchRange::Kline(UnixMs::new(prefetch_earliest), kline_earliest);
+                    log::info!(
+                        "KLINE PriorityFetch | reason=visible_before_earliest visible_earliest={} kline_earliest={} fetch={}",
+                        fetcher::format_time_short(visible_earliest_ms),
+                        fetcher::format_time_short(kline_earliest),
+                        fetcher::format_fetch_range(&range)
+                    );
                     if let Some(action) = request_fetch(&mut self.request_handler, range) {
                         return Some(action);
+                    } else {
+                        log::debug!(
+                            "KLINE PriorityFetchSuppressed | reason=request_handler fetch={}",
+                            fetcher::format_fetch_range(&range)
+                        );
                     }
+                } else {
+                    log::trace!(
+                        "KLINE PrioritySkip | reason=visible_not_before_earliest visible_earliest={} kline_earliest={}",
+                        fetcher::format_time_short(visible_earliest_ms),
+                        fetcher::format_time_short(kline_earliest)
+                    );
                 }
 
                 // priority 2, trades
@@ -415,14 +500,16 @@ impl KlineChart {
                         if let Some((fetch_from, fetch_to)) = timeseries
                             .suggest_trade_fetch_range(visible_earliest_ms, visible_latest_ms)
                         {
+                            log::debug!(
+                                "CHART Footprint | action=suggest_missing range={}",
+                                fetcher::format_time_range(fetch_from, fetch_to)
+                            );
                             if let Some((fetch_from, fetch_to)) =
                                 self.subtract_covered_trade_ranges(fetch_from, fetch_to)
                             {
                                 log::info!(
                                     "CHART Footprint | action=fetch_trades reason=missing_range range={}",
-                                    crate::connector::fetcher::format_time_range(
-                                        fetch_from, fetch_to
-                                    )
+                                    fetcher::format_time_range(fetch_from, fetch_to)
                                 );
                                 let range = FetchRange::Trades(fetch_from, fetch_to);
                                 if let Some(action) =
@@ -430,13 +517,21 @@ impl KlineChart {
                                 {
                                     self.fetching_trades = (true, None);
                                     return Some(action);
+                                } else {
+                                    let reason = self
+                                        .request_handler
+                                        .last_suppression_reason()
+                                        .map_or("throttled", |reason| reason.as_str());
+                                    log::info!(
+                                        "CHART Footprint | action=suppressed reason={} range={}",
+                                        reason,
+                                        fetcher::format_fetch_range(&range)
+                                    );
                                 }
                             } else {
                                 log::debug!(
                                     "CHART Footprint | action=skip reason=already_covered range={}",
-                                    crate::connector::fetcher::format_time_range(
-                                        fetch_from, fetch_to
-                                    )
+                                    fetcher::format_time_range(fetch_from, fetch_to)
                                 );
                             }
                         } else {
@@ -452,10 +547,14 @@ impl KlineChart {
                 if matches!(self.kind, KlineChartKind::Candles)
                     && self.visual_config.volume_bubbles.enabled
                 {
-                    /// Maximum single-shot trade range for Bubbles to avoid
-                    /// hitting exchange rate limits with multi-hour fetches.
-                    const MAX_BUBBLE_FETCH_RANGE_MS: u64 = 15 * 60 * 1_000; // 15 min
+                    const BUBBLE_AUTO_BACKFILL_COOLDOWN: std::time::Duration =
+                        std::time::Duration::from_secs(60);
 
+                    log::debug!(
+                        "CHART Bubbles | enabled=true session={:?} fetching_trades={}",
+                        self.visual_config.volume_bubbles.session,
+                        self.fetching_trades.0
+                    );
                     if self.fetching_trades.0 {
                         log::debug!("CHART Bubbles | action=skip reason=already_fetching");
                     } else {
@@ -463,6 +562,12 @@ impl KlineChart {
                         let session_start =
                             current_volume_bubble_session_start_ms(chrono::Utc::now(), session);
                         let request_earliest = visible_earliest_ms.max(session_start);
+                        log::debug!(
+                            "CHART Bubbles | session={session:?} session_start={} request_earliest={} visible_range={}",
+                            fetcher::format_time_short(session_start),
+                            fetcher::format_time_short(request_earliest),
+                            fetcher::format_time_range(visible_earliest_ms, visible_latest_ms)
+                        );
 
                         if visible_latest_ms <= session_start {
                             log::debug!(
@@ -474,31 +579,77 @@ impl KlineChart {
                         {
                             let fetch_from = fetch_from.max(session_start);
                             if fetch_to > fetch_from {
-                                if let Some((fetch_from, fetch_to)) =
-                                    self.subtract_covered_trade_ranges(fetch_from, fetch_to)
+                                if let Some((fetch_from, fetch_to)) = self
+                                    .subtract_covered_bubble_summary_ranges(fetch_from, fetch_to)
                                 {
+                                    if self
+                                        .visual_config
+                                        .volume_bubbles
+                                        .use_raw_trades_when_available
+                                        && self.is_trade_range_covered(fetch_from, fetch_to)
+                                    {
+                                        let summaries = self.bubble_summaries_from_raw_trades(
+                                            fetch_from,
+                                            fetch_to,
+                                            timeframe_ms,
+                                            self.chart.tick_size,
+                                            self.visual_config
+                                                .volume_bubbles
+                                                .max_candidates_per_candle
+                                                .max(
+                                                    self.visual_config
+                                                        .volume_bubbles
+                                                        .max_bubbles_per_bar,
+                                                ),
+                                        );
+                                        let candidates = summaries
+                                            .iter()
+                                            .map(|summary| summary.candidates.len())
+                                            .sum::<usize>();
+                                        log::info!(
+                                            "BUBBLE Summary Reuse | source=footprint_raw_trades range={} candles={} candidates={}",
+                                            fetcher::format_time_range(fetch_from, fetch_to),
+                                            summaries.len(),
+                                            candidates
+                                        );
+                                        self.insert_bubble_summaries(
+                                            summaries, fetch_from, fetch_to, 0, 0, None,
+                                        );
+                                        return None;
+                                    }
+
+                                    if self.bubble_auto_fetch_at.is_some_and(|last_fetch| {
+                                        last_fetch.elapsed() < BUBBLE_AUTO_BACKFILL_COOLDOWN
+                                    }) {
+                                        log::info!(
+                                            "CHART Bubbles | action=defer_backfill reason=budget_exhausted remaining={}",
+                                            fetcher::format_time_range(fetch_from, fetch_to)
+                                        );
+                                        return None;
+                                    }
+
                                     // Cap to the most recent portion to avoid
                                     // huge single-shot Binance aggTrades fetches.
+                                    let max_range_ms = self
+                                        .visual_config
+                                        .volume_bubbles
+                                        .max_history_minutes_per_request
+                                        .max(1)
+                                        * 60
+                                        * 1_000;
                                     let range_ms =
                                         fetch_to.as_u64().saturating_sub(fetch_from.as_u64());
                                     let (fetch_from, fetch_to, was_capped) = if range_ms
-                                        > MAX_BUBBLE_FETCH_RANGE_MS
+                                        > max_range_ms
                                     {
                                         let capped_from = UnixMs::new(
-                                            fetch_to
-                                                .as_u64()
-                                                .saturating_sub(MAX_BUBBLE_FETCH_RANGE_MS),
+                                            fetch_to.as_u64().saturating_sub(max_range_ms),
                                         );
                                         log::info!(
-                                            "CHART Bubbles | action=range_capped \
-                                             original={orig} capped={capped} session={session:?}",
-                                            orig = crate::connector::fetcher::format_time_range(
-                                                fetch_from, fetch_to
-                                            ),
-                                            capped = crate::connector::fetcher::format_time_range(
-                                                capped_from,
-                                                fetch_to
-                                            ),
+                                            "BUBBLE Summary Cap | original_range={orig} capped_range={capped} session={session:?}",
+                                            orig = fetcher::format_time_range(fetch_from, fetch_to),
+                                            capped =
+                                                fetcher::format_time_range(capped_from, fetch_to),
                                         );
                                         (capped_from, fetch_to, true)
                                     } else {
@@ -507,26 +658,41 @@ impl KlineChart {
 
                                     if !was_capped {
                                         log::info!(
-                                            "CHART Bubbles | action=fetch_trades session={:?} range={}",
+                                            "CHART Bubbles | action=fetch_summary session={:?} range={}",
                                             session,
-                                            crate::connector::fetcher::format_time_range(
-                                                fetch_from, fetch_to
-                                            )
+                                            fetcher::format_time_range(fetch_from, fetch_to)
                                         );
                                     }
-                                    let range = FetchRange::Trades(fetch_from, fetch_to);
+                                    let range = FetchRange::BubbleSummary {
+                                        from: fetch_from,
+                                        to: fetch_to,
+                                        timeframe_ms,
+                                        price_step: self.chart.tick_size,
+                                        max_candidates_per_candle: self
+                                            .visual_config
+                                            .volume_bubbles
+                                            .max_candidates_per_candle
+                                            .max(
+                                                self.visual_config
+                                                    .volume_bubbles
+                                                    .max_bubbles_per_bar,
+                                            ),
+                                    };
                                     if let Some(action) =
                                         request_fetch(&mut self.request_handler, range)
                                     {
-                                        self.fetching_trades = (true, None);
+                                        self.bubble_auto_fetch_at = Some(Instant::now());
                                         return Some(action);
+                                    } else {
+                                        log::debug!(
+                                            "CHART Bubbles | action=suppressed reason=request_handler range={}",
+                                            fetcher::format_fetch_range(&range)
+                                        );
                                     }
                                 } else {
                                     log::debug!(
-                                        "CHART Bubbles | action=skip reason=already_covered range={}",
-                                        crate::connector::fetcher::format_time_range(
-                                            fetch_from, fetch_to
-                                        )
+                                        "BUBBLE Summary Skip | reason=already_covered range={}",
+                                        fetcher::format_time_range(fetch_from, fetch_to)
                                     );
                                 }
                             } else {
@@ -553,17 +719,41 @@ impl KlineChart {
                     kline_latest,
                     prefetch_earliest: UnixMs::new(prefetch_earliest),
                 };
-                for indi in self.indicators.values_mut().filter_map(Option::as_mut) {
-                    if let Some(range) = indi.fetch_range(&ctx)
-                        && let Some(action) = request_fetch(&mut self.request_handler, range)
-                    {
-                        return Some(action);
+                for (indicator_kind, indi) in self.indicators.iter_mut() {
+                    let Some(indi) = indi.as_mut() else {
+                        continue;
+                    };
+                    if let Some(range) = indi.fetch_range(&ctx) {
+                        log::debug!(
+                            "CHART IndicatorFetch | indicator={:?} range={}",
+                            indicator_kind,
+                            fetcher::format_fetch_range(&range)
+                        );
+                        if let Some(action) = request_fetch(&mut self.request_handler, range) {
+                            log::info!(
+                                "CHART IndicatorFetchQueued | indicator={:?} range={}",
+                                indicator_kind,
+                                fetcher::format_fetch_range(&range)
+                            );
+                            return Some(action);
+                        } else {
+                            log::debug!(
+                                "CHART IndicatorFetchSuppressed | indicator={:?} range={} reason=request_handler",
+                                indicator_kind,
+                                fetcher::format_fetch_range(&range)
+                            );
+                        }
                     }
                 }
 
                 // priority 4, missing klines & integrity check
                 let check_earliest = UnixMs::new(prefetch_earliest).max(kline_earliest);
                 let check_latest = visible_latest_ms.saturating_add(timeframe_ms);
+                log::trace!(
+                    "KLINE IntegrityCheck | check_earliest={} check_latest={}",
+                    fetcher::format_time_short(check_earliest),
+                    fetcher::format_time_short(check_latest)
+                );
 
                 if let Some(missing_keys) =
                     timeseries.check_kline_integrity(check_earliest, check_latest)
@@ -580,13 +770,40 @@ impl KlineChart {
                         .saturating_sub(timeframe_ms);
 
                     let range = FetchRange::Kline(earliest, latest);
+                    log::warn!(
+                        "KLINE IntegrityMissing | missing_count={} min={} max={} fetch={}",
+                        missing_keys.len(),
+                        missing_keys
+                            .iter()
+                            .min()
+                            .map_or("-".to_string(), |t| fetcher::format_time_short(*t)),
+                        missing_keys
+                            .iter()
+                            .max()
+                            .map_or("-".to_string(), |t| fetcher::format_time_short(*t)),
+                        fetcher::format_fetch_range(&range)
+                    );
                     if let Some(action) = request_fetch(&mut self.request_handler, range) {
                         return Some(action);
+                    } else {
+                        log::debug!(
+                            "KLINE IntegrityFetchSuppressed | reason=request_handler fetch={}",
+                            fetcher::format_fetch_range(&range)
+                        );
                     }
+                } else {
+                    log::trace!(
+                        "KLINE IntegrityPassed | check_range={}",
+                        fetcher::format_time_range(check_earliest, check_latest)
+                    );
                 }
             }
             PlotData::TickBased(_) => {
                 // TODO: implement trade fetch
+                log::trace!(
+                    "CHART TickBased | action=skip reason=trade_fetch_todo kind={:?}",
+                    self.kind
+                );
             }
         }
 
@@ -598,17 +815,40 @@ impl KlineChart {
         self.request_handler = RequestHandler::default();
         self.fetching_trades = (false, None);
         self.covered_trade_ranges.clear();
+        self.covered_bubble_summary_ranges.clear();
+        self.bubble_auto_fetch_at = None;
+    }
+
+    pub fn register_backfill_request(&mut self, req_id: uuid::Uuid, fetch: FetchRange) -> bool {
+        match self.request_handler.add_request_with_id(req_id, fetch) {
+            Ok(Some(_)) => true,
+            Ok(None) => false,
+            Err(ReqError::Failed(reason)) => {
+                log::error!("Failed to request {:?}: {}", fetch, reason);
+                false
+            }
+        }
     }
 
     pub fn mark_trade_request_completed(&mut self, req_id: uuid::Uuid) {
         self.request_handler.mark_completed(req_id);
     }
 
+    pub fn mark_request_failed(&mut self, req_id: uuid::Uuid, error: String) {
+        self.request_handler.mark_failed(req_id, error);
+        self.fetching_trades = (false, None);
+    }
+
     pub fn mark_trade_range_covered(&mut self, from: UnixMs, to: UnixMs) {
         if to <= from {
+            log::warn!(
+                "DATA Trades CoveredSkip | incoming_range={} reason=invalid_range",
+                fetcher::format_time_range(from, to)
+            );
             return;
         }
 
+        let before = self.covered_trade_ranges.clone();
         self.covered_trade_ranges.push((from, to));
         self.covered_trade_ranges.sort_by_key(|(from, _)| *from);
 
@@ -626,9 +866,45 @@ impl KlineChart {
 
         self.covered_trade_ranges = merged;
         log::debug!(
-            "DATA Trades Covered | range={} covered_ranges={}",
-            crate::connector::fetcher::format_time_range(from, to),
-            self.covered_trade_ranges.len()
+            "DATA Trades Covered | incoming_range={} before={} after={}",
+            fetcher::format_time_range(from, to),
+            format_trade_ranges(&before),
+            format_trade_ranges(&self.covered_trade_ranges)
+        );
+    }
+
+    pub fn mark_bubble_summary_range_covered(&mut self, from: UnixMs, to: UnixMs) {
+        if to <= from {
+            log::warn!(
+                "BUBBLE Summary Skip | reason=invalid_range range={}",
+                fetcher::format_time_range(from, to)
+            );
+            return;
+        }
+
+        let before = self.covered_bubble_summary_ranges.clone();
+        self.covered_bubble_summary_ranges.push((from, to));
+        self.covered_bubble_summary_ranges
+            .sort_by_key(|(from, _)| *from);
+
+        let mut merged: Vec<(UnixMs, UnixMs)> = Vec::new();
+        for (range_from, range_to) in self.covered_bubble_summary_ranges.drain(..) {
+            if let Some((_, last_to)) = merged.last_mut()
+                && range_from <= *last_to
+            {
+                *last_to = (*last_to).max(range_to);
+                continue;
+            }
+
+            merged.push((range_from, range_to));
+        }
+
+        self.covered_bubble_summary_ranges = merged;
+        log::debug!(
+            "BUBBLE Summary Covered | incoming_range={} before={} after={}",
+            fetcher::format_time_range(from, to),
+            format_trade_ranges(&before),
+            format_trade_ranges(&self.covered_bubble_summary_ranges)
         );
     }
 
@@ -643,7 +919,21 @@ impl KlineChart {
         from: UnixMs,
         to: UnixMs,
     ) -> Option<(UnixMs, UnixMs)> {
-        if to <= from || self.is_trade_range_covered(from, to) {
+        if to <= from {
+            log::debug!(
+                "DATA Trades SubtractCovered | input_range={} covered={} returned=- reason=invalid_range",
+                fetcher::format_time_range(from, to),
+                format_trade_ranges(&self.covered_trade_ranges)
+            );
+            return None;
+        }
+
+        if self.is_trade_range_covered(from, to) {
+            log::debug!(
+                "DATA Trades SubtractCovered | input_range={} covered={} returned=- reason=fully_covered",
+                fetcher::format_time_range(from, to),
+                format_trade_ranges(&self.covered_trade_ranges)
+            );
             return None;
         }
 
@@ -654,19 +944,61 @@ impl KlineChart {
             }
 
             if *covered_from > cursor {
-                return Some((cursor, (*covered_from).min(to)));
+                let result = (cursor, (*covered_from).min(to));
+                log::debug!(
+                    "DATA Trades SubtractCovered | input_range={} covered={} returned={} reason=gap_before_covered",
+                    fetcher::format_time_range(from, to),
+                    format_trade_ranges(&self.covered_trade_ranges),
+                    fetcher::format_time_range(result.0, result.1)
+                );
+                return Some(result);
             }
 
             cursor = cursor.max(*covered_to);
             if cursor >= to {
+                log::debug!(
+                    "DATA Trades SubtractCovered | input_range={} covered={} returned=- reason=fully_covered_after_merge",
+                    fetcher::format_time_range(from, to),
+                    format_trade_ranges(&self.covered_trade_ranges)
+                );
                 return None;
             }
         }
 
-        Some((cursor, to))
+        let result = (cursor, to);
+        log::debug!(
+            "DATA Trades SubtractCovered | input_range={} covered={} returned={} reason=tail_gap",
+            fetcher::format_time_range(from, to),
+            format_trade_ranges(&self.covered_trade_ranges),
+            fetcher::format_time_range(result.0, result.1)
+        );
+        Some(result)
+    }
+
+    pub fn subtract_covered_bubble_summary_ranges(
+        &self,
+        from: UnixMs,
+        to: UnixMs,
+    ) -> Option<(UnixMs, UnixMs)> {
+        subtract_covered_ranges(
+            &self.covered_bubble_summary_ranges,
+            from,
+            to,
+            "BUBBLE Summary",
+        )
+    }
+
+    pub fn missing_trade_range(&self, from: UnixMs, to: UnixMs) -> Option<(UnixMs, UnixMs)> {
+        self.subtract_covered_trade_ranges(from, to)
     }
 
     pub fn complete_trade_fetch(&mut self, req_id: Option<uuid::Uuid>, fetch: Option<FetchRange>) {
+        log::info!(
+            "TRADE CompleteFetch | req={} fetch={} fetching_before={}",
+            fetcher::format_req_id(req_id),
+            fetcher::format_fetch_range_compact(fetch),
+            self.fetching_trades.0
+        );
         if let Some(id) = req_id {
             self.mark_trade_request_completed(id);
         }
@@ -677,6 +1009,28 @@ impl KlineChart {
         }
 
         self.fetching_trades = (false, None);
+        log::debug!(
+            "TRADE CompleteFetch | req={} fetching_after=false",
+            fetcher::format_req_id(req_id)
+        );
+    }
+
+    pub fn complete_bubble_summary_fetch(
+        &mut self,
+        req_id: Option<uuid::Uuid>,
+        from: UnixMs,
+        to: UnixMs,
+    ) {
+        log::info!(
+            "BUBBLE Summary CompleteFetch | req={} range={}",
+            fetcher::format_req_id(req_id),
+            fetcher::format_time_range(from, to)
+        );
+        if let Some(id) = req_id {
+            self.mark_trade_request_completed(id);
+        }
+        self.mark_bubble_summary_range_covered(from, to);
+        self.mark_trade_buckets_checked(from, to);
     }
 
     fn mark_trade_buckets_checked(&mut self, from: UnixMs, to: UnixMs) {
@@ -908,7 +1262,20 @@ impl KlineChart {
     }
 
     pub fn insert_trades(&mut self, buffer: &[Trade]) {
+        let raw_before = self.raw_trades.len();
         self.raw_trades.extend_from_slice(buffer);
+        let content_type = match self.data_source {
+            PlotData::TickBased(_) => "TickBased",
+            PlotData::TimeBased(_) => "TimeBased",
+        };
+        log::trace!(
+            "TRADE InsertLive | content_type={content_type} buffer_len={} first_trade_t={} last_trade_t={} raw_before={} raw_after={}",
+            buffer.len(),
+            fetcher::format_optional_time(buffer.first().map(|trade| trade.time)),
+            fetcher::format_optional_time(buffer.last().map(|trade| trade.time)),
+            raw_before,
+            self.raw_trades.len()
+        );
 
         match self.data_source {
             PlotData::TickBased(ref mut tick_aggr) => {
@@ -949,16 +1316,10 @@ impl KlineChart {
         let latest = raw_trades.last().map(|t| t.time);
 
         log::debug!(
-            "DATA Trades | fetched_batch={batch_size} inserted_raw={batch_size} total_raw_after={} is_batches_done={is_batches_done} earliest={} latest={}",
+            "DATA Trades | fetched_batch={batch_size} raw_before={raw_before} raw_after={} first={} last={} is_batches_done={is_batches_done}",
             raw_before + batch_size,
-            earliest.map_or(
-                "-".to_string(),
-                crate::connector::fetcher::format_time_short
-            ),
-            latest.map_or(
-                "-".to_string(),
-                crate::connector::fetcher::format_time_short
-            )
+            fetcher::format_optional_time(earliest),
+            fetcher::format_optional_time(latest)
         );
 
         match self.data_source {
@@ -984,13 +1345,125 @@ impl KlineChart {
                 self.raw_trades.len()
             );
             if batch_size == 0 {
-                log::info!(
-                    "DATA Trades Done | final_batch=0 reason=no_trades_within_requested_until_or_already_filtered"
+                log::warn!(
+                    "DATA Trades Done | final_batch=0 fetching_trades=false reason=no_trades_within_requested_until_or_already_filtered"
                 );
             }
         }
 
         self.invalidate(None);
+    }
+
+    pub fn insert_bubble_summaries(
+        &mut self,
+        summaries: Vec<BubbleVolumeSummary>,
+        from: UnixMs,
+        to: UnixMs,
+        trades_seen: usize,
+        raw_discarded: usize,
+        req_id: Option<uuid::Uuid>,
+    ) {
+        let candles = summaries.len();
+        let candidates = summaries
+            .iter()
+            .map(|summary| summary.candidates.len())
+            .sum::<usize>();
+
+        log::info!(
+            "BUBBLE Summary Insert | req={} range={} candles={} candidates={} trades_seen={} raw_discarded={} raw_trades_kept={}",
+            fetcher::format_req_id(req_id),
+            fetcher::format_time_range(from, to),
+            candles,
+            candidates,
+            trades_seen,
+            raw_discarded,
+            self.raw_trades.len()
+        );
+
+        if let PlotData::TimeBased(ref mut timeseries) = self.data_source {
+            timeseries.insert_bubble_summaries(summaries);
+        }
+
+        self.complete_bubble_summary_fetch(req_id, from, to);
+        self.invalidate(None);
+    }
+
+    fn bubble_summaries_from_raw_trades(
+        &self,
+        from: UnixMs,
+        to: UnixMs,
+        timeframe_ms: u64,
+        price_step: PriceStep,
+        max_candidates_per_candle: usize,
+    ) -> Vec<BubbleVolumeSummary> {
+        #[derive(Clone, Copy, Default)]
+        struct Accum {
+            buy_qty: Qty,
+            sell_qty: Qty,
+            trade_count: usize,
+            first_time: Option<UnixMs>,
+            last_time: Option<UnixMs>,
+        }
+
+        let mut buckets: FxHashMap<(UnixMs, Price), Accum> = FxHashMap::default();
+        for trade in self
+            .raw_trades
+            .iter()
+            .filter(|trade| trade.time >= from && trade.time <= to)
+        {
+            let candle_time =
+                UnixMs::new(trade.time.as_u64() - (trade.time.as_u64() % timeframe_ms));
+            let price = trade.price.round_to_step(price_step);
+            let bucket = buckets.entry((candle_time, price)).or_default();
+            if trade.is_sell {
+                bucket.sell_qty += trade.qty;
+            } else {
+                bucket.buy_qty += trade.qty;
+            }
+            bucket.trade_count += 1;
+            bucket.first_time = Some(
+                bucket
+                    .first_time
+                    .map_or(trade.time, |first| first.min(trade.time)),
+            );
+            bucket.last_time = Some(
+                bucket
+                    .last_time
+                    .map_or(trade.time, |last| last.max(trade.time)),
+            );
+        }
+
+        let mut grouped: FxHashMap<UnixMs, Vec<BubbleCandidate>> = FxHashMap::default();
+        for ((candle_time, price), bucket) in buckets {
+            let total_qty = bucket.buy_qty + bucket.sell_qty;
+            let delta_qty = bucket.buy_qty - bucket.sell_qty;
+            grouped
+                .entry(candle_time)
+                .or_default()
+                .push(BubbleCandidate {
+                    candle_time,
+                    price,
+                    total_qty,
+                    buy_qty: bucket.buy_qty,
+                    sell_qty: bucket.sell_qty,
+                    delta_qty,
+                    trade_count: bucket.trade_count,
+                    score: total_qty.to_f64(),
+                    first_time: bucket.first_time,
+                    last_time: bucket.last_time,
+                });
+        }
+
+        let mut summaries = grouped
+            .into_iter()
+            .map(|(candle_time, mut candidates)| {
+                candidates.sort_by_key(|candidate| std::cmp::Reverse(candidate.total_qty));
+                candidates.truncate(max_candidates_per_candle);
+                BubbleVolumeSummary::new(candle_time, candidates)
+            })
+            .collect::<Vec<_>>();
+        summaries.sort_by_key(|summary| summary.candle_time);
+        summaries
     }
 
     pub fn insert_hist_klines(&mut self, req_id: uuid::Uuid, klines_raw: &[Kline]) {
@@ -999,16 +1472,10 @@ impl KlineChart {
         let latest = klines_raw.last().map(|k| k.time);
 
         log::info!(
-            "DATA Klines | req={} records={count} earliest={} latest={}",
-            crate::connector::fetcher::short_id(req_id),
-            earliest.map_or(
-                "-".to_string(),
-                crate::connector::fetcher::format_time_short
-            ),
-            latest.map_or(
-                "-".to_string(),
-                crate::connector::fetcher::format_time_short
-            )
+            "DATA Klines | req={} records={count} first={} last={}",
+            fetcher::short_id(req_id),
+            fetcher::format_optional_time(earliest),
+            fetcher::format_optional_time(latest)
         );
 
         match self.data_source {
@@ -1022,9 +1489,18 @@ impl KlineChart {
                     .for_each(|indi| indi.on_insert_klines(klines_raw, &self.data_source));
 
                 if klines_raw.is_empty() {
+                    log::warn!(
+                        "DATA Klines Complete | req={} records=0 transition=failed reason=no_data",
+                        fetcher::short_id(req_id)
+                    );
                     self.request_handler
                         .mark_failed(req_id, "No data received".to_string());
                 } else {
+                    log::debug!(
+                        "DATA Klines Complete | req={} records={} transition=completed",
+                        fetcher::short_id(req_id),
+                        klines_raw.len()
+                    );
                     self.request_handler.mark_completed(req_id);
                 }
                 self.invalidate(None);
@@ -1251,6 +1727,83 @@ impl KlineChart {
     }
 }
 
+fn format_trade_ranges(ranges: &[(UnixMs, UnixMs)]) -> String {
+    if ranges.is_empty() {
+        return "-".to_string();
+    }
+
+    ranges
+        .iter()
+        .map(|(from, to)| fetcher::format_time_range(*from, *to))
+        .collect::<Vec<_>>()
+        .join(",")
+}
+
+fn subtract_covered_ranges(
+    covered_ranges: &[(UnixMs, UnixMs)],
+    from: UnixMs,
+    to: UnixMs,
+    log_prefix: &str,
+) -> Option<(UnixMs, UnixMs)> {
+    if to <= from {
+        log::debug!(
+            "{log_prefix} SubtractCovered | input_range={} covered={} returned=- reason=invalid_range",
+            fetcher::format_time_range(from, to),
+            format_trade_ranges(covered_ranges)
+        );
+        return None;
+    }
+
+    if covered_ranges
+        .iter()
+        .any(|(covered_from, covered_to)| from >= *covered_from && to <= *covered_to)
+    {
+        log::debug!(
+            "{log_prefix} SubtractCovered | input_range={} covered={} returned=- reason=fully_covered",
+            fetcher::format_time_range(from, to),
+            format_trade_ranges(covered_ranges)
+        );
+        return None;
+    }
+
+    let mut cursor = from;
+    for (covered_from, covered_to) in covered_ranges {
+        if *covered_to <= cursor {
+            continue;
+        }
+
+        if *covered_from > cursor {
+            let result = (cursor, (*covered_from).min(to));
+            log::debug!(
+                "{log_prefix} SubtractCovered | input_range={} covered={} returned={} reason=gap_before_covered",
+                fetcher::format_time_range(from, to),
+                format_trade_ranges(covered_ranges),
+                fetcher::format_time_range(result.0, result.1)
+            );
+            return Some(result);
+        }
+
+        cursor = cursor.max(*covered_to);
+        if cursor >= to {
+            log::debug!(
+                "{log_prefix} SubtractCovered | input_range={} covered={} returned=- reason=fully_covered_after_merge",
+                fetcher::format_time_range(from, to),
+                format_trade_ranges(covered_ranges)
+            );
+            return None;
+        }
+    }
+
+    let result = (cursor, to);
+    log::debug!(
+        "{log_prefix} SubtractCovered | input_range={} covered={} returned={} reason=tail_gap",
+        fetcher::format_time_range(from, to),
+        format_trade_ranges(covered_ranges),
+        fetcher::format_time_range(result.0, result.1)
+    );
+    Some(result)
+}
+
 impl KlineChart {
     fn sanitized_kind(mut kind: KlineChartKind) -> KlineChartKind {
         if let KlineChartKind::Footprint {
@@ -1391,7 +1944,7 @@ impl canvas::Program<Message> for KlineChart {
                         earliest,
                         latest,
                         interval_to_x,
-                        |frame, x_position, kline, trades| {
+                        |frame, x_position, kline, trades, _summary| {
                             let cluster_scaling =
                                 effective_cluster_qty(*scaling, max_cluster_qty, trades, *clusters);
 
@@ -1434,7 +1987,7 @@ impl canvas::Program<Message> for KlineChart {
                         earliest,
                         latest,
                         interval_to_x,
-                        |frame, x_position, kline, trades| {
+                        |frame, x_position, kline, trades, summary| {
                             draw_candle_dp(
                                 frame,
                                 price_to_y,
@@ -1450,6 +2003,7 @@ impl canvas::Program<Message> for KlineChart {
                                     price_to_y,
                                     x_position,
                                     trades,
+                                    summary,
                                     &volume_bubbles,
                                     visible_max_bubble_qty,
                                     chart.scaling,
@@ -1611,6 +2165,7 @@ fn draw_volume_bubbles(
     price_to_y: impl Fn(Price) -> f32,
     x_position: f32,
     trades: &KlineTrades,
+    summary: &BubbleVolumeSummary,
     config: &VolumeBubbleConfig,
     visible_max_qty: f64,
     scaling: f32,
@@ -1620,7 +2175,7 @@ fn draw_volume_bubbles(
         return;
     }
 
-    for bubble in collect_volume_bubble_points(trades, config) {
+    for bubble in collect_volume_bubble_points(trades, summary, config) {
         let radius_px = volume_bubble_radius(bubble.total_qty, visible_max_qty, config);
         let radius = radius_px / scaling;
         let center = Point::new(x_position, price_to_y(bubble.price));
@@ -1650,28 +2205,50 @@ fn draw_volume_bubbles(
 
 fn collect_volume_bubble_points(
     trades: &KlineTrades,
+    summary: &BubbleVolumeSummary,
     config: &VolumeBubbleConfig,
 ) -> Vec<VolumeBubblePoint> {
-    let mut points: Vec<_> = trades
-        .trades
-        .iter()
-        .filter_map(|(price, group)| {
-            let buy_qty = group.buy_qty.to_f64();
-            let sell_qty = group.sell_qty.to_f64();
-            let total_qty = buy_qty + sell_qty;
+    let mut points: Vec<_> = if !summary.is_empty() {
+        summary
+            .candidates
+            .iter()
+            .filter_map(|candidate| bubble_point_from_candidate(candidate, config))
+            .collect()
+    } else {
+        trades
+            .trades
+            .iter()
+            .filter_map(|(price, group)| {
+                let buy_qty = group.buy_qty.to_f64();
+                let sell_qty = group.sell_qty.to_f64();
+                let total_qty = buy_qty + sell_qty;
 
-            (total_qty > 0.0 && total_qty >= config.min_qty).then_some(VolumeBubblePoint {
-                price: *price,
-                total_qty,
-                buy_qty,
-                sell_qty,
+                (total_qty > 0.0 && total_qty >= config.min_qty).then_some(VolumeBubblePoint {
+                    price: *price,
+                    total_qty,
+                    buy_qty,
+                    sell_qty,
+                })
             })
-        })
-        .collect();
+            .collect()
+    };
 
     points.sort_by(|a, b| b.total_qty.total_cmp(&a.total_qty));
     points.truncate(config.max_bubbles_per_bar);
     points
+}
+
+fn bubble_point_from_candidate(
+    candidate: &BubbleCandidate,
+    config: &VolumeBubbleConfig,
+) -> Option<VolumeBubblePoint> {
+    let total_qty = candidate.total_qty.to_f64();
+    (total_qty > 0.0 && total_qty >= config.min_qty).then_some(VolumeBubblePoint {
+        price: candidate.price,
+        total_qty,
+        buy_qty: candidate.buy_qty.to_f64(),
+        sell_qty: candidate.sell_qty.to_f64(),
+    })
 }
 
 fn volume_bubble_radius(qty: f64, visible_max_qty: f64, config: &VolumeBubbleConfig) -> f32 {
@@ -1782,7 +2359,16 @@ fn max_bubble_qty_in_range(
         return None;
     }
 
-    let max_from_trades = |trades: &KlineTrades| {
+    let max_from_sources = |trades: &KlineTrades, summary: &BubbleVolumeSummary| {
+        if !summary.is_empty() {
+            return summary
+                .candidates
+                .iter()
+                .map(|candidate| candidate.total_qty.to_f64())
+                .filter(|qty| *qty > 0.0)
+                .max_by(f64::total_cmp);
+        }
+
         trades
             .trades
             .values()
@@ -1801,13 +2387,15 @@ fn max_bubble_qty_in_range(
                 .iter()
                 .enumerate()
                 .filter(|(index, _)| *index >= earliest && *index <= latest)
-                .filter_map(|(_, dp)| max_from_trades(&dp.footprint))
+                .filter_map(|(_, dp)| {
+                    max_from_sources(&dp.footprint, &BubbleVolumeSummary::default())
+                })
                 .max_by(f64::total_cmp)
         }
         PlotData::TimeBased(timeseries) => timeseries
             .datapoints
             .range(UnixMs::new(earliest)..=UnixMs::new(latest))
-            .filter_map(|(_, dp)| max_from_trades(&dp.footprint))
+            .filter_map(|(_, dp)| max_from_sources(&dp.footprint, &dp.bubble_summary))
             .max_by(f64::total_cmp),
     }
 }
@@ -1877,7 +2465,7 @@ fn render_data_source<F>(
     interval_to_x: impl Fn(u64) -> f32,
     draw_fn: F,
 ) where
-    F: Fn(&mut canvas::Frame, f32, &Kline, &KlineTrades),
+    F: Fn(&mut canvas::Frame, f32, &Kline, &KlineTrades, &BubbleVolumeSummary),
 {
     match data_source {
         PlotData::TickBased(tick_aggr) => {
@@ -1893,7 +2481,13 @@ fn render_data_source<F>(
                 .for_each(|(index, tick_aggr)| {
                     let x_position = interval_to_x(index as u64);
 
-                    draw_fn(frame, x_position, &tick_aggr.kline, &tick_aggr.footprint);
+                    draw_fn(
+                        frame,
+                        x_position,
+                        &tick_aggr.kline,
+                        &tick_aggr.footprint,
+                        &BubbleVolumeSummary::default(),
+                    );
                 });
         }
         PlotData::TimeBased(timeseries) => {
@@ -1907,7 +2501,13 @@ fn render_data_source<F>(
                 .for_each(|(timestamp, dp)| {
                     let x_position = interval_to_x(timestamp.as_u64());
 
-                    draw_fn(frame, x_position, &dp.kline, &dp.footprint);
+                    draw_fn(
+                        frame,
+                        x_position,
+                        &dp.kline,
+                        &dp.footprint,
+                        &dp.bubble_summary,
+                    );
                 });
         }
     }

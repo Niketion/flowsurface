@@ -49,6 +49,12 @@ pub enum Message {
         req_id: Option<uuid::Uuid>,
         fetch: Option<fetcher::FetchRange>,
     },
+    FetchFailed {
+        pane_id: uuid::Uuid,
+        error: String,
+        req_id: Option<uuid::Uuid>,
+        fetch: Option<fetcher::FetchRange>,
+    },
     SavePopoutSpecs(HashMap<window::Id, WindowSpec>),
     ErrorOccurred(Option<uuid::Uuid>, DashboardError),
     Notification(Toast),
@@ -57,6 +63,11 @@ pub enum Message {
         pane_id: uuid::Uuid,
         stream: StreamKind,
         data: FetchedData,
+    },
+    BackfillFetchUpdate {
+        pane_ids: Vec<uuid::Uuid>,
+        stream: StreamKind,
+        update: fetcher::FetchUpdate,
     },
     ResolveStreams(uuid::Uuid, Vec<PersistStreamKind>),
     RequestPalette,
@@ -450,6 +461,33 @@ impl Dashboard {
             } => {
                 self.complete_fetch(main_window.id, pane_id, req_id, fetch);
             }
+            Message::FetchFailed {
+                pane_id,
+                error,
+                req_id,
+                fetch,
+            } => {
+                if let Some(id) = req_id
+                    && let Some(pane_state) =
+                        self.get_mut_pane_state_by_uuid(main_window.id, pane_id)
+                {
+                    pane_state.mark_fetch_failed(id, error.clone());
+                }
+
+                log::warn!(
+                    "FETCH FailedUpdate | pane={} req={} fetch={} error={}",
+                    fetcher::short_id(pane_id),
+                    fetcher::format_req_id(req_id),
+                    fetcher::format_fetch_range_compact(fetch),
+                    error
+                );
+                if let Some(pane_state) = self.get_mut_pane_state_by_uuid(main_window.id, pane_id) {
+                    pane_state.status = pane::Status::Ready;
+                    pane_state
+                        .notifications
+                        .push(Toast::error(DashboardError::Fetch(error).to_string()));
+                }
+            }
             Message::DistributeFetchedData {
                 layout_id,
                 pane_id,
@@ -465,6 +503,13 @@ impl Dashboard {
                         stream,
                     }),
                 );
+            }
+            Message::BackfillFetchUpdate {
+                pane_ids,
+                stream,
+                update,
+            } => {
+                self.apply_backfill_update(main_window.id, pane_ids, stream, update);
             }
             Message::ResolveStreams(pane_id, streams) => {
                 return (
@@ -915,17 +960,28 @@ impl Dashboard {
                 req_id,
             } => {
                 let last_trade_time = batch.last().map_or(UnixMs::ZERO, |trade| trade.time);
+                let received = batch.len();
+                let first_received = batch.first().map(|trade| trade.time);
+                let last_received = batch.last().map(|trade| trade.time);
 
                 if last_trade_time < until_time {
+                    log::debug!(
+                        "DATA Trades Distribute | pane={} req={} stream={} received={} inserted={} dropped_after_until=0 until_time={} first_received={} last_received={}",
+                        fetcher::short_id(pane_id),
+                        fetcher::format_req_id(req_id),
+                        fetcher::format_stream(&stream_type),
+                        received,
+                        received,
+                        fetcher::format_time_short(until_time),
+                        fetcher::format_optional_time(first_received),
+                        fetcher::format_optional_time(last_received)
+                    );
                     if let Err(reason) =
                         self.insert_fetched_trades(main_window, pane_id, &batch, false, req_id)
                     {
                         return self.handle_error(Some(pane_id), &reason, main_window);
                     }
                 } else {
-                    let received = batch.len();
-                    let first_received = batch.first().map(|trade| trade.time);
-                    let last_received = batch.last().map(|trade| trade.time);
                     let filtered_batch = batch
                         .iter()
                         .filter(|trade| trade.time <= until_time)
@@ -933,15 +989,16 @@ impl Dashboard {
                         .collect::<Vec<_>>();
                     let dropped_after_until = received.saturating_sub(filtered_batch.len());
 
-                    if dropped_after_until > 0 {
-                        log::debug!(
-                            "DATA Trades Filter | received={received} inserted={} dropped_after_until={dropped_after_until} until_time={} first_received={} last_received={}",
-                            filtered_batch.len(),
-                            fetcher::format_time_short(until_time),
-                            first_received.map_or("-".to_string(), fetcher::format_time_short),
-                            last_received.map_or("-".to_string(), fetcher::format_time_short)
-                        );
-                    }
+                    log::debug!(
+                        "DATA Trades Distribute | pane={} req={} stream={} received={received} inserted={} dropped_after_until={dropped_after_until} until_time={} first_received={} last_received={}",
+                        fetcher::short_id(pane_id),
+                        fetcher::format_req_id(req_id),
+                        fetcher::format_stream(&stream_type),
+                        filtered_batch.len(),
+                        fetcher::format_time_short(until_time),
+                        fetcher::format_optional_time(first_received),
+                        fetcher::format_optional_time(last_received)
+                    );
 
                     if let Err(reason) = self.insert_fetched_trades(
                         main_window,
@@ -954,7 +1011,47 @@ impl Dashboard {
                     }
                 }
             }
+            FetchedData::BubbleSummary {
+                data,
+                range,
+                trades_seen,
+                raw_discarded,
+                req_id,
+            } => {
+                log::debug!(
+                    "BUBBLE Summary Distribute | pane={} req={} stream={} range={} candles={} trades_seen={} raw_discarded={}",
+                    fetcher::short_id(pane_id),
+                    fetcher::format_req_id(req_id),
+                    fetcher::format_stream(&stream_type),
+                    fetcher::format_time_range(range.0, range.1),
+                    data.len(),
+                    trades_seen,
+                    raw_discarded
+                );
+                if let Some(pane_state) = self.get_mut_pane_state_by_uuid(main_window, pane_id) {
+                    pane_state.status = pane::Status::Ready;
+                    if let pane::Content::Kline { chart: Some(c), .. } = &mut pane_state.content {
+                        c.insert_bubble_summaries(
+                            data,
+                            range.0,
+                            range.1,
+                            trades_seen,
+                            raw_discarded,
+                            req_id,
+                        );
+                    }
+                }
+            }
             FetchedData::Klines { data, req_id } => {
+                log::debug!(
+                    "DATA Klines Distribute | pane={} req={} stream={} count={} first={} last={}",
+                    fetcher::short_id(pane_id),
+                    fetcher::format_req_id(req_id),
+                    fetcher::format_stream(&stream_type),
+                    data.len(),
+                    fetcher::format_optional_time(data.first().map(|kline| kline.time)),
+                    fetcher::format_optional_time(data.last().map(|kline| kline.time))
+                );
                 if let Some(pane_state) = self.get_mut_pane_state_by_uuid(main_window, pane_id) {
                     pane_state.status = pane::Status::Ready;
 
@@ -968,6 +1065,13 @@ impl Dashboard {
                 }
             }
             FetchedData::OI { data, req_id } => {
+                log::debug!(
+                    "DATA OI Distribute | pane={} req={} stream={} count={}",
+                    fetcher::short_id(pane_id),
+                    fetcher::format_req_id(req_id),
+                    fetcher::format_stream(&stream_type),
+                    data.len()
+                );
                 if let Some(pane_state) = self.get_mut_pane_state_by_uuid(main_window, pane_id) {
                     pane_state.status = pane::Status::Ready;
 
@@ -989,16 +1093,172 @@ impl Dashboard {
         fetch: Option<fetcher::FetchRange>,
     ) {
         let Some(pane_state) = self.get_mut_pane_state_by_uuid(main_window, pane_id) else {
+            log::warn!(
+                "FETCH Complete | pane={} req={} fetch={} found=false reason=no_pane",
+                fetcher::short_id(pane_id),
+                fetcher::format_req_id(req_id),
+                fetcher::format_fetch_range_compact(fetch)
+            );
             return;
         };
 
+        let mut chart_found = false;
         if let Some(fetcher::FetchRange::Trades(from, to)) = fetch
             && let pane::Content::Kline { chart: Some(c), .. } = &mut pane_state.content
         {
+            chart_found = true;
             c.complete_trade_fetch(req_id, Some(fetcher::FetchRange::Trades(from, to)));
         }
 
+        log::debug!(
+            "FETCH Complete | pane={} req={} fetch={} found=true chart_found={chart_found}",
+            fetcher::short_id(pane_id),
+            fetcher::format_req_id(req_id),
+            fetcher::format_fetch_range_compact(fetch)
+        );
         pane_state.status = pane::Status::Ready;
+    }
+
+    fn apply_backfill_update(
+        &mut self,
+        main_window: window::Id,
+        pane_ids: Vec<uuid::Uuid>,
+        stream: StreamKind,
+        update: fetcher::FetchUpdate,
+    ) {
+        match update {
+            fetcher::FetchUpdate::Status { status, .. } => match status {
+                fetcher::FetchTaskStatus::Loading(info) => {
+                    log::debug!(
+                        "BACKFILL Update | kind=Loading stream={} pane_ids={} info={info:?}",
+                        fetcher::format_stream(&stream),
+                        pane_ids.len()
+                    );
+                    for pane_id in pane_ids {
+                        if let Some(pane_state) =
+                            self.get_mut_pane_state_by_uuid(main_window, pane_id)
+                        {
+                            pane_state.status = pane::Status::Loading(info);
+                        }
+                    }
+                }
+                fetcher::FetchTaskStatus::Completed { req_id, fetch } => {
+                    log::info!(
+                        "BACKFILL Update | kind=Completed stream={} pane_ids={} req={} fetch={}",
+                        fetcher::format_stream(&stream),
+                        pane_ids.len(),
+                        fetcher::format_req_id(req_id),
+                        fetcher::format_fetch_range_compact(fetch)
+                    );
+                    if let Some(fetch) = fetch {
+                        self.clear_pending_backfill(stream, fetch);
+                    }
+
+                    for pane_id in pane_ids {
+                        self.complete_fetch(main_window, pane_id, req_id, fetch);
+                    }
+                }
+            },
+            fetcher::FetchUpdate::Data { data, .. } => {
+                let data_summary = match &data {
+                    FetchedData::Trades { batch, req_id, .. } => {
+                        format!(
+                            "Trades:req={}:count={}",
+                            fetcher::format_req_id(*req_id),
+                            batch.len()
+                        )
+                    }
+                    FetchedData::BubbleSummary { data, req_id, .. } => {
+                        format!(
+                            "BubbleSummary:req={}:candles={}:candidates={}",
+                            fetcher::format_req_id(*req_id),
+                            data.len(),
+                            data.iter()
+                                .map(|summary| summary.candidates.len())
+                                .sum::<usize>()
+                        )
+                    }
+                    FetchedData::Klines { data, req_id } => {
+                        format!(
+                            "Klines:req={}:count={}",
+                            fetcher::format_req_id(*req_id),
+                            data.len()
+                        )
+                    }
+                    FetchedData::OI { data, req_id } => {
+                        format!(
+                            "OI:req={}:count={}",
+                            fetcher::format_req_id(*req_id),
+                            data.len()
+                        )
+                    }
+                };
+                log::debug!(
+                    "BACKFILL Update | kind=Data stream={} pane_ids={} data={}",
+                    fetcher::format_stream(&stream),
+                    pane_ids.len(),
+                    data_summary
+                );
+                for pane_id in pane_ids {
+                    let _ =
+                        self.distribute_fetched_data(main_window, pane_id, data.clone(), stream);
+                }
+            }
+            fetcher::FetchUpdate::Error {
+                pane_id,
+                error,
+                req_id,
+                fetch,
+            } => {
+                log::warn!(
+                    "BACKFILL Update | kind=Error stream={} pane_ids={} source_pane={} req={} fetch={} error={}",
+                    fetcher::format_stream(&stream),
+                    pane_ids.len(),
+                    fetcher::short_id(pane_id),
+                    fetcher::format_req_id(req_id),
+                    fetcher::format_fetch_range_compact(fetch),
+                    error
+                );
+                if let Some(fetch) = fetch {
+                    self.clear_pending_backfill(stream, fetch);
+                }
+
+                for target_pane_id in pane_ids {
+                    if let Some(id) = req_id
+                        && let Some(pane_state) =
+                            self.get_mut_pane_state_by_uuid(main_window, target_pane_id)
+                    {
+                        pane_state.mark_fetch_failed(id, error.clone());
+                    }
+                }
+
+                if let Some(pane_state) = self.get_mut_pane_state_by_uuid(main_window, pane_id) {
+                    pane_state.status = pane::Status::Ready;
+                    pane_state
+                        .notifications
+                        .push(Toast::error(DashboardError::Fetch(error).to_string()));
+                }
+            }
+        }
+    }
+
+    fn clear_pending_backfill(&mut self, stream: StreamKind, fetch: fetcher::FetchRange) {
+        let (from, to) = match fetch {
+            fetcher::FetchRange::Kline(from, to)
+            | fetcher::FetchRange::OpenInterest(from, to)
+            | fetcher::FetchRange::Trades(from, to) => (from, to),
+            fetcher::FetchRange::BubbleSummary { from, to, .. } => (from, to),
+        };
+
+        let removed = self
+            .pending_backfills
+            .remove(&(stream, from.as_u64(), to.as_u64()))
+            .is_some();
+        log::debug!(
+            "BACKFILL ClearPending | stream={} range={} removed={removed}",
+            fetcher::format_stream(&stream),
+            fetcher::format_time_range(from, to)
+        );
     }
 
     fn insert_fetched_trades(
@@ -1057,23 +1317,23 @@ impl Dashboard {
         main_window: window::Id,
     ) -> Task<Message> {
         // Track last live timestamp for backfill on disconnect.
+        let previous_last_live_t = self.last_live_t.get(stream).copied();
         if self
             .last_live_t
             .get(stream)
             .is_none_or(|&prev| kline.time > prev)
         {
             self.last_live_t.insert(*stream, kline.time);
-            log::trace!(
-                "WS Backfill Track | stream={stream:?} last_seen={}",
-                fetcher::format_time_short(kline.time),
-            );
         }
+        let new_last_live_t = self.last_live_t.get(stream).copied();
 
         let mut found_match = false;
+        let mut matched_panes = 0usize;
 
         self.iter_all_panes_mut(main_window)
             .for_each(|(_, _, pane_state)| {
                 if pane_state.matches_stream(stream) {
+                    matched_panes += 1;
                     match &mut pane_state.content {
                         pane::Content::Kline { chart: Some(c), .. } => {
                             c.update_latest_kline(kline);
@@ -1087,10 +1347,22 @@ impl Dashboard {
                 }
             });
 
+        log::trace!(
+            "KLINE LiveRoute | stream={} kline_t={} prev_last_live_t={} new_last_live_t={} matched_panes={matched_panes}",
+            fetcher::format_stream(stream),
+            fetcher::format_time_short(kline.time),
+            fetcher::format_optional_time(previous_last_live_t),
+            fetcher::format_optional_time(new_last_live_t)
+        );
+
         if found_match {
             Task::none()
         } else {
-            log::debug!("{stream:?} stream had no matching panes - dropping");
+            log::warn!(
+                "KLINE NoMatch | stream={} kline_t={} reason=refresh_streams",
+                fetcher::format_stream(stream),
+                fetcher::format_time_short(kline.time)
+            );
             self.refresh_streams(main_window)
         }
     }
@@ -1103,10 +1375,12 @@ impl Dashboard {
         main_window: window::Id,
     ) -> Task<Message> {
         let mut found_match = false;
+        let mut matched_panes = 0usize;
 
         self.iter_all_panes_mut(main_window)
             .for_each(|(_, _, pane_state)| {
                 if pane_state.matches_stream(stream) {
+                    matched_panes += 1;
                     match &mut pane_state.content {
                         pane::Content::Heatmap { chart, .. } => {
                             if let Some(c) = chart {
@@ -1131,9 +1405,20 @@ impl Dashboard {
                 }
             });
 
+        log::trace!(
+            "DATA DepthRoute | stream={} update_t={} matched_panes={matched_panes}",
+            fetcher::format_stream(stream),
+            fetcher::format_time_short(update_t)
+        );
+
         if found_match {
             Task::none()
         } else {
+            log::warn!(
+                "DATA DepthNoMatch | stream={} update_t={} reason=refresh_streams",
+                fetcher::format_stream(stream),
+                fetcher::format_time_short(update_t)
+            );
             self.refresh_streams(main_window)
         }
     }
@@ -1147,47 +1432,53 @@ impl Dashboard {
     ) -> Task<Message> {
         // Track last live timestamp for backfill on disconnect.
         let last_trade_t = buffer.last().map_or(update_t, |t| t.time);
+        let previous_last_live_t = self.last_live_t.get(stream).copied();
         if self
             .last_live_t
             .get(stream)
             .is_none_or(|&prev| last_trade_t > prev)
         {
             self.last_live_t.insert(*stream, last_trade_t);
-            log::trace!(
-                "WS Backfill Track | stream={stream:?} last_seen={}",
-                fetcher::format_time_short(last_trade_t),
-            );
         }
+        let new_last_live_t = self.last_live_t.get(stream).copied();
 
         let mut found_match = false;
+        let mut matched_panes = 0usize;
+        let mut content_updates = Vec::new();
 
         self.iter_all_panes_mut(main_window)
             .for_each(|(_, _, pane_state)| {
                 if pane_state.matches_stream(stream) {
+                    matched_panes += 1;
                     match &mut pane_state.content {
                         pane::Content::Heatmap { chart, .. } => {
                             if let Some(c) = chart {
                                 c.insert_trades(buffer, update_t);
+                                content_updates.push("Heatmap");
                             }
                         }
                         pane::Content::ShaderHeatmap { chart, .. } => {
                             if let Some(c) = chart {
                                 c.insert_trades(buffer, update_t);
+                                content_updates.push("ShaderHeatmap");
                             }
                         }
                         pane::Content::Kline { chart, .. } => {
                             if let Some(c) = chart {
                                 c.insert_trades(buffer);
+                                content_updates.push("Kline");
                             }
                         }
                         pane::Content::TimeAndSales(panel) => {
                             if let Some(p) = panel {
                                 p.insert_buffer(buffer);
+                                content_updates.push("TimeAndSales");
                             }
                         }
                         pane::Content::Ladder(panel) => {
                             if let Some(p) = panel {
                                 p.insert_trades(buffer);
+                                content_updates.push("Ladder");
                             }
                         }
                         _ => {
@@ -1198,9 +1489,28 @@ impl Dashboard {
                 }
             });
 
+        log::trace!(
+            "TRADE LiveRoute | stream={} buffer_len={} first_trade_t={} last_trade_t={} update_t={} prev_last_live_t={} new_last_live_t={} matched_panes={} content_updates={}",
+            fetcher::format_stream(stream),
+            buffer.len(),
+            fetcher::format_optional_time(buffer.first().map(|trade| trade.time)),
+            fetcher::format_optional_time(buffer.last().map(|trade| trade.time)),
+            fetcher::format_time_short(update_t),
+            fetcher::format_optional_time(previous_last_live_t),
+            fetcher::format_optional_time(new_last_live_t),
+            matched_panes,
+            content_updates.join(",")
+        );
+
         if found_match {
             Task::none()
         } else {
+            log::warn!(
+                "TRADE NoMatch | stream={} buffer_len={} update_t={} reason=refresh_streams",
+                fetcher::format_stream(stream),
+                buffer.len(),
+                fetcher::format_time_short(update_t)
+            );
             self.refresh_streams(main_window)
         }
     }
@@ -1305,6 +1615,11 @@ impl Dashboard {
         pane_id: uuid::Uuid,
         streams: Vec<StreamKind>,
     ) -> Task<Message> {
+        log::debug!(
+            "STREAM ResolveReady | pane={} streams={}",
+            fetcher::short_id(pane_id),
+            fetcher::format_streams(&streams)
+        );
         if let Some(state) = self.get_mut_pane_state_by_uuid(main_window, pane_id) {
             state.streams = ResolvedStream::Ready(streams.clone());
         }
@@ -1312,11 +1627,24 @@ impl Dashboard {
     }
 
     pub fn market_subscriptions(&self, handles: &AdapterHandles) -> Subscription<exchange::Event> {
+        let pane_count = self.panes.iter().count()
+            + self
+                .popout
+                .values()
+                .map(|(state, _)| state.iter().count())
+                .sum::<usize>();
+        log::debug!("STREAM RebuildSubscriptions | panes={pane_count}");
         let unique_streams = self
             .streams
             .combined_used()
             .flat_map(|(exchange, specs)| {
                 let mut subs = vec![];
+                log::debug!(
+                    "STREAM SubscriptionGroup | exchange={exchange:?} depth={} trade={} kline={}",
+                    specs.depth.len(),
+                    specs.trade.len(),
+                    specs.kline.len()
+                );
 
                 if !specs.depth.is_empty() {
                     let depth_subs = specs
@@ -1349,7 +1677,12 @@ impl Dashboard {
                     let trade_subs = specs
                         .trade
                         .chunks(MAX_TRADE_TICKERS_PER_STREAM)
-                        .map(|tickers| {
+                        .enumerate()
+                        .map(|(idx, tickers)| {
+                            log::debug!(
+                                "STREAM TradeChunk | exchange={exchange:?} idx={idx} size={}",
+                                tickers.len()
+                            );
                             let config = StreamConfig::new(
                                 tickers.to_vec(),
                                 exchange,
@@ -1371,7 +1704,12 @@ impl Dashboard {
                     let kline_subs = specs
                         .kline
                         .chunks(MAX_KLINE_STREAMS_PER_STREAM)
-                        .map(|streams| {
+                        .enumerate()
+                        .map(|(idx, streams)| {
+                            log::debug!(
+                                "STREAM KlineChunk | exchange={exchange:?} idx={idx} size={}",
+                                streams.len()
+                            );
                             let config = StreamConfig::new(
                                 streams.to_vec(),
                                 exchange,
@@ -1393,6 +1731,10 @@ impl Dashboard {
             })
             .collect::<Vec<Subscription<exchange::Event>>>();
 
+        if unique_streams.is_empty() && pane_count > 0 {
+            log::warn!("STREAM EmptySubscriptions | panes={pane_count} reason=no_unique_streams");
+        }
+
         Subscription::batch(unique_streams)
     }
 
@@ -1404,10 +1746,36 @@ impl Dashboard {
     }
 
     fn refresh_streams(&mut self, main_window: window::Id) -> Task<Message> {
+        let old_streams = all_unique_streams(&self.streams);
         let all_pane_streams = self
             .iter_all_panes(main_window)
             .flat_map(|(_, _, pane_state)| pane_state.streams.ready_iter().into_iter().flatten());
         self.streams = UniqueStreams::from(all_pane_streams);
+        let new_streams = all_unique_streams(&self.streams);
+        let added = new_streams
+            .iter()
+            .filter(|stream| !old_streams.contains(stream))
+            .copied()
+            .collect::<Vec<_>>();
+        let removed = old_streams
+            .iter()
+            .filter(|stream| !new_streams.contains(stream))
+            .copied()
+            .collect::<Vec<_>>();
+
+        log::debug!(
+            "STREAM Refresh | old_count={} new_count={} added={} removed={}",
+            old_streams.len(),
+            new_streams.len(),
+            added.len(),
+            removed.len()
+        );
+        for stream in &added {
+            log::debug!("STREAM Added | stream={}", fetcher::format_stream(stream));
+        }
+        for stream in &removed {
+            log::debug!("STREAM Removed | stream={}", fetcher::format_stream(stream));
+        }
 
         Task::none()
     }
@@ -1439,23 +1807,48 @@ impl Dashboard {
         /// Pending backfill entries older than this are pruned to allow re-fetching.
         const PENDING_EXPIRY: std::time::Duration = std::time::Duration::from_secs(60);
 
+        log::info!(
+            "BACKFILL Entry | disconnected_streams={} last_live_t={} pending_backfills={} now={}",
+            streams.len(),
+            self.last_live_t.len(),
+            self.pending_backfills.len(),
+            fetcher::format_time_short(now)
+        );
+
         // Prune stale pending entries.
+        let pending_before = self.pending_backfills.len();
         self.pending_backfills
             .retain(|_, inserted_at| inserted_at.elapsed() < PENDING_EXPIRY);
+        let pruned = pending_before.saturating_sub(self.pending_backfills.len());
+        if pruned > 0 {
+            log::debug!(
+                "BACKFILL Pruned | before={pending_before} after={} pruned={pruned}",
+                self.pending_backfills.len()
+            );
+        }
 
         let mut fetch_tasks: Vec<Task<Message>> = Vec::new();
 
         for stream in streams {
             // Depth streams are stateful snapshots — no historical gap to fill.
             if matches!(stream, StreamKind::Depth { .. }) {
-                log::info!("WS Backfill Skip | stream={stream:?} reason=depth_not_supported");
+                log::info!(
+                    "BACKFILL Decision | stream={} has_last_seen={} last_seen=- full_from=- full_to={} gap_ms=0 capped=false grouped_panes=0 registered_panes=0 reason=depth_not_supported",
+                    fetcher::format_stream(stream),
+                    self.last_live_t.contains_key(stream),
+                    fetcher::format_time_short(now)
+                );
                 continue;
             }
 
             let last_t = match self.last_live_t.get(stream) {
                 Some(&t) => t,
                 None => {
-                    log::info!("WS Backfill Skip | stream={stream:?} reason=no_last_seen");
+                    log::info!(
+                        "BACKFILL Decision | stream={} has_last_seen=false last_seen=- full_from=- full_to={} gap_ms=0 capped=false grouped_panes=0 registered_panes=0 reason=no_last_seen",
+                        fetcher::format_stream(stream),
+                        fetcher::format_time_short(now)
+                    );
                     continue;
                 }
             };
@@ -1466,18 +1859,24 @@ impl Dashboard {
 
             if gap_ms < MIN_BACKFILL_GAP_MS {
                 log::info!(
-                    "WS Backfill Skip | stream={stream:?} gap_ms={gap_ms} reason=gap_too_small"
+                    "BACKFILL Decision | stream={} has_last_seen=true last_seen={} full_from={} full_to={} gap_ms={gap_ms} capped=false grouped_panes=0 registered_panes=0 reason=gap_too_small",
+                    fetcher::format_stream(stream),
+                    fetcher::format_time_short(last_t),
+                    fetcher::format_time_short(full_from),
+                    fetcher::format_time_short(full_to)
                 );
                 continue;
             }
 
             // Cap the range if it exceeds the maximum.
-            let (from, to) = if gap_ms > MAX_BACKFILL_RANGE_MS {
+            let capped = gap_ms > MAX_BACKFILL_RANGE_MS;
+            let (from, to) = if capped {
                 let capped_from = full_to.saturating_sub(MAX_BACKFILL_RANGE_MS);
                 log::info!(
-                    "WS Backfill Capped | stream={stream:?} \
+                    "BACKFILL Capped | stream={} \
                      original_range={orig} capped_range={capped} \
                      reason=disconnect",
+                    fetcher::format_stream(stream),
                     orig = fetcher::format_time_range(full_from, full_to),
                     capped = fetcher::format_time_range(capped_from, full_to),
                 );
@@ -1486,63 +1885,127 @@ impl Dashboard {
                 (full_from, full_to)
             };
 
-            // Deduplicate: skip if an identical or overlapping range was
-            // recently queued (covers rapid repeated disconnects).
-            let dedupe_key = (*stream, from.as_u64(), to.as_u64());
-            let already_pending = self
-                .pending_backfills
-                .keys()
-                .any(|(s, ef, et)| *s == *stream && *ef <= to.as_u64() && *et >= from.as_u64());
+            let mut grouped_panes: HashMap<(UnixMs, UnixMs), Vec<uuid::Uuid>> = HashMap::new();
 
-            if already_pending {
-                log::info!(
-                    "WS Backfill Skip | stream={stream:?} \
-                     range={} reason=already_pending",
-                    fetcher::format_time_range(from, to),
-                );
-                continue;
-            }
-
-            self.pending_backfills
-                .insert(dedupe_key, std::time::Instant::now());
-
-            if gap_ms <= MAX_BACKFILL_RANGE_MS {
-                log::info!(
-                    "WS Backfill Queued | stream={stream:?} \
-                     range={} reason=disconnect",
-                    fetcher::format_time_range(from, to),
-                );
-            }
-
-            let fetch = match stream {
-                StreamKind::Trades { .. } => FetchRange::Trades(from, to),
-                StreamKind::Kline { .. } => FetchRange::Kline(from, to),
-                // Already handled above; defensive guard.
-                _ => continue,
-            };
-
-            // Find all panes (main + popouts) that use this stream and enqueue
-            // a backfill fetch for each one.
-            let mut dispatched = 0u32;
             for (_window, _pane, pane_state) in self.iter_all_panes(main_window) {
                 if !pane_state.matches_stream(stream) {
                     continue;
                 }
 
                 let pane_id = pane_state.unique_id();
-                let ready_streams = vec![*stream];
-                let req_id = uuid::Uuid::new_v4();
-                let handles_clone = handles.clone();
-                let layout_id = self.layout_id;
+                let Some((missing_from, missing_to)) = (match stream {
+                    StreamKind::Trades { .. } => pane_state.missing_trade_range(from, to),
+                    StreamKind::Kline { .. } => Some((from, to)),
+                    _ => None,
+                }) else {
+                    log::debug!(
+                        "BACKFILL PaneCovered | stream={} pane={} requested_range={} reason=no_missing_range",
+                        fetcher::format_stream(stream),
+                        fetcher::short_id(pane_id),
+                        fetcher::format_time_range(from, to)
+                    );
+                    continue;
+                };
 
-                log::info!(
-                    "WS Backfill Dispatch | pane={} stream={stream:?} \
-                     req={} range={}",
+                log::debug!(
+                    "BACKFILL PaneMissing | stream={} pane={} missing_range={}",
+                    fetcher::format_stream(stream),
                     fetcher::short_id(pane_id),
-                    fetcher::short_id(req_id),
+                    fetcher::format_time_range(missing_from, missing_to)
+                );
+                grouped_panes
+                    .entry((missing_from, missing_to))
+                    .or_default()
+                    .push(pane_id);
+            }
+
+            if grouped_panes.is_empty() {
+                log::info!(
+                    "BACKFILL Decision | stream={} has_last_seen=true last_seen={} full_from={} full_to={} gap_ms={gap_ms} capped={} grouped_panes=0 registered_panes=0 range={} reason=no_matching_pane_or_covered",
+                    fetcher::format_stream(stream),
+                    fetcher::format_time_short(last_t),
+                    fetcher::format_time_short(full_from),
+                    fetcher::format_time_short(full_to),
+                    capped,
                     fetcher::format_time_range(from, to),
                 );
+                continue;
+            }
 
+            for ((missing_from, missing_to), pane_ids) in grouped_panes {
+                let pending_overlap = self.pending_backfills.keys().find(|(s, ef, et)| {
+                    *s == *stream && *ef <= missing_to.as_u64() && *et >= missing_from.as_u64()
+                });
+
+                if let Some((_, ef, et)) = pending_overlap {
+                    log::info!(
+                        "BACKFILL Decision | stream={} has_last_seen=true last_seen={} full_from={} full_to={} gap_ms={gap_ms} capped={} grouped_panes={} missing_range={} pending_overlap={} registered_panes=0 reason=already_pending",
+                        fetcher::format_stream(stream),
+                        fetcher::format_time_short(last_t),
+                        fetcher::format_time_short(full_from),
+                        fetcher::format_time_short(full_to),
+                        capped,
+                        pane_ids.len(),
+                        fetcher::format_time_range(missing_from, missing_to),
+                        fetcher::format_time_range(UnixMs::new(*ef), UnixMs::new(*et))
+                    );
+                    continue;
+                }
+
+                let dedupe_key = (*stream, missing_from.as_u64(), missing_to.as_u64());
+                self.pending_backfills
+                    .insert(dedupe_key, std::time::Instant::now());
+
+                let req_id = uuid::Uuid::new_v4();
+                let fetch = match stream {
+                    StreamKind::Trades { .. } => FetchRange::Trades(missing_from, missing_to),
+                    StreamKind::Kline { .. } => FetchRange::Kline(missing_from, missing_to),
+                    _ => continue,
+                };
+
+                let mut registered_panes = Vec::new();
+                for pane_id in pane_ids {
+                    if let Some(pane_state) = self.get_mut_pane_state_by_uuid(main_window, pane_id)
+                        && pane_state.register_backfill_request(req_id, fetch)
+                    {
+                        registered_panes.push(pane_id);
+                    }
+                }
+
+                if registered_panes.is_empty() {
+                    self.pending_backfills.remove(&dedupe_key);
+                    log::info!(
+                        "BACKFILL Decision | stream={} has_last_seen=true last_seen={} full_from={} full_to={} gap_ms={gap_ms} capped={} grouped_panes=0 missing_range={} req={} registered_panes=0 reason=registration_rejected",
+                        fetcher::format_stream(stream),
+                        fetcher::format_time_short(last_t),
+                        fetcher::format_time_short(full_from),
+                        fetcher::format_time_short(full_to),
+                        capped,
+                        fetcher::format_time_range(missing_from, missing_to),
+                        fetcher::short_id(req_id)
+                    );
+                    continue;
+                }
+
+                log::info!(
+                    "BACKFILL Queued | stream={} has_last_seen=true last_seen={} full_from={} full_to={} gap_ms={gap_ms} capped={} grouped_panes={} registered_panes={} req={} fetch_range={} reason=disconnect",
+                    fetcher::format_stream(stream),
+                    fetcher::format_time_short(last_t),
+                    fetcher::format_time_short(full_from),
+                    fetcher::format_time_short(full_to),
+                    capped,
+                    registered_panes.len(),
+                    registered_panes.len(),
+                    fetcher::short_id(req_id),
+                    fetcher::format_time_range(missing_from, missing_to),
+                );
+
+                let pane_id = registered_panes[0];
+                let ready_streams = vec![*stream];
+                let handles_clone = handles.clone();
+                let layout_id = self.layout_id;
+                let target_panes = registered_panes.clone();
+                let stream_kind = *stream;
                 let task = fetcher::request_fetch(
                     handles_clone,
                     pane_id,
@@ -1554,21 +2017,43 @@ impl Dashboard {
                     &mut |_handle| {},
                 );
 
-                fetch_tasks.push(task.map(Message::from));
-                dispatched += 1;
-            }
-
-            if dispatched == 0 {
-                log::info!(
-                    "WS Backfill Skip | stream={stream:?} \
-                     range={} reason=no_matching_pane",
-                    fetcher::format_time_range(from, to),
-                );
+                fetch_tasks.push(task.map(move |update| Message::BackfillFetchUpdate {
+                    pane_ids: target_panes.clone(),
+                    stream: stream_kind,
+                    update,
+                }));
             }
         }
 
         Task::batch(fetch_tasks)
     }
+}
+
+fn all_unique_streams(streams: &UniqueStreams) -> Vec<StreamKind> {
+    let mut all = Vec::new();
+    all.extend(streams.depth_streams(None).into_iter().map(
+        |(ticker_info, depth_aggr, push_freq)| StreamKind::Depth {
+            ticker_info,
+            depth_aggr,
+            push_freq,
+        },
+    ));
+    all.extend(
+        streams
+            .trade_streams(None)
+            .into_iter()
+            .map(|ticker_info| StreamKind::Trades { ticker_info }),
+    );
+    all.extend(
+        streams
+            .kline_streams(None)
+            .into_iter()
+            .map(|(ticker_info, timeframe)| StreamKind::Kline {
+                ticker_info,
+                timeframe,
+            }),
+    );
+    all
 }
 
 impl From<fetcher::FetchUpdate> for Message {
@@ -1595,9 +2080,17 @@ impl From<fetcher::FetchUpdate> for Message {
                 stream,
                 data,
             },
-            fetcher::FetchUpdate::Error { pane_id, error } => {
-                Message::ErrorOccurred(Some(pane_id), DashboardError::Fetch(error))
-            }
+            fetcher::FetchUpdate::Error {
+                pane_id,
+                error,
+                req_id,
+                fetch,
+            } => Message::FetchFailed {
+                pane_id,
+                error,
+                req_id,
+                fetch,
+            },
         }
     }
 }

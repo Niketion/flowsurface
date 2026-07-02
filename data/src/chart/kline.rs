@@ -12,6 +12,7 @@ use serde::{Deserialize, Serialize};
 pub struct KlineDataPoint {
     pub kline: Kline,
     pub footprint: KlineTrades,
+    pub bubble_summary: BubbleVolumeSummary,
     /// Whether trades have been fetched/checked for this kline bucket.
     /// Prevents re-requesting the same empty range repeatedly.
     pub trades_checked: bool,
@@ -37,6 +38,10 @@ impl KlineDataPoint {
 
     pub fn clear_trades(&mut self) {
         self.footprint.clear();
+    }
+
+    pub fn set_bubble_summary(&mut self, summary: BubbleVolumeSummary) {
+        self.bubble_summary = summary;
     }
 
     pub fn calculate_poc(&mut self) {
@@ -159,6 +164,45 @@ impl GroupedTrades {
             ClusterKind::DeltaProfile => self.buy_qty.abs_diff(self.sell_qty),
             ClusterKind::VolumeProfile => self.total_qty(),
         }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Deserialize, Serialize)]
+pub enum BubbleHistoricalMode {
+    #[default]
+    SummaryOnly,
+}
+
+#[derive(Debug, Clone, Copy)]
+pub struct BubbleCandidate {
+    pub candle_time: UnixMs,
+    pub price: Price,
+    pub total_qty: Qty,
+    pub buy_qty: Qty,
+    pub sell_qty: Qty,
+    pub delta_qty: Qty,
+    pub trade_count: usize,
+    pub score: f64,
+    pub first_time: Option<UnixMs>,
+    pub last_time: Option<UnixMs>,
+}
+
+#[derive(Debug, Clone, Default)]
+pub struct BubbleVolumeSummary {
+    pub candle_time: UnixMs,
+    pub candidates: Vec<BubbleCandidate>,
+}
+
+impl BubbleVolumeSummary {
+    pub fn new(candle_time: UnixMs, candidates: Vec<BubbleCandidate>) -> Self {
+        Self {
+            candle_time,
+            candidates,
+        }
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.candidates.is_empty()
     }
 }
 
@@ -446,6 +490,10 @@ pub struct VolumeBubbleConfig {
     pub enabled: bool,
     pub min_qty: f64,
     pub max_bubbles_per_bar: usize,
+    pub historical_mode: BubbleHistoricalMode,
+    pub max_candidates_per_candle: usize,
+    pub max_history_minutes_per_request: u64,
+    pub use_raw_trades_when_available: bool,
     pub min_radius_px: f32,
     pub max_radius_px: f32,
     pub show_labels: bool,
@@ -459,6 +507,10 @@ impl Default for VolumeBubbleConfig {
             enabled: false,
             min_qty: 0.0,
             max_bubbles_per_bar: 3,
+            historical_mode: BubbleHistoricalMode::SummaryOnly,
+            max_candidates_per_candle: 3,
+            max_history_minutes_per_request: 15,
+            use_raw_trades_when_available: true,
             min_radius_px: 3.0,
             max_radius_px: 14.0,
             show_labels: false,

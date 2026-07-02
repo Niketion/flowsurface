@@ -2,7 +2,7 @@ use std::collections::BTreeMap;
 
 use crate::chart::Basis;
 use crate::chart::heatmap::HeatmapDataPoint;
-use crate::chart::kline::{ClusterKind, KlineDataPoint, KlineTrades, NPoc};
+use crate::chart::kline::{BubbleVolumeSummary, ClusterKind, KlineDataPoint, KlineTrades, NPoc};
 
 use exchange::unit::{Price, PriceStep, Qty};
 use exchange::{Kline, Timeframe, Trade, UnixMs, Volume};
@@ -250,6 +250,7 @@ impl TimeSeries<KlineDataPoint> {
                 .or_insert_with(|| KlineDataPoint {
                     kline: *kline,
                     footprint: KlineTrades::new(),
+                    bubble_summary: BubbleVolumeSummary::default(),
                     trades_checked: false,
                 });
 
@@ -285,6 +286,7 @@ impl TimeSeries<KlineDataPoint> {
                         volume: Volume::empty_buy_sell(),
                     },
                     footprint: KlineTrades::new(),
+                    bubble_summary: BubbleVolumeSummary::default(),
                     trades_checked: false,
                 });
 
@@ -329,6 +331,15 @@ impl TimeSeries<KlineDataPoint> {
     pub fn mark_range_trades_checked(&mut self, from: UnixMs, to: UnixMs) {
         for (_, dp) in self.datapoints.range_mut(from..=to) {
             dp.trades_checked = true;
+        }
+    }
+
+    pub fn insert_bubble_summaries(&mut self, summaries: Vec<BubbleVolumeSummary>) {
+        for summary in summaries {
+            if let Some(dp) = self.datapoints.get_mut(&summary.candle_time) {
+                dp.set_bubble_summary(summary);
+                dp.trades_checked = true;
+            }
         }
     }
 

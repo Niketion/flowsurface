@@ -32,10 +32,15 @@ impl ResolvedStream {
             last_attempt,
         } = self
         else {
+            log::trace!("STREAM ResolveDue | state=ready reason=not_waiting");
             return None;
         };
 
         if streams.is_empty() {
+            log::trace!(
+                "STREAM ResolveDue | waiting_streams=0 last_attempt={:?} should_retry=false reason=empty_waiting",
+                last_attempt
+            );
             return None;
         }
 
@@ -44,10 +49,21 @@ impl ResolvedStream {
             .unwrap_or(true);
 
         if !should_retry {
+            log::trace!(
+                "STREAM ResolveDue | waiting_streams={} last_attempt={:?} should_retry=false reason=retry_interval",
+                streams.len(),
+                last_attempt
+            );
             return None;
         }
 
         *last_attempt = Some(now);
+        log::debug!(
+            "STREAM ResolveDue | waiting_streams={} last_attempt={:?} should_retry=true returned_streams={:?}",
+            streams.len(),
+            last_attempt,
+            streams
+        );
         Some(streams.clone())
     }
 

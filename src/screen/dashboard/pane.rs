@@ -2,7 +2,7 @@ use crate::{
     chart::{self, comparison::ComparisonChart, heatmap::HeatmapChart, kline::KlineChart},
     connector::{
         ResolvedStream,
-        fetcher::{FetchSpec, InfoKind},
+        fetcher::{self, FetchSpec, InfoKind},
     },
     modal::{
         self, ModifierKind,
@@ -37,7 +37,7 @@ use data::{
     stream::PersistStreamKind,
 };
 use exchange::{
-    Kline, OpenInterest, StreamPairKind, TickMultiplier, TickerInfo, Timeframe,
+    Kline, OpenInterest, StreamPairKind, TickMultiplier, TickerInfo, Timeframe, UnixMs,
     adapter::{MarketKind, StreamKind, StreamTicksize},
     unit::PriceStep,
 };
@@ -421,6 +421,38 @@ impl State {
 
         self.content = content;
         self.streams = ResolvedStream::Ready(streams.clone());
+        let final_volume_bubbles_enabled = self
+            .settings
+            .visual_config
+            .as_ref()
+            .and_then(|cfg| cfg.kline())
+            .is_some_and(|cfg| cfg.volume_bubbles.enabled);
+
+        log::info!(
+            "STREAM PaneContent | pane={} content={kind:?} base_ticker={} basis={:?} tick_multiplier={:?} streams={}",
+            fetcher::short_id(self.id),
+            fetcher::format_ticker(&base_ticker),
+            self.settings.selected_basis,
+            self.settings.tick_multiply,
+            fetcher::format_streams(&streams)
+        );
+        if matches!(kind, ContentKind::CandlestickChart) {
+            log::debug!(
+                "STREAM Candlestick | pane={} volume_bubbles_enabled={} trades_stream_included={}",
+                fetcher::short_id(self.id),
+                final_volume_bubbles_enabled,
+                streams
+                    .iter()
+                    .any(|stream| matches!(stream, StreamKind::Trades { .. }))
+            );
+        }
+        if matches!(kind, ContentKind::FootprintChart) {
+            log::debug!(
+                "STREAM Footprint | pane={} requires=Trades+Kline streams={}",
+                fetcher::short_id(self.id),
+                fetcher::format_streams(&streams)
+            );
+        }
 
         streams
     }
@@ -457,9 +489,12 @@ impl State {
                 if let Some(id) = req_id {
                     if chart.basis() != Basis::Time(timeframe) {
                         log::warn!(
-                            "Ignoring stale kline fetch for timeframe {:?}; chart basis = {:?}",
+                            "KLINE StaleFetch | pane={} req={} fetched_timeframe={:?} current_basis={:?} count={} reason=timeframe_mismatch",
+                            fetcher::short_id(self.id),
+                            fetcher::short_id(id),
                             timeframe,
-                            chart.basis()
+                            chart.basis(),
+                            klines.len()
                         );
                         return;
                     }
@@ -490,9 +525,12 @@ impl State {
                 if let Some(id) = req_id {
                     if chart.timeframe != timeframe {
                         log::warn!(
-                            "Ignoring stale kline fetch for timeframe {:?}; chart timeframe = {:?}",
+                            "KLINE StaleFetch | pane={} req={} fetched_timeframe={:?} current_timeframe={:?} count={} reason=comparison_timeframe_mismatch",
+                            fetcher::short_id(self.id),
+                            fetcher::short_id(id),
                             timeframe,
-                            chart.timeframe
+                            chart.timeframe,
+                            klines.len()
                         );
                         return;
                     }
@@ -508,6 +546,54 @@ impl State {
             _ => {
                 log::error!("pane content not candlestick or footprint");
             }
+        }
+    }
+
+    pub fn register_backfill_request(
+        &mut self,
+        req_id: uuid::Uuid,
+        fetch: crate::connector::fetcher::FetchRange,
+    ) -> bool {
+        let registered = match &mut self.content {
+            Content::Kline {
+                chart: Some(chart), ..
+            } => chart.register_backfill_request(req_id, fetch),
+            _ => false,
+        };
+        log::debug!(
+            "BACKFILL RegisterPane | pane={} content={} req={} fetch={} registered={registered}",
+            fetcher::short_id(self.id),
+            self.content,
+            fetcher::short_id(req_id),
+            fetcher::format_fetch_range(&fetch)
+        );
+        registered
+    }
+
+    pub fn missing_trade_range(&self, from: UnixMs, to: UnixMs) -> Option<(UnixMs, UnixMs)> {
+        let missing = match &self.content {
+            Content::Kline {
+                chart: Some(chart), ..
+            } => chart.missing_trade_range(from, to),
+            _ => Some((from, to)),
+        };
+        log::trace!(
+            "BACKFILL MissingTradeRange | pane={} requested_range={} returned_range={}",
+            fetcher::short_id(self.id),
+            fetcher::format_time_range(from, to),
+            missing.map_or("-".to_string(), |(from, to)| fetcher::format_time_range(
+                from, to
+            ))
+        );
+        missing
+    }
+
+    pub fn mark_fetch_failed(&mut self, req_id: uuid::Uuid, error: String) {
+        if let Content::Kline {
+            chart: Some(chart), ..
+        } = &mut self.content
+        {
+            chart.mark_request_failed(req_id, error);
         }
     }
 
@@ -1088,6 +1174,9 @@ impl State {
             Status::Loading(InfoKind::FetchingTrades(count)) => {
                 top_left_buttons =
                     top_left_buttons.push(text(format!("Fetching Trades... {count} fetched")));
+            }
+            Status::Loading(InfoKind::FetchingBubbleSummaries) => {
+                top_left_buttons = top_left_buttons.push(text("Fetching Bubble summaries..."));
             }
             Status::Loading(InfoKind::FetchingOI) => {
                 top_left_buttons = top_left_buttons.push(text("Fetching Open Interest..."));
@@ -1800,10 +1889,20 @@ impl State {
         let last_tick: Option<Instant> = self.last_tick();
 
         if let Some(streams) = self.streams.due_streams_to_resolve(now) {
+            log::debug!(
+                "STREAM PaneResolveDue | pane={} waiting_streams={}",
+                fetcher::short_id(self.id),
+                streams.len()
+            );
             return Some(Action::ResolveStreams(streams));
         }
 
         if !self.content.initialized() {
+            log::debug!(
+                "CHART ResolveContent | pane={} content={} reason=uninitialized",
+                fetcher::short_id(self.id),
+                self.content
+            );
             return Some(Action::ResolveContent);
         }
 
@@ -1812,16 +1911,28 @@ impl State {
                 if interval_ms > 0 {
                     let interval_duration = std::time::Duration::from_millis(interval_ms);
                     if now.duration_since(previous_tick_time) >= interval_duration {
+                        log::trace!(
+                            "CHART Invalidate | pane={} interval_ms={interval_ms} reason=elapsed",
+                            fetcher::short_id(self.id)
+                        );
                         return self.invalidate(now);
                     }
                 }
             }
             (Some(interval_ms), None) => {
                 if interval_ms > 0 {
+                    log::debug!(
+                        "CHART Invalidate | pane={} interval_ms={interval_ms} reason=no_last_tick",
+                        fetcher::short_id(self.id)
+                    );
                     return self.invalidate(now);
                 }
             }
             (None, _) => {
+                log::trace!(
+                    "CHART Invalidate | pane={} reason=no_interval",
+                    fetcher::short_id(self.id)
+                );
                 return self.invalidate(now);
             }
         }
@@ -1850,6 +1961,7 @@ impl Default for State {
 }
 
 #[derive(Default)]
+#[allow(clippy::large_enum_variant)]
 pub enum Content {
     #[default]
     Starter,
@@ -2191,8 +2303,16 @@ impl Content {
                 },
                 VisualConfig::Kline(cfg),
             ) => {
+                let old_bubbles = c.visual_config().volume_bubbles;
                 let should_refresh_streams = matches!(kind, data::chart::KlineChartKind::Candles)
-                    && c.visual_config().volume_bubbles.enabled != cfg.volume_bubbles.enabled;
+                    && old_bubbles.enabled != cfg.volume_bubbles.enabled;
+                log::debug!(
+                    "CHART BubblesConfig | old_enabled={} new_enabled={} old_session={:?} new_session={:?} refresh_streams={should_refresh_streams}",
+                    old_bubbles.enabled,
+                    cfg.volume_bubbles.enabled,
+                    old_bubbles.session,
+                    cfg.volume_bubbles.session
+                );
                 c.set_visual_config(cfg);
                 should_refresh_streams
             }
