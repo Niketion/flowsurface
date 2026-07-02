@@ -777,6 +777,7 @@ impl Dashboard {
         main_window: &'a Window,
         tickers_table: &'a TickersTable,
         timezone: UserTimezone,
+        allow_native_popout: bool,
     ) -> Element<'a, Message> {
         let pane_grid: Element<_> = PaneGrid::new(&self.panes, |id, pane, maximized| {
             let is_focused = self.focus == Some((main_window.id, id));
@@ -789,6 +790,7 @@ impl Dashboard {
                 main_window,
                 timezone,
                 tickers_table,
+                allow_native_popout,
             )
         })
         .min_size(240)
@@ -808,6 +810,7 @@ impl Dashboard {
         main_window: &'a Window,
         tickers_table: &'a TickersTable,
         timezone: UserTimezone,
+        allow_native_popout: bool,
     ) -> Element<'a, Message> {
         if let Some((state, _)) = self.popout.get(&window) {
             let content = container(
@@ -822,6 +825,7 @@ impl Dashboard {
                         main_window,
                         timezone,
                         tickers_table,
+                        allow_native_popout,
                     )
                 })
                 .on_click(pane::Message::PaneClicked),

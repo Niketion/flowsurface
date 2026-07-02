@@ -1285,7 +1285,12 @@ impl Flowsurface {
                 .map(Message::Sidebar);
 
             let dashboard_view = dashboard
-                .view(&self.main_window, tickers_table, self.timezone)
+                .view(
+                    &self.main_window,
+                    tickers_table,
+                    self.timezone,
+                    self.windowing_mode.allows_native_popout(),
+                )
                 .map(move |msg| Message::Dashboard {
                     layout_id: None,
                     event: msg,
@@ -1349,7 +1354,13 @@ impl Flowsurface {
         } else {
             container(
                 dashboard
-                    .view_window(id, &self.main_window, tickers_table, self.timezone)
+                    .view_window(
+                        id,
+                        &self.main_window,
+                        tickers_table,
+                        self.timezone,
+                        self.windowing_mode.allows_native_popout(),
+                    )
                     .map(move |msg| Message::Dashboard {
                         layout_id: None,
                         event: msg,
