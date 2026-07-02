@@ -589,6 +589,19 @@ impl Flowsurface {
                                 crate::connector::fetcher::format_stream(stream)
                             );
                         }
+                        // Compute real offline gap and enqueue backfill if needed.
+                        // At disconnect time the gap was tiny; now we have the
+                        // full offline duration (last_seen → reconnect_time).
+                        let main_window_id = self.main_window.id;
+                        let handles = self.handles.clone();
+                        let dashboard = self.active_dashboard_mut();
+                        let reconnect_time = exchange::UnixMs::now();
+                        return dashboard
+                            .execute_reconnect_backfill(&handles, main_window_id, reconnect_time)
+                            .map(move |msg| Message::Dashboard {
+                                layout_id: None,
+                                event: msg,
+                            });
                     }
                     exchange::Event::Disconnected(streams, reason) => {
                         let now = exchange::UnixMs::now();
@@ -604,16 +617,12 @@ impl Flowsurface {
                             );
                         }
 
-                        let main_window_id = self.main_window.id;
-                        let handles = self.handles.clone();
+                        // Defer backfill until reconnect — the gap at disconnect
+                        // time is tiny (last_seen → disconnect ≈ 87ms), but the
+                        // real offline gap is last_seen → reconnect_time.
                         let dashboard = self.active_dashboard_mut();
-
-                        return dashboard
-                            .backfill_disconnected_streams(&handles, main_window_id, &streams, now)
-                            .map(move |msg| Message::Dashboard {
-                                layout_id: None,
-                                event: msg,
-                            });
+                        dashboard.record_pending_disconnect_gaps(&streams, now);
+                        return Task::none();
                     }
                     exchange::Event::DepthReceived(stream, update_t, depth) => {
                         log::trace!(

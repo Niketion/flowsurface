@@ -226,8 +226,15 @@ impl WsSession {
             let mut backoff = ReconnectBackoff::new();
             let mut disconnect_count: u32 = 0;
             let mut last_disconnect_instant: Option<std::time::Instant> = None;
+            let mut attempt: u32 = 0;
 
             loop {
+                attempt += 1;
+                log::info!(
+                    "WS ReconnectAttempt | attempt={attempt} backoff_next={:?}",
+                    backoff.peek_delay()
+                );
+
                 let transport = match adapter.connect().await {
                     Ok(t) => t,
                     Err(reason) => {
@@ -237,8 +244,10 @@ impl WsSession {
                             backoff.peek_delay()
                         );
                         let _ = event_tx.send(Event::Disconnected(Arc::clone(&streams), reason));
-                        tokio::time::sleep(backoff.delay()).await;
+                        let delay = backoff.delay();
                         backoff.record_failure();
+                        log::info!("WS ReconnectScheduled | attempt={attempt} delay={delay:?}");
+                        tokio::time::sleep(delay).await;
                         continue;
                     }
                 };
@@ -255,6 +264,13 @@ impl WsSession {
                 let tick_sleep = tokio::time::sleep(tick_interval);
                 tokio::pin!(tick_sleep);
 
+                // Track connection stability for backoff reset.
+                let connected_at = std::time::Instant::now();
+                let stability_timer = tokio::time::sleep(ReconnectBackoff::STABLE_THRESHOLD);
+                tokio::pin!(stability_timer);
+                let mut is_stable = false;
+                let mut data_received = false;
+
                 let disconnect_reason = loop {
                     tokio::select! {
                         biased;
@@ -268,6 +284,7 @@ impl WsSession {
                                                 let _ = event_tx.send(event);
                                             }
                                             if had_events {
+                                                data_received = true;
                                                 backoff.record_success();
                                             }
                                         }
@@ -292,6 +309,19 @@ impl WsSession {
                                 .as_mut()
                                 .reset(tokio::time::Instant::now() + tick_interval);
                         }
+                        _ = &mut stability_timer, if !is_stable => {
+                            is_stable = true;
+                            let connected_for = connected_at.elapsed();
+                            log::info!(
+                                "WS Stable | connected_for={connected_for:?}"
+                            );
+                            if backoff.is_inflated() {
+                                log::info!(
+                                    "WS BackoffReset | reason=connected_stable connected_for={connected_for:?}"
+                                );
+                                backoff.record_success();
+                            }
+                        }
                     }
                 };
 
@@ -305,14 +335,22 @@ impl WsSession {
 
                 if let Some(reason) = disconnect_reason {
                     disconnect_count += 1;
-                    let since_last = last_disconnect_instant
-                        .map(|t| t.elapsed())
-                        .unwrap_or(Duration::MAX);
+
+                    // Only inflate backoff for genuine failures (no data received).
+                    // Stable connections that received data before dropping should
+                    // not increase the reconnection delay.
+                    if !data_received {
+                        backoff.record_failure();
+                    }
+
+                    let since_last_str = match last_disconnect_instant {
+                        Some(t) => format!("{:?}", t.elapsed()),
+                        None => "none".to_string(),
+                    };
                     last_disconnect_instant = Some(std::time::Instant::now());
 
                     log::warn!(
-                        "WS ReconnectDiag | reason={reason} count={disconnect_count} since_last={:?} backoff_next={:?}",
-                        since_last,
+                        "WS ReconnectDiag | reason={reason} count={disconnect_count} since_last={since_last_str} backoff_next={:?}",
                         backoff.peek_delay()
                     );
 
@@ -322,8 +360,9 @@ impl WsSession {
                     let _ = event_tx.send(Event::Disconnected(Arc::clone(&streams), reason));
                 }
 
-                tokio::time::sleep(backoff.delay()).await;
-                backoff.record_failure();
+                let delay = backoff.delay();
+                log::info!("WS ReconnectScheduled | attempt={attempt} delay={delay:?}");
+                tokio::time::sleep(delay).await;
             }
         });
 
@@ -629,6 +668,8 @@ impl ReconnectBackoff {
     const INITIAL: Duration = Duration::from_millis(500);
     const MAX: Duration = Duration::from_secs(30);
     const JITTER: f32 = 0.25;
+    /// How long a connection must remain alive before backoff is reset.
+    const STABLE_THRESHOLD: Duration = Duration::from_secs(30);
 
     fn new() -> Self {
         Self {
@@ -657,6 +698,11 @@ impl ReconnectBackoff {
     /// Returns the current delay without jitter, for diagnostic logging.
     fn peek_delay(&self) -> Duration {
         self.current.min(Self::MAX)
+    }
+
+    /// Returns true if the backoff has been inflated above the initial value.
+    fn is_inflated(&self) -> bool {
+        self.current > Self::INITIAL
     }
 }
 

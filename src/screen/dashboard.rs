@@ -74,6 +74,16 @@ pub enum Message {
     RequestPalette,
 }
 
+/// Tracks WS disconnect state for deferred backfill computation.
+/// Backfill is not decided at disconnect time because the gap is tiny
+/// (last_seen → disconnect ≈ 87ms). Instead, we wait for reconnect and
+/// compute the real offline gap (last_seen → reconnect_time).
+struct PendingDisconnect {
+    disconnected_at: UnixMs,
+    /// Per-stream last live timestamp at the time of disconnect.
+    stream_last_seen: HashMap<StreamKind, UnixMs>,
+}
+
 pub struct Dashboard {
     pub panes: pane_grid::State<pane::State>,
     pub focus: Option<(window::Id, pane_grid::Pane)>,
@@ -90,6 +100,8 @@ pub struct Dashboard {
     /// Abort handles for active backfill trade tasks. Stored to prevent
     /// the tasks from being aborted when the handle is dropped prematurely.
     backfill_handles: Vec<iced::task::Handle>,
+    /// Pending WS disconnect awaiting reconnect to compute real backfill gap.
+    pending_disconnect: Option<PendingDisconnect>,
 }
 
 impl Default for Dashboard {
@@ -103,6 +115,7 @@ impl Default for Dashboard {
             last_live_t: HashMap::new(),
             pending_backfills: HashMap::new(),
             backfill_handles: Vec::new(),
+            pending_disconnect: None,
         }
     }
 }
@@ -173,6 +186,7 @@ impl Dashboard {
             last_live_t: HashMap::new(),
             pending_backfills: HashMap::new(),
             backfill_handles: Vec::new(),
+            pending_disconnect: None,
         }
     }
 
@@ -1916,6 +1930,7 @@ impl Dashboard {
         main_window: window::Id,
         streams: &[StreamKind],
         now: UnixMs,
+        reason: &str,
     ) -> Task<Message> {
         /// Minimum gap (ms) to bother backfilling; avoids tiny useless fetches.
         const MIN_BACKFILL_GAP_MS: u64 = 1_000;
@@ -1993,7 +2008,7 @@ impl Dashboard {
                 log::info!(
                     "BACKFILL Capped | stream={} \
                      original_range={orig} capped_range={capped} \
-                     reason=disconnect",
+                     reason={reason}",
                     fetcher::format_stream(stream),
                     orig = fetcher::format_time_range(full_from, full_to),
                     capped = fetcher::format_time_range(capped_from, full_to),
@@ -2088,7 +2103,7 @@ impl Dashboard {
                 let target_panes = pane_ids.clone();
 
                 log::info!(
-                    "BACKFILL Queued | stream={} has_last_seen=true last_seen={} full_from={} full_to={} gap_ms={gap_ms} capped={} grouped_panes={} req={} fetch_range={} reason=disconnect",
+                    "BACKFILL Queued | stream={} has_last_seen=true last_seen={} full_from={} full_to={} gap_ms={gap_ms} capped={} grouped_panes={} req={} fetch_range={} reason={reason}",
                     fetcher::format_stream(stream),
                     fetcher::format_time_short(last_t),
                     fetcher::format_time_short(full_from),
@@ -2142,6 +2157,85 @@ impl Dashboard {
         self.backfill_handles.extend(new_backfill_handles);
 
         Task::batch(fetch_tasks)
+    }
+
+    /// Records that a WS disconnect happened, deferring backfill until reconnect.
+    /// At disconnect time the gap is tiny (last_seen → disconnect ≈ 87ms),
+    /// so we wait for reconnect to compute the real offline duration.
+    pub fn record_pending_disconnect_gaps(
+        &mut self,
+        streams: &[StreamKind],
+        disconnected_at: UnixMs,
+    ) {
+        let mut stream_last_seen = HashMap::new();
+        for stream in streams {
+            if matches!(stream, StreamKind::Depth { .. }) {
+                log::info!(
+                    "BACKFILL PendingGap | stream={} reason=depth_not_supported",
+                    fetcher::format_stream(stream),
+                );
+                continue;
+            }
+            match self.last_live_t.get(stream) {
+                Some(&last_t) => {
+                    log::info!(
+                        "BACKFILL PendingGap | stream={} last_seen={} disconnected_at={}",
+                        fetcher::format_stream(stream),
+                        fetcher::format_time_short(last_t),
+                        fetcher::format_time_short(disconnected_at),
+                    );
+                    stream_last_seen.insert(*stream, last_t);
+                }
+                None => {
+                    log::info!(
+                        "BACKFILL PendingGap | stream={} last_seen=- disconnected_at={} reason=no_last_seen",
+                        fetcher::format_stream(stream),
+                        fetcher::format_time_short(disconnected_at),
+                    );
+                }
+            }
+        }
+        self.pending_disconnect = Some(PendingDisconnect {
+            disconnected_at,
+            stream_last_seen,
+        });
+    }
+
+    /// Computes real offline gap from stored disconnect state and enqueues backfill.
+    /// Called when WS reconnects — the gap is now `last_seen → reconnect_time`
+    /// which accurately reflects the offline duration.
+    pub fn execute_reconnect_backfill(
+        &mut self,
+        handles: &exchange::adapter::AdapterHandles,
+        main_window: window::Id,
+        reconnect_time: UnixMs,
+    ) -> Task<Message> {
+        let Some(pending) = self.pending_disconnect.take() else {
+            return Task::none();
+        };
+
+        let offline_ms = reconnect_time.saturating_diff(pending.disconnected_at);
+        log::info!(
+            "BACKFILL ReconnectGap | disconnected_at={} reconnect_time={} offline_ms={offline_ms}",
+            fetcher::format_time_short(pending.disconnected_at),
+            fetcher::format_time_short(reconnect_time),
+        );
+
+        let streams: Vec<StreamKind> = pending.stream_last_seen.keys().copied().collect();
+        if streams.is_empty() {
+            return Task::none();
+        }
+
+        // Delegate to existing backfill logic with reconnect_time as "now".
+        // This computes gap = reconnect_time - last_seen for each stream,
+        // which reflects the real offline duration.
+        self.backfill_disconnected_streams(
+            handles,
+            main_window,
+            &streams,
+            reconnect_time,
+            "reconnect_gap",
+        )
     }
 }
 
