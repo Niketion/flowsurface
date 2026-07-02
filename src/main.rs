@@ -53,6 +53,18 @@ fn main() {
         logger::report_stderr(&format!("Failed to initialize logger: {err}"));
     }
 
+    let profile = if cfg!(debug_assertions) {
+        "debug"
+    } else {
+        "release"
+    };
+    log::info!(
+        "BUILD Info | git_sha={} branch={} profile={}",
+        version::BUILD_GIT_SHA.unwrap_or("unknown"),
+        version::BUILD_GIT_BRANCH.unwrap_or("unknown"),
+        profile
+    );
+
     std::thread::spawn(data::cleanup_old_market_data);
 
     let daemon = iced::daemon(Flowsurface::new, Flowsurface::update, Flowsurface::view)
@@ -816,7 +828,7 @@ impl Flowsurface {
                             data,
                             stream,
                         }) => dashboard
-                            .distribute_fetched_data(main_window.id, pane_id, data, stream)
+                            .distribute_fetched_data(main_window.id, pane_id, data, stream, false)
                             .map(move |msg| Message::Dashboard {
                                 layout_id: Some(layout_id),
                                 event: msg,

@@ -2,6 +2,7 @@ pub const GITHUB_REPOSITORY_URL: &str = env!("CARGO_PKG_REPOSITORY");
 pub const APP_VERSION: &str = env!("CARGO_PKG_VERSION");
 
 pub const BUILD_GIT_SHA: Option<&str> = option_env!("FLOWSURFACE_GIT_SHA");
+pub const BUILD_GIT_BRANCH: Option<&str> = option_env!("FLOWSURFACE_GIT_BRANCH");
 pub const BUILD_IS_RELEASE_TAG_RAW: Option<&str> = option_env!("FLOWSURFACE_IS_RELEASE_TAG");
 pub const BUILD_IS_OFFICIAL_RELEASE_RAW: Option<&str> =
     option_env!("FLOWSURFACE_IS_OFFICIAL_RELEASE");

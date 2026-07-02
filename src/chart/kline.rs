@@ -31,6 +31,11 @@ use enum_map::EnumMap;
 use rustc_hash::FxHashMap;
 use std::time::Instant;
 
+/// Maximum number of raw trades to retain in memory.
+/// Older trades are pruned FIFO when this cap is exceeded.
+/// 50k trades ≈ 1.5-3 MB depending on Trade size.
+const MAX_RAW_TRADES: usize = 50_000;
+
 impl Chart for KlineChart {
     type IndicatorKind = KlineIndicator;
 
@@ -631,7 +636,7 @@ impl KlineChart {
                                     if self.bubble_auto_fetch_at.is_some_and(|last_fetch| {
                                         last_fetch.elapsed() < BUBBLE_AUTO_BACKFILL_COOLDOWN
                                     }) {
-                                        log::info!(
+                                        log::debug!(
                                             "CHART Bubbles | action=defer_backfill reason=budget_exhausted remaining={}",
                                             fetcher::format_time_range(fetch_from, fetch_to)
                                         );
@@ -1050,7 +1055,7 @@ impl KlineChart {
         fetch: Option<FetchRange>,
         empty_covered_tail: Option<(UnixMs, UnixMs)>,
     ) {
-        log::info!(
+        log::debug!(
             "TRADE CompleteFetch | req={} fetch={} fetching_before={} tail={}",
             fetcher::format_req_id(req_id),
             fetcher::format_fetch_range_compact(fetch),
@@ -1088,6 +1093,34 @@ impl KlineChart {
             "TRADE CompleteFetch | req={} fetching_after=false",
             fetcher::format_req_id(req_id)
         );
+    }
+
+    /// Mark a backfill as completed without touching per-pane fetching_trades
+    /// state or RequestHandler. Backfill is tracked globally via pending_backfills.
+    pub fn complete_backfill(
+        &mut self,
+        fetch: Option<FetchRange>,
+        empty_covered_tail: Option<(UnixMs, UnixMs)>,
+    ) {
+        log::info!(
+            "BACKFILL Complete | fetch={} tail={}",
+            fetcher::format_fetch_range_compact(fetch),
+            empty_covered_tail
+                .map(|(f, t)| fetcher::format_time_range(f, t))
+                .unwrap_or_else(|| "-".to_string())
+        );
+
+        if let Some(FetchRange::Trades(from, to)) = fetch {
+            if let Some((tail_from, tail_to)) = empty_covered_tail {
+                self.request_handler.mark_empty_trade_range(
+                    &self.chart.ticker_info,
+                    tail_from,
+                    tail_to,
+                );
+            }
+            self.mark_trade_range_covered(from, to);
+            self.mark_trade_buckets_checked(from, to);
+        }
     }
 
     pub fn complete_bubble_summary_fetch(
@@ -1339,6 +1372,18 @@ impl KlineChart {
     pub fn insert_trades(&mut self, buffer: &[Trade]) {
         let raw_before = self.raw_trades.len();
         self.raw_trades.extend_from_slice(buffer);
+
+        // Prune oldest trades if we exceed the retention cap.
+        if self.raw_trades.len() > MAX_RAW_TRADES {
+            let excess = self.raw_trades.len() - MAX_RAW_TRADES;
+            self.raw_trades.drain(..excess);
+            log::debug!(
+                "DATA Trades Prune | reason=cap exceeded={} removed={excess} retained={}",
+                self.raw_trades.len() + excess,
+                self.raw_trades.len()
+            );
+        }
+
         let content_type = match self.data_source {
             PlotData::TickBased(_) => "TickBased",
             PlotData::TimeBased(_) => "TimeBased",
@@ -1407,6 +1452,17 @@ impl KlineChart {
         }
 
         self.raw_trades.extend_from_slice(&raw_trades);
+
+        // Prune oldest trades if we exceed the retention cap.
+        if self.raw_trades.len() > MAX_RAW_TRADES {
+            let excess = self.raw_trades.len() - MAX_RAW_TRADES;
+            self.raw_trades.drain(..excess);
+            log::debug!(
+                "DATA Trades Prune | reason=cap exceeded={} removed={excess} retained={}",
+                self.raw_trades.len() + excess,
+                self.raw_trades.len()
+            );
+        }
 
         self.indicators
             .values_mut()

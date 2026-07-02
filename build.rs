@@ -13,6 +13,10 @@ fn main() {
 
     println!("cargo:rustc-env=FLOWSURFACE_GIT_SHA={git_sha}");
 
+    let git_branch =
+        git_output(&["rev-parse", "--abbrev-ref", "HEAD"]).unwrap_or_else(|| "unknown".to_string());
+    println!("cargo:rustc-env=FLOWSURFACE_GIT_BRANCH={git_branch}");
+
     let pkg_version = env::var("CARGO_PKG_VERSION").unwrap_or_default();
     let is_release_tag = git_head_has_release_tag(&pkg_version);
     println!(

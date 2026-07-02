@@ -87,6 +87,9 @@ pub struct Dashboard {
     /// on repeated disconnects. Key is `(stream, from_ms, to_ms)`, value is
     /// the `Instant` when the entry was inserted so stale entries can expire.
     pending_backfills: HashMap<(StreamKind, u64, u64), std::time::Instant>,
+    /// Abort handles for active backfill trade tasks. Stored to prevent
+    /// the tasks from being aborted when the handle is dropped prematurely.
+    backfill_handles: Vec<iced::task::Handle>,
 }
 
 impl Default for Dashboard {
@@ -99,6 +102,7 @@ impl Default for Dashboard {
             layout_id: uuid::Uuid::new_v4(),
             last_live_t: HashMap::new(),
             pending_backfills: HashMap::new(),
+            backfill_handles: Vec::new(),
         }
     }
 }
@@ -168,6 +172,7 @@ impl Dashboard {
             layout_id,
             last_live_t: HashMap::new(),
             pending_backfills: HashMap::new(),
+            backfill_handles: Vec::new(),
         }
     }
 
@@ -965,32 +970,33 @@ impl Dashboard {
         pane_id: uuid::Uuid,
         data: FetchedData,
         stream_type: StreamKind,
+        skip_stale_check: bool,
     ) -> Task<Message> {
         // Check for stale generation before applying any data
-        let req_id = match &data {
-            FetchedData::Trades { req_id, .. } => *req_id,
-            FetchedData::BubbleSummary { req_id, .. } => *req_id,
-            FetchedData::Klines { req_id, .. } => *req_id,
-            FetchedData::OI { req_id, .. } => *req_id,
-        };
+        if !skip_stale_check {
+            let req_id = match &data {
+                FetchedData::Trades { req_id, .. } => *req_id,
+                FetchedData::BubbleSummary { req_id, .. } => *req_id,
+                FetchedData::Klines { req_id, .. } => *req_id,
+                FetchedData::OI { req_id, .. } => *req_id,
+            };
 
-        if let Some(req_id) = req_id {
-            if let Some(pane_state) = self.get_mut_pane_state_by_uuid(main_window, pane_id) {
-                if let pane::Content::Kline { chart: Some(c), .. } = &mut pane_state.content {
-                    if c.is_fetch_stale(req_id) {
-                        let request_gen = c.request_generation(req_id);
-                        let current_gen = c.current_generation();
-                        log::info!(
-                            "FETCH StaleResult | req={} request_generation={} current_generation={} action=discard",
-                            fetcher::short_id(req_id),
-                            request_gen.map_or("-".to_string(), |g| g.to_string()),
-                            current_gen
-                        );
-                        // Mark the request as completed to clean up pending state
-                        c.mark_trade_request_completed(req_id);
-                        return Task::none();
-                    }
-                }
+            if let Some(req_id) = req_id
+                && let Some(pane_state) = self.get_mut_pane_state_by_uuid(main_window, pane_id)
+                && let pane::Content::Kline { chart: Some(c), .. } = &mut pane_state.content
+                && c.is_fetch_stale(req_id)
+            {
+                let request_gen = c.request_generation(req_id);
+                let current_gen = c.current_generation();
+                log::info!(
+                    "FETCH StaleResult | req={} request_generation={} current_generation={} action=discard",
+                    fetcher::short_id(req_id),
+                    request_gen.map_or("-".to_string(), |g| g.to_string()),
+                    current_gen
+                );
+                // Mark the request as completed to clean up pending state
+                c.mark_trade_request_completed(req_id);
+                return Task::none();
             }
         }
 
@@ -1194,24 +1200,32 @@ impl Dashboard {
                     empty_covered_tail,
                 } => {
                     log::info!(
-                        "BACKFILL Update | kind=Completed stream={} pane_ids={} req={} fetch={}",
+                        "BACKFILL Completed | stream={} pane_ids={} req={} fetch={} tail={}",
                         fetcher::format_stream(&stream),
                         pane_ids.len(),
                         fetcher::format_req_id(req_id),
-                        fetcher::format_fetch_range_compact(fetch)
+                        fetcher::format_fetch_range_compact(fetch),
+                        empty_covered_tail
+                            .map(|(f, t)| fetcher::format_time_range(f, t))
+                            .unwrap_or_else(|| "-".to_string())
                     );
                     if let Some(fetch) = fetch {
                         self.clear_pending_backfill(stream, fetch);
+                        log::info!(
+                            "BACKFILL PendingRemove | stream={} fetch={} reason=completed",
+                            fetcher::format_stream(&stream),
+                            fetcher::format_fetch_range(&fetch)
+                        );
                     }
 
+                    // Backfill completion: mark covered ranges on each pane
+                    // without going through per-pane RequestHandler.
                     for pane_id in pane_ids {
-                        self.complete_fetch(
-                            main_window,
-                            pane_id,
-                            req_id,
-                            fetch,
-                            empty_covered_tail,
-                        );
+                        if let Some(pane_state) =
+                            self.get_mut_pane_state_by_uuid(main_window, pane_id)
+                        {
+                            pane_state.mark_backfill_completed(fetch, empty_covered_tail);
+                        }
                     }
                 }
             },
@@ -1256,8 +1270,13 @@ impl Dashboard {
                     data_summary
                 );
                 for pane_id in pane_ids {
-                    let _ =
-                        self.distribute_fetched_data(main_window, pane_id, data.clone(), stream);
+                    let _ = self.distribute_fetched_data(
+                        main_window,
+                        pane_id,
+                        data.clone(),
+                        stream,
+                        true, // backfill: skip stale generation check
+                    );
                 }
             }
             fetcher::FetchUpdate::Error {
@@ -1266,48 +1285,47 @@ impl Dashboard {
                 req_id,
                 fetch,
             } => {
-                // Check for stale generation before applying error
-                if let Some(id) = req_id {
-                    if let Some(pane_state) = self.get_mut_pane_state_by_uuid(main_window, pane_id)
-                    {
-                        if let pane::Content::Kline { chart: Some(c), .. } = &mut pane_state.content
-                        {
-                            if c.is_fetch_stale(id) {
-                                let request_gen = c.request_generation(id);
-                                let current_gen = c.current_generation();
-                                log::info!(
-                                    "FETCH StaleResult | req={} request_generation={} current_generation={} action=discard_error",
-                                    fetcher::short_id(id),
-                                    request_gen.map_or("-".to_string(), |g| g.to_string()),
-                                    current_gen
-                                );
-                                // Mark the request as completed to clean up pending state
-                                c.mark_trade_request_completed(id);
-                                return;
-                            }
-                        }
-                    }
+                // For backfill, skip stale generation check since requests
+                // are tracked globally (pending_backfills), not per-pane.
+                let is_timeout = error.contains("TimedOut") || error.contains("timed out");
+                if is_timeout {
+                    log::error!(
+                        "BACKFILL Timeout | stream={} pane_ids={} source_pane={} req={} fetch={} error={}",
+                        fetcher::format_stream(&stream),
+                        pane_ids.len(),
+                        fetcher::short_id(pane_id),
+                        fetcher::format_req_id(req_id),
+                        fetcher::format_fetch_range_compact(fetch),
+                        error
+                    );
+                } else {
+                    log::warn!(
+                        "BACKFILL Failed | stream={} pane_ids={} source_pane={} req={} fetch={} error={}",
+                        fetcher::format_stream(&stream),
+                        pane_ids.len(),
+                        fetcher::short_id(pane_id),
+                        fetcher::format_req_id(req_id),
+                        fetcher::format_fetch_range_compact(fetch),
+                        error
+                    );
                 }
-
-                log::warn!(
-                    "BACKFILL Update | kind=Error stream={} pane_ids={} source_pane={} req={} fetch={} error={}",
-                    fetcher::format_stream(&stream),
-                    pane_ids.len(),
-                    fetcher::short_id(pane_id),
-                    fetcher::format_req_id(req_id),
-                    fetcher::format_fetch_range_compact(fetch),
-                    error
-                );
                 if let Some(fetch) = fetch {
                     self.clear_pending_backfill(stream, fetch);
+                    log::info!(
+                        "BACKFILL PendingRemove | stream={} fetch={} reason={}",
+                        fetcher::format_stream(&stream),
+                        fetcher::format_fetch_range(&fetch),
+                        if is_timeout { "timeout" } else { "failed" }
+                    );
                 }
 
-                for target_pane_id in pane_ids {
-                    if let Some(id) = req_id
-                        && let Some(pane_state) =
-                            self.get_mut_pane_state_by_uuid(main_window, target_pane_id)
+                // Set all affected panes to Ready (don't call mark_fetch_failed
+                // since backfill requests aren't in per-pane RequestHandler).
+                for target_pane_id in &pane_ids {
+                    if let Some(pane_state) =
+                        self.get_mut_pane_state_by_uuid(main_window, *target_pane_id)
                     {
-                        pane_state.mark_fetch_failed(id, error.clone());
+                        pane_state.status = pane::Status::Ready;
                     }
                 }
 
@@ -1346,7 +1364,7 @@ impl Dashboard {
         pane_id: uuid::Uuid,
         trades: &[Trade],
         is_batches_done: bool,
-        req_id: Option<uuid::Uuid>,
+        _req_id: Option<uuid::Uuid>,
     ) -> Result<(), DashboardError> {
         let pane_state = self
             .get_mut_pane_state_by_uuid(main_window, pane_id)
@@ -1371,9 +1389,9 @@ impl Dashboard {
                     c.insert_raw_trades(trades.to_owned(), is_batches_done);
 
                     if is_batches_done {
-                        if let Some(id) = req_id {
-                            c.mark_trade_request_completed(id);
-                        }
+                        // NOTE: Do NOT mark request completed here.
+                        // complete_fetch() -> complete_trade_fetch() handles that,
+                        // avoiding the double PendingRemove + StaleResult log.
                         pane_state.status = pane::Status::Ready;
                     }
                     Ok(())
@@ -1612,6 +1630,15 @@ impl Dashboard {
         now: Instant,
         _main_window: window::Id,
     ) -> Task<Message> {
+        // Clean up backfill handles when no backfills are pending.
+        if self.pending_backfills.is_empty() && !self.backfill_handles.is_empty() {
+            log::debug!(
+                "BACKFILL HandleCleanup | cleared={} handles",
+                self.backfill_handles.len()
+            );
+            self.backfill_handles.clear();
+        }
+
         let mut tasks = vec![];
 
         let mut tick_state = |state: &mut pane::State| match state.tick(now) {
@@ -1820,7 +1847,9 @@ impl Dashboard {
             .collect::<Vec<Subscription<exchange::Event>>>();
 
         if unique_streams.is_empty() && pane_count > 0 {
-            log::warn!("STREAM EmptySubscriptions | panes={pane_count} reason=no_unique_streams");
+            // Log at debug level to avoid spamming every frame.
+            // This is a normal transient state during startup / stream resolution.
+            log::debug!("STREAM EmptySubscriptions | panes={pane_count} reason=no_unique_streams");
         }
 
         Subscription::batch(unique_streams)
@@ -1916,6 +1945,7 @@ impl Dashboard {
         }
 
         let mut fetch_tasks: Vec<Task<Message>> = Vec::new();
+        let mut new_backfill_handles: Vec<iced::task::Handle> = Vec::new();
 
         for stream in streams {
             // Depth streams are stateful snapshots — no historical gap to fill.
@@ -2051,49 +2081,31 @@ impl Dashboard {
                     _ => continue,
                 };
 
-                let mut registered_panes = Vec::new();
-                for pane_id in pane_ids {
-                    if let Some(pane_state) = self.get_mut_pane_state_by_uuid(main_window, pane_id)
-                        && pane_state.register_backfill_request(req_id, fetch)
-                    {
-                        registered_panes.push(pane_id);
-                    }
-                }
-
-                if registered_panes.is_empty() {
-                    self.pending_backfills.remove(&dedupe_key);
-                    log::info!(
-                        "BACKFILL Decision | stream={} has_last_seen=true last_seen={} full_from={} full_to={} gap_ms={gap_ms} capped={} grouped_panes=0 missing_range={} req={} registered_panes=0 reason=registration_rejected",
-                        fetcher::format_stream(stream),
-                        fetcher::format_time_short(last_t),
-                        fetcher::format_time_short(full_from),
-                        fetcher::format_time_short(full_to),
-                        capped,
-                        fetcher::format_time_range(missing_from, missing_to),
-                        fetcher::short_id(req_id)
-                    );
-                    continue;
-                }
+                // Backfill uses global pending_backfills for dedup; do NOT
+                // register the request in per-pane RequestHandlers.
+                // This avoids duplicate FETCH Queued/PendingInsert/Timeout logs.
+                let pane_id = pane_ids[0];
+                let target_panes = pane_ids.clone();
 
                 log::info!(
-                    "BACKFILL Queued | stream={} has_last_seen=true last_seen={} full_from={} full_to={} gap_ms={gap_ms} capped={} grouped_panes={} registered_panes={} req={} fetch_range={} reason=disconnect",
+                    "BACKFILL Queued | stream={} has_last_seen=true last_seen={} full_from={} full_to={} gap_ms={gap_ms} capped={} grouped_panes={} req={} fetch_range={} reason=disconnect",
                     fetcher::format_stream(stream),
                     fetcher::format_time_short(last_t),
                     fetcher::format_time_short(full_from),
                     fetcher::format_time_short(full_to),
                     capped,
-                    registered_panes.len(),
-                    registered_panes.len(),
+                    target_panes.len(),
                     fetcher::short_id(req_id),
                     fetcher::format_time_range(missing_from, missing_to),
                 );
 
-                let pane_id = registered_panes[0];
                 let ready_streams = vec![*stream];
                 let handles_clone = handles.clone();
                 let layout_id = self.layout_id;
-                let target_panes = registered_panes.clone();
                 let stream_kind = *stream;
+                let backfill_req_id = req_id;
+                let backfill_from = missing_from;
+                let backfill_to = missing_to;
                 let task = fetcher::request_fetch(
                     handles_clone,
                     pane_id,
@@ -2102,8 +2114,20 @@ impl Dashboard {
                     req_id,
                     fetch,
                     Some(*stream),
-                    &mut |_handle| {},
+                    &mut |handle| {
+                        // Store the abort handle to prevent the backfill task
+                        // from being aborted when the handle is dropped.
+                        new_backfill_handles.push(handle);
+                    },
                     0, // backfill tasks don't have a specific chart generation
+                );
+
+                log::info!(
+                    "BACKFILL FetchStart | req={} stream={} range={} target_panes={}",
+                    fetcher::short_id(backfill_req_id),
+                    fetcher::format_stream(&stream_kind),
+                    fetcher::format_time_range(backfill_from, backfill_to),
+                    target_panes.len()
                 );
 
                 fetch_tasks.push(task.map(move |update| Message::BackfillFetchUpdate {
@@ -2113,6 +2137,9 @@ impl Dashboard {
                 }));
             }
         }
+
+        // Store backfill handles to keep tasks alive.
+        self.backfill_handles.extend(new_backfill_handles);
 
         Task::batch(fetch_tasks)
     }

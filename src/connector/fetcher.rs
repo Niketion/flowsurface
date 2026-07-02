@@ -159,6 +159,11 @@ pub fn is_trade_fetch_enabled() -> bool {
 
 const TRADE_REST_REQUEST_TIMEOUT: Duration = Duration::from_secs(35);
 
+/// Overall wall-clock timeout for the entire trade worker (all REST batches).
+/// Prevents the worker from hanging indefinitely if individual requests succeed
+/// but cursor advancement is slow.
+const TRADE_WORKER_TIMEOUT: Duration = Duration::from_secs(85);
+
 /// Stop raw Trades fetch after this many consecutive no-progress batches.
 const TRADE_NO_PROGRESS_MAX_CONSECUTIVE: usize = 3;
 
@@ -577,14 +582,11 @@ impl RequestHandler {
 
                 let exact = new_from == exist_from && new_to == exist_to;
                 let contained = trades_contained(new_from, new_to, exist_from, exist_to);
-                let overlaps = new_from < exist_to && new_to > exist_from;
 
                 match &existing_req.status {
-                    RequestStatus::Pending if exact || contained || overlaps => {
+                    RequestStatus::Pending if exact || contained => {
                         let reason = if exact {
                             FetchSuppressionReason::AlreadyPending
-                        } else if contained {
-                            FetchSuppressionReason::CoveredByInflight
                         } else {
                             FetchSuppressionReason::CoveredByInflight
                         };
@@ -668,15 +670,11 @@ impl RequestHandler {
                     && new_timeframe == exist_timeframe;
                 let contained = new_timeframe == exist_timeframe
                     && trades_contained(new_from, new_to, exist_from, exist_to);
-                let overlaps =
-                    new_timeframe == exist_timeframe && new_from < exist_to && new_to > exist_from;
 
                 match &existing_req.status {
-                    RequestStatus::Pending if exact || contained || overlaps => {
+                    RequestStatus::Pending if exact || contained => {
                         let reason = if exact {
                             FetchSuppressionReason::AlreadyPending
-                        } else if contained {
-                            FetchSuppressionReason::CoveredByInflight
                         } else {
                             FetchSuppressionReason::CoveredByInflight
                         };
@@ -855,7 +853,7 @@ impl RequestHandler {
                 return;
             }
             if matches!(request.status, RequestStatus::Completed(_)) {
-                log::info!(
+                log::debug!(
                     "FETCH StaleResult | req={} action=discard_already_completed",
                     short_id(id)
                 );
@@ -1766,6 +1764,22 @@ pub fn fetch_trades_batched(
         );
 
         while latest_trade_t < to_time {
+            // Overall worker timeout: bail out if we've been running too long.
+            if started.elapsed() >= TRADE_WORKER_TIMEOUT {
+                log::error!(
+                    "TRADE Worker Timeout | venue={venue} symbol={symbol} req={} range={} elapsed={} requests={request_count} trades={total_trades} latest={} target_to={}",
+                    short_id(req_id),
+                    format_time_range(from_time, to_time),
+                    format_duration_ms(started.elapsed().as_millis() as u64),
+                    format_time_short(latest_trade_t),
+                    format_time_short(to_time)
+                );
+                return Err(AdapterError::InvalidRequest(format!(
+                    "TimedOut: worker exceeded {}",
+                    format_duration_ms(TRADE_WORKER_TIMEOUT.as_millis() as u64)
+                )));
+            }
+
             request_count += 1;
 
             // Safety: stop if we're about to make the exact same request as

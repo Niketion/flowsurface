@@ -597,6 +597,22 @@ impl State {
         }
     }
 
+    /// Mark a backfill as completed without going through per-pane RequestHandler.
+    /// Backfill requests are tracked globally (pending_backfills), not per-pane.
+    pub fn mark_backfill_completed(
+        &mut self,
+        fetch: Option<crate::connector::fetcher::FetchRange>,
+        empty_covered_tail: Option<(exchange::UnixMs, exchange::UnixMs)>,
+    ) {
+        if let Content::Kline {
+            chart: Some(chart), ..
+        } = &mut self.content
+        {
+            chart.complete_backfill(fetch, empty_covered_tail);
+        }
+        self.status = Status::Ready;
+    }
+
     fn has_stream(&self) -> bool {
         match &self.streams {
             ResolvedStream::Ready(streams) => !streams.is_empty(),

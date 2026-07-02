@@ -224,11 +224,18 @@ impl WsSession {
             }
 
             let mut backoff = ReconnectBackoff::new();
+            let mut disconnect_count: u32 = 0;
+            let mut last_disconnect_instant: Option<std::time::Instant> = None;
 
             loop {
                 let transport = match adapter.connect().await {
                     Ok(t) => t,
                     Err(reason) => {
+                        disconnect_count += 1;
+                        log::warn!(
+                            "WS ConnectFailed | reason={reason} count={disconnect_count} backoff_next={:?}",
+                            backoff.peek_delay()
+                        );
                         let _ = event_tx.send(Event::Disconnected(Arc::clone(&streams), reason));
                         tokio::time::sleep(backoff.delay()).await;
                         backoff.record_failure();
@@ -297,6 +304,18 @@ impl WsSession {
                 }
 
                 if let Some(reason) = disconnect_reason {
+                    disconnect_count += 1;
+                    let since_last = last_disconnect_instant
+                        .map(|t| t.elapsed())
+                        .unwrap_or(Duration::MAX);
+                    last_disconnect_instant = Some(std::time::Instant::now());
+
+                    log::warn!(
+                        "WS ReconnectDiag | reason={reason} count={disconnect_count} since_last={:?} backoff_next={:?}",
+                        since_last,
+                        backoff.peek_delay()
+                    );
+
                     for event in adapter.on_disconnected(&reason).await {
                         let _ = event_tx.send(event);
                     }
@@ -633,6 +652,11 @@ impl ReconnectBackoff {
     /// (real market-data events were produced by the connection).
     fn record_success(&mut self) {
         self.current = Self::INITIAL;
+    }
+
+    /// Returns the current delay without jitter, for diagnostic logging.
+    fn peek_delay(&self) -> Duration {
+        self.current.min(Self::MAX)
     }
 }
 
