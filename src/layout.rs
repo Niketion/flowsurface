@@ -6,6 +6,7 @@ use data::{
 };
 
 use iced::widget::pane_grid::{self, Configuration};
+use std::path::PathBuf;
 use std::vec;
 use uuid::Uuid;
 
@@ -32,6 +33,27 @@ pub struct SavedState {
     pub volume_size_unit: exchange::SizeUnit,
     pub proxy_cfg: Option<exchange::proxy::Proxy>,
     pub debug_terminal_enabled: bool,
+}
+
+pub enum SavedStateLoadOutcome {
+    Loaded(SavedState),
+    Migrated {
+        state: SavedState,
+        from_version: u32,
+        to_version: u32,
+        backup_path: Option<PathBuf>,
+    },
+    Recovered {
+        state: SavedState,
+        warnings: Vec<String>,
+        backup_path: Option<PathBuf>,
+    },
+    Corrupt {
+        error: String,
+        original_path: PathBuf,
+        backup_path: Option<PathBuf>,
+    },
+    MissingDefault(SavedState),
 }
 
 impl SavedState {
@@ -312,96 +334,125 @@ pub fn configuration(pane: data::Pane) -> Configuration<pane::State> {
     }
 }
 
-pub fn load_saved_state() -> SavedState {
-    match data::read_from_file(data::SAVED_STATE_PATH) {
-        Ok(state) => {
-            let mut de_layouts = vec![];
-
-            for layout in &state.layout_manager.layouts {
-                let mut popout_windows = Vec::new();
-
-                for (pane, window_spec) in &layout.dashboard.popout {
-                    let configuration = configuration(pane.clone());
-                    popout_windows.push((configuration, *window_spec));
-                }
-
-                let layout_id = Uuid::new_v4();
-
-                let dashboard = Dashboard::from_config(
-                    configuration(layout.dashboard.pane.clone()),
-                    popout_windows,
-                    layout_id,
-                );
-
-                de_layouts.push((layout.name.clone(), layout_id, dashboard));
+pub fn load_saved_state() -> SavedStateLoadOutcome {
+    match data::load_saved_state_file() {
+        data::StateLoadOutcome::Loaded(state) => {
+            SavedStateLoadOutcome::Loaded(saved_state_from_config(state))
+        }
+        data::StateLoadOutcome::Migrated {
+            state,
+            from_version,
+            to_version,
+            backup_path,
+        } => SavedStateLoadOutcome::Migrated {
+            state: saved_state_from_config(state),
+            from_version,
+            to_version,
+            backup_path,
+        },
+        data::StateLoadOutcome::Recovered {
+            state,
+            warnings,
+            backup_path,
+        } => SavedStateLoadOutcome::Recovered {
+            state: saved_state_from_config(state),
+            warnings,
+            backup_path,
+        },
+        data::StateLoadOutcome::Corrupt {
+            error,
+            original_path,
+            backup_path,
+        } => {
+            log::error!("SAVED_STATE Corrupt | action=await_user_confirmation error={error}");
+            SavedStateLoadOutcome::Corrupt {
+                error,
+                original_path,
+                backup_path,
             }
+        }
+        data::StateLoadOutcome::MissingDefault(state) => {
+            SavedStateLoadOutcome::MissingDefault(saved_state_from_config(state))
+        }
+    }
+}
 
-            let layout_manager = {
-                let mut layouts = Vec::with_capacity(de_layouts.len());
+fn saved_state_from_config(state: data::State) -> SavedState {
+    let mut de_layouts = vec![];
 
-                for (name, layout_id, dashboard) in de_layouts {
-                    let id = LayoutId {
-                        unique: layout_id,
-                        name,
-                    };
-                    layouts.push(Layout { id, dashboard });
-                }
+    for layout in &state.layout_manager.layouts {
+        let mut popout_windows = Vec::new();
 
-                if layouts.is_empty() {
-                    log::error!(
-                        "Saved state contained no layouts. Starting with a default layout."
-                    );
-                    LayoutManager::new()
-                } else {
-                    let active_layout =
-                        state
-                            .layout_manager
-                            .active_layout
-                            .as_ref()
-                            .and_then(|target_name| {
-                                layouts
-                                    .iter()
-                                    .find(|layout| layout.id.name == *target_name)
-                                    .map(|layout| layout.id.clone())
-                            });
+        for (pane, window_spec) in &layout.dashboard.popout {
+            let configuration = configuration(pane.clone());
+            popout_windows.push((configuration, *window_spec));
+        }
 
-                    LayoutManager::from_config(layouts, active_layout)
-                }
+        let layout_id = Uuid::new_v4();
+
+        let dashboard = Dashboard::from_config(
+            configuration(layout.dashboard.pane.clone()),
+            popout_windows,
+            layout_id,
+        );
+
+        de_layouts.push((layout.name.clone(), layout_id, dashboard));
+    }
+
+    let layout_manager = {
+        let mut layouts = Vec::with_capacity(de_layouts.len());
+
+        for (name, layout_id, dashboard) in de_layouts {
+            let id = LayoutId {
+                unique: layout_id,
+                name,
             };
-
-            crate::connector::fetcher::toggle_trade_fetch(state.trade_fetch_enabled);
-            exchange::unit::qty::set_preferred_currency(state.size_in_quote_ccy);
-
-            // Hydrate proxy auth from keychain (keeps auth out of persisted JSON)
-            let mut proxy_cfg = state.proxy_cfg;
-            if let Some(proxy) = proxy_cfg.as_mut()
-                && proxy.auth().is_none()
-                && let Some(auth) = data::config::proxy::load_proxy_auth(proxy)
-            {
-                proxy.set_auth(Some(auth));
-            }
-
-            SavedState {
-                theme: state.selected_theme,
-                custom_theme: state.custom_theme,
-                layout_manager,
-                main_window: state.main_window,
-                timezone: state.timezone,
-                sidebar: state.sidebar,
-                scale_factor: state.scale_factor,
-                audio_cfg: state.audio_cfg,
-                volume_size_unit: state.size_in_quote_ccy,
-                proxy_cfg,
-                debug_terminal_enabled: state.debug_terminal_enabled,
-            }
+            layouts.push(Layout { id, dashboard });
         }
-        Err(e) => {
-            log::error!(
-                "Failed to load/find layout state: {}. Starting with a new layout.",
-                e
-            );
 
-            SavedState::default()
+        if layouts.is_empty() {
+            log::error!("Saved state contained no layouts. Starting with a default layout.");
+            LayoutManager::new()
+        } else {
+            let active_layout =
+                state
+                    .layout_manager
+                    .active_layout
+                    .as_ref()
+                    .and_then(|target_name| {
+                        layouts
+                            .iter()
+                            .find(|layout| layout.id.name == *target_name)
+                            .map(|layout| layout.id.clone())
+                    });
+
+            LayoutManager::from_config(layouts, active_layout)
         }
+    };
+
+    crate::connector::fetcher::toggle_trade_fetch(state.trade_fetch_enabled);
+    exchange::unit::qty::set_preferred_currency(state.size_in_quote_ccy);
+
+    // Hydrate proxy auth from keychain (keeps auth out of persisted JSON)
+    let mut proxy_cfg = state.proxy_cfg;
+    if let Some(proxy) = proxy_cfg.as_mut()
+        && proxy.auth().is_none()
+        && let Some(auth) = data::config::proxy::load_proxy_auth(proxy)
+    {
+        proxy.set_auth(Some(auth));
+    }
+
+    SavedState {
+        theme: state.selected_theme,
+        custom_theme: state.custom_theme,
+        layout_manager,
+        main_window: state.main_window,
+        timezone: state.timezone,
+        sidebar: state.sidebar,
+        scale_factor: state.scale_factor,
+        audio_cfg: state.audio_cfg,
+        volume_size_unit: state.size_in_quote_ccy,
+        proxy_cfg,
+        debug_terminal_enabled: state.debug_terminal_enabled,
     }
 }
