@@ -1122,8 +1122,12 @@ impl ViewState {
     }
 }
 
-fn request_fetch(handler: &mut RequestHandler, range: FetchRange) -> Option<Action> {
-    match handler.add_request(range) {
+fn request_fetch(
+    handler: &mut RequestHandler,
+    range: FetchRange,
+    ticker_info: Option<&TickerInfo>,
+) -> Option<Action> {
+    match handler.add_request_with_ticker(range, ticker_info) {
         Ok(Some(req_id)) => {
             let fetch_spec = FetchSpec {
                 req_id,

@@ -159,6 +159,17 @@ pub fn is_trade_fetch_enabled() -> bool {
 
 const TRADE_REST_REQUEST_TIMEOUT: Duration = Duration::from_secs(35);
 
+/// Stop raw Trades fetch after this many consecutive no-progress batches.
+const TRADE_NO_PROGRESS_MAX_CONSECUTIVE: usize = 3;
+
+/// If the remaining gap to `target_to` is within this epsilon (ms) and trades
+/// have already been collected, treat the fetch as complete rather than
+/// retrying the same tiny tail indefinitely.
+const NO_PROGRESS_REMAINING_EPSILON_MS: u64 = 1000;
+
+/// How long to remember that a trade range returned empty.
+const EMPTY_TRADE_FETCH_TTL: Duration = Duration::from_secs(60);
+
 #[derive(Debug, Clone)]
 pub enum FetchedData {
     Trades {
@@ -238,6 +249,37 @@ pub struct RequestHandler {
     requests: FxHashMap<Uuid, FetchRequest>,
     last_suppression: Cell<Option<FetchSuppressionReason>>,
     generation_id: u64,
+    /// Cache of recently empty trade fetch ranges to avoid re-fetching.
+    /// Keyed by full stream identity + time range to avoid cross-symbol suppression.
+    empty_trade_fetches: FxHashMap<EmptyTradeFetchKey, Instant>,
+}
+
+/// Full identity for the empty trade fetch cache.
+/// Includes venue, symbol, market type, and time range so that
+/// an empty result for one stream never suppresses a different stream.
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+struct EmptyTradeFetchKey {
+    venue: String,
+    symbol: String,
+    market_type: String,
+    from_ms: u64,
+    to_ms: u64,
+}
+
+impl EmptyTradeFetchKey {
+    fn from_ticker_info(ticker_info: &TickerInfo, from: UnixMs, to: UnixMs) -> Self {
+        Self {
+            venue: format_venue(ticker_info),
+            symbol: format_symbol(ticker_info),
+            market_type: format!("{:?}", ticker_info.exchange()),
+            from_ms: from.as_u64(),
+            to_ms: to.as_u64(),
+        }
+    }
+
+    fn stream_display(&self) -> String {
+        format!("{}/{}/{}", self.venue, self.symbol, self.market_type)
+    }
 }
 
 impl RequestHandler {
@@ -252,7 +294,16 @@ impl RequestHandler {
     }
 
     pub fn add_request(&mut self, fetch: FetchRange) -> Result<Option<Uuid>, ReqError> {
-        self.add_request_with_id(Uuid::new_v4(), fetch)
+        self.add_request_with_id(Uuid::new_v4(), fetch, None)
+    }
+
+    /// Add a request with optional ticker_info for empty trade range checking.
+    pub fn add_request_with_ticker(
+        &mut self,
+        fetch: FetchRange,
+        ticker_info: Option<&TickerInfo>,
+    ) -> Result<Option<Uuid>, ReqError> {
+        self.add_request_with_id(Uuid::new_v4(), fetch, ticker_info)
     }
 
     pub fn last_suppression_reason(&self) -> Option<FetchSuppressionReason> {
@@ -262,6 +313,7 @@ impl RequestHandler {
     pub fn cleanup_stale(&mut self) {
         let now = chrono::Utc::now().timestamp_millis() as u64;
         self.cleanup_stale_at(now);
+        self.cleanup_empty_trade_fetches();
     }
 
     pub fn has_pending_trade_requests(&self) -> bool {
@@ -269,6 +321,32 @@ impl RequestHandler {
             matches!(request.fetch_type, FetchRange::Trades(_, _))
                 && matches!(request.status, RequestStatus::Pending)
         })
+    }
+
+    fn cleanup_empty_trade_fetches(&mut self) {
+        let now = Instant::now();
+        self.empty_trade_fetches
+            .retain(|_, marked_at| now.duration_since(*marked_at) < EMPTY_TRADE_FETCH_TTL);
+    }
+
+    /// Mark a trade range as empty (no trades in the tail).
+    pub fn mark_empty_trade_range(&mut self, ticker_info: &TickerInfo, from: UnixMs, to: UnixMs) {
+        let key = EmptyTradeFetchKey::from_ticker_info(ticker_info, from, to);
+        log::info!(
+            "FETCH EmptyCoveredInsert | stream={} range={} reason=no_progress_near_target ttl={:?}",
+            key.stream_display(),
+            format_time_range(from, to),
+            EMPTY_TRADE_FETCH_TTL
+        );
+        self.empty_trade_fetches.insert(key, Instant::now());
+    }
+
+    /// Check if a trade range was recently marked as empty.
+    pub fn is_empty_trade_range(&self, ticker_info: &TickerInfo, from: UnixMs, to: UnixMs) -> bool {
+        let key = EmptyTradeFetchKey::from_ticker_info(ticker_info, from, to);
+        self.empty_trade_fetches
+            .get(&key)
+            .is_some_and(|marked_at| marked_at.elapsed() < EMPTY_TRADE_FETCH_TTL)
     }
 
     fn retry_delay_ms(attempts: u32) -> u64 {
@@ -426,6 +504,7 @@ impl RequestHandler {
         &mut self,
         id: Uuid,
         fetch: FetchRange,
+        ticker_info: Option<&TickerInfo>,
     ) -> Result<Option<Uuid>, ReqError> {
         let now = chrono::Utc::now().timestamp_millis() as u64;
         self.cleanup_stale_at(now);
@@ -434,6 +513,25 @@ impl RequestHandler {
             self.set_suppressed(FetchSuppressionReason::InvalidRange, id, &fetch, None);
             return Ok(None);
         }
+
+        // Check if this trade range was recently marked as empty
+        if let FetchRange::Trades(from, to) = fetch
+            && let Some(ticker_info) = ticker_info
+            && self.is_empty_trade_range(ticker_info, from, to)
+        {
+            log::info!(
+                "FETCH Skip | reason=recent_empty_result stream={}/{}/{:?} range={} req={}",
+                format_venue(ticker_info),
+                format_symbol(ticker_info),
+                ticker_info.exchange(),
+                format_time_range(from, to),
+                short_id(id)
+            );
+            self.last_suppression
+                .set(Some(FetchSuppressionReason::Throttled));
+            return Ok(None);
+        }
+
         let request = FetchRequest::new(fetch, now, self.generation_id);
         let retryable_failed = self
             .requests
@@ -951,6 +1049,10 @@ pub enum FetchTaskStatus {
     Completed {
         req_id: Option<Uuid>,
         fetch: Option<FetchRange>,
+        /// When the worker stopped early due to no-progress near target,
+        /// this carries the unfilled tail range that should be marked
+        /// empty-covered in the negative cache.
+        empty_covered_tail: Option<(UnixMs, UnixMs)>,
     },
 }
 
@@ -1139,19 +1241,23 @@ pub fn request_fetch(
                             }
                         },
                         move |result| match result {
-                            Ok(()) => {
+                            Ok(empty_covered_tail) => {
                                 log::info!(
-                                    "TRADE Done | venue={} symbol={} req={} range={}",
+                                    "TRADE Done | venue={} symbol={} req={} range={} tail={}",
                                     format_venue(&ticker_info),
                                     format_symbol(&ticker_info),
                                     short_id(req_id),
-                                    format_time_range(from_time, to_time)
+                                    format_time_range(from_time, to_time),
+                                    empty_covered_tail
+                                        .map(|(f, t)| format_time_range(f, t))
+                                        .unwrap_or_else(|| "-".to_string())
                                 );
                                 FetchUpdate::Status {
                                     pane_id,
                                     status: FetchTaskStatus::Completed {
                                         req_id: Some(req_id),
                                         fetch: Some(FetchRange::Trades(from_time, to_time)),
+                                        empty_covered_tail,
                                     },
                                 }
                             }
@@ -1638,7 +1744,7 @@ pub fn fetch_trades_batched(
     to_time: UnixMs,
     data_path: PathBuf,
     req_id: Uuid,
-) -> impl Straw<(), Vec<Trade>, AdapterError> {
+) -> impl Straw<Option<(UnixMs, UnixMs)>, Vec<Trade>, AdapterError> {
     let venue = format_venue(&ticker_info);
     let symbol = format_symbol(&ticker_info);
 
@@ -1648,6 +1754,9 @@ pub fn fetch_trades_batched(
         let mut total_trades = 0usize;
         let mut request_count = 0usize;
         let mut last_progress_log = Instant::now();
+        let mut consecutive_no_progress: usize = 0;
+        let mut prev_request_from: Option<UnixMs> = None;
+        let mut prev_request_to: Option<UnixMs> = None;
 
         log::info!(
             "TRADE Worker | {venue} {symbol} req={} range={} path={}",
@@ -1658,6 +1767,22 @@ pub fn fetch_trades_batched(
 
         while latest_trade_t < to_time {
             request_count += 1;
+
+            // Safety: stop if we're about to make the exact same request as
+            // last time (same startTime/endTime).  This catches edge cases
+            // where cursor advancement was skipped.
+            if prev_request_from == Some(latest_trade_t) && prev_request_to == Some(to_time) {
+                log::warn!(
+                    "TRADE Stop | venue={venue} symbol={symbol} reason=duplicate_request_bounds from={} target_to={} requests={request_count} trades={total_trades} duration={}",
+                    format_time_short(latest_trade_t),
+                    format_time_short(to_time),
+                    format_duration_ms(started.elapsed().as_millis() as u64)
+                );
+                break;
+            }
+            prev_request_from = Some(latest_trade_t);
+            prev_request_to = Some(to_time);
+
             let request_started = Instant::now();
             log::debug!(
                 "TRADE Request | venue={venue} symbol={symbol} req={} request_idx={request_count} from={} target_to={}",
@@ -1713,12 +1838,57 @@ pub fn fetch_trades_batched(
 
                     latest_trade_t = batch.last().map_or(latest_trade_t, |trade| trade.time);
                     if latest_trade_t <= prev_latest_trade_t {
+                        consecutive_no_progress += 1;
+                        let remaining_ms = to_time.saturating_diff(latest_trade_t);
                         log::warn!(
-                            "TRADE NoProgress | venue={venue} symbol={symbol} request_idx={request_count} prev_latest={} new_latest={} target_to={} reason=batch_last_not_after_latest",
+                            "TRADE NoProgress | venue={venue} symbol={symbol} request_idx={request_count} prev_latest={} new_latest={} target_to={} remaining_ms={remaining_ms} consecutive={consecutive_no_progress} reason=batch_last_not_after_latest",
                             format_time_short(prev_latest_trade_t),
                             format_time_short(latest_trade_t),
                             format_time_short(to_time)
                         );
+
+                        // Near-target with tiny unreachable tail → complete as
+                        // partial result instead of retrying forever.
+                        if remaining_ms <= NO_PROGRESS_REMAINING_EPSILON_MS {
+                            let tail_from = latest_trade_t.saturating_add(1);
+                            log::info!(
+                                "TRADE Stop | venue={venue} symbol={symbol} reason=no_progress_near_target latest={} target_to={} remaining_ms={remaining_ms} requests={request_count} trades={total_trades} duration={}",
+                                format_time_short(latest_trade_t),
+                                format_time_short(to_time),
+                                format_duration_ms(started.elapsed().as_millis() as u64)
+                            );
+                            return Ok(Some((tail_from, to_time)));
+                        }
+
+                        // Consecutive no-progress threshold → stop early,
+                        // long before the 90s watchdog.
+                        if consecutive_no_progress >= TRADE_NO_PROGRESS_MAX_CONSECUTIVE {
+                            let tail_from = latest_trade_t.saturating_add(1);
+                            log::warn!(
+                                "TRADE Stop | venue={venue} symbol={symbol} reason=no_progress latest={} target_to={} remaining_ms={remaining_ms} requests={request_count} trades={total_trades} duration={}",
+                                format_time_short(latest_trade_t),
+                                format_time_short(to_time),
+                                format_duration_ms(started.elapsed().as_millis() as u64)
+                            );
+                            return Ok(Some((tail_from, to_time)));
+                        }
+
+                        // Advance cursor by 1ms so the next request uses
+                        // different startTime and avoids re-fetching the
+                        // identical batch.
+                        let advanced = latest_trade_t.saturating_add(1);
+                        if advanced >= to_time {
+                            log::info!(
+                                "TRADE Stop | venue={venue} symbol={symbol} reason=cursor_exceeds_target latest={} target_to={} requests={request_count} trades={total_trades}",
+                                format_time_short(latest_trade_t),
+                                format_time_short(to_time)
+                            );
+                            return Ok(Some((advanced, to_time)));
+                        }
+                        latest_trade_t = advanced;
+                        prev_request_from = None; // bounds changed
+                    } else {
+                        consecutive_no_progress = 0;
                     }
                     total_trades += batch.len();
 
@@ -1758,7 +1928,7 @@ pub fn fetch_trades_batched(
             format_duration_ms(started.elapsed().as_millis() as u64)
         );
 
-        Ok(())
+        Ok(None)
     })
 }
 

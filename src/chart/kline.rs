@@ -434,7 +434,11 @@ impl KlineChart {
                         "KLINE InitialFetch | reason=empty_data range={}",
                         fetcher::format_time_range(UnixMs::new(earliest), UnixMs::new(latest))
                     );
-                    if let Some(action) = request_fetch(&mut self.request_handler, range) {
+                    if let Some(action) = request_fetch(
+                        &mut self.request_handler,
+                        range,
+                        Some(&self.chart.ticker_info),
+                    ) {
                         log::info!(
                             "KLINE InitialFetchQueued | range={}",
                             fetcher::format_time_range(UnixMs::new(earliest), UnixMs::new(latest))
@@ -478,7 +482,11 @@ impl KlineChart {
                         fetcher::format_time_short(kline_earliest),
                         fetcher::format_fetch_range(&range)
                     );
-                    if let Some(action) = request_fetch(&mut self.request_handler, range) {
+                    if let Some(action) = request_fetch(
+                        &mut self.request_handler,
+                        range,
+                        Some(&self.chart.ticker_info),
+                    ) {
                         return Some(action);
                     } else {
                         log::debug!(
@@ -512,9 +520,11 @@ impl KlineChart {
                                     fetcher::format_time_range(fetch_from, fetch_to)
                                 );
                                 let range = FetchRange::Trades(fetch_from, fetch_to);
-                                if let Some(action) =
-                                    request_fetch(&mut self.request_handler, range)
-                                {
+                                if let Some(action) = request_fetch(
+                                    &mut self.request_handler,
+                                    range,
+                                    Some(&self.chart.ticker_info),
+                                ) {
                                     self.fetching_trades = (true, None);
                                     return Some(action);
                                 } else {
@@ -678,9 +688,11 @@ impl KlineChart {
                                                     .max_bubbles_per_bar,
                                             ),
                                     };
-                                    if let Some(action) =
-                                        request_fetch(&mut self.request_handler, range)
-                                    {
+                                    if let Some(action) = request_fetch(
+                                        &mut self.request_handler,
+                                        range,
+                                        Some(&self.chart.ticker_info),
+                                    ) {
                                         self.bubble_auto_fetch_at = Some(Instant::now());
                                         return Some(action);
                                     } else {
@@ -729,7 +741,11 @@ impl KlineChart {
                             indicator_kind,
                             fetcher::format_fetch_range(&range)
                         );
-                        if let Some(action) = request_fetch(&mut self.request_handler, range) {
+                        if let Some(action) = request_fetch(
+                            &mut self.request_handler,
+                            range,
+                            Some(&self.chart.ticker_info),
+                        ) {
                             log::info!(
                                 "CHART IndicatorFetchQueued | indicator={:?} range={}",
                                 indicator_kind,
@@ -783,7 +799,11 @@ impl KlineChart {
                             .map_or("-".to_string(), |t| fetcher::format_time_short(*t)),
                         fetcher::format_fetch_range(&range)
                     );
-                    if let Some(action) = request_fetch(&mut self.request_handler, range) {
+                    if let Some(action) = request_fetch(
+                        &mut self.request_handler,
+                        range,
+                        Some(&self.chart.ticker_info),
+                    ) {
                         return Some(action);
                     } else {
                         log::debug!(
@@ -849,7 +869,10 @@ impl KlineChart {
     }
 
     pub fn register_backfill_request(&mut self, req_id: uuid::Uuid, fetch: FetchRange) -> bool {
-        match self.request_handler.add_request_with_id(req_id, fetch) {
+        match self
+            .request_handler
+            .add_request_with_id(req_id, fetch, Some(&self.chart.ticker_info))
+        {
             Ok(Some(_)) => true,
             Ok(None) => false,
             Err(ReqError::Failed(reason)) => {
@@ -1021,18 +1044,41 @@ impl KlineChart {
         self.subtract_covered_trade_ranges(from, to)
     }
 
-    pub fn complete_trade_fetch(&mut self, req_id: Option<uuid::Uuid>, fetch: Option<FetchRange>) {
+    pub fn complete_trade_fetch(
+        &mut self,
+        req_id: Option<uuid::Uuid>,
+        fetch: Option<FetchRange>,
+        empty_covered_tail: Option<(UnixMs, UnixMs)>,
+    ) {
         log::info!(
-            "TRADE CompleteFetch | req={} fetch={} fetching_before={}",
+            "TRADE CompleteFetch | req={} fetch={} fetching_before={} tail={}",
             fetcher::format_req_id(req_id),
             fetcher::format_fetch_range_compact(fetch),
-            self.fetching_trades.0
+            self.fetching_trades.0,
+            empty_covered_tail
+                .map(|(f, t)| fetcher::format_time_range(f, t))
+                .unwrap_or_else(|| "-".to_string())
         );
         if let Some(id) = req_id {
             self.mark_trade_request_completed(id);
         }
 
         if let Some(FetchRange::Trades(from, to)) = fetch {
+            // Mark the unfilled tail as empty-covered so the chart does not
+            // immediately retry the same tiny gap.
+            if let Some((tail_from, tail_to)) = empty_covered_tail {
+                log::info!(
+                    "FETCH EmptyCovered | req={} range={}→{} reason=no_progress_near_target",
+                    fetcher::format_req_id(req_id),
+                    fetcher::format_time_short(tail_from),
+                    fetcher::format_time_short(tail_to)
+                );
+                self.request_handler.mark_empty_trade_range(
+                    &self.chart.ticker_info,
+                    tail_from,
+                    tail_to,
+                );
+            }
             self.mark_trade_range_covered(from, to);
             self.mark_trade_buckets_checked(from, to);
         }

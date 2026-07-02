@@ -48,6 +48,7 @@ pub enum Message {
         pane_id: uuid::Uuid,
         req_id: Option<uuid::Uuid>,
         fetch: Option<fetcher::FetchRange>,
+        empty_covered_tail: Option<(UnixMs, UnixMs)>,
     },
     FetchFailed {
         pane_id: uuid::Uuid,
@@ -469,8 +470,9 @@ impl Dashboard {
                 pane_id,
                 req_id,
                 fetch,
+                empty_covered_tail,
             } => {
-                self.complete_fetch(main_window.id, pane_id, req_id, fetch);
+                self.complete_fetch(main_window.id, pane_id, req_id, fetch, empty_covered_tail);
             }
             Message::FetchFailed {
                 pane_id,
@@ -1130,6 +1132,7 @@ impl Dashboard {
         pane_id: uuid::Uuid,
         req_id: Option<uuid::Uuid>,
         fetch: Option<fetcher::FetchRange>,
+        empty_covered_tail: Option<(UnixMs, UnixMs)>,
     ) {
         let Some(pane_state) = self.get_mut_pane_state_by_uuid(main_window, pane_id) else {
             log::warn!(
@@ -1146,7 +1149,11 @@ impl Dashboard {
             && let pane::Content::Kline { chart: Some(c), .. } = &mut pane_state.content
         {
             chart_found = true;
-            c.complete_trade_fetch(req_id, Some(fetcher::FetchRange::Trades(from, to)));
+            c.complete_trade_fetch(
+                req_id,
+                Some(fetcher::FetchRange::Trades(from, to)),
+                empty_covered_tail,
+            );
         }
 
         log::debug!(
@@ -1181,7 +1188,11 @@ impl Dashboard {
                         }
                     }
                 }
-                fetcher::FetchTaskStatus::Completed { req_id, fetch } => {
+                fetcher::FetchTaskStatus::Completed {
+                    req_id,
+                    fetch,
+                    empty_covered_tail,
+                } => {
                     log::info!(
                         "BACKFILL Update | kind=Completed stream={} pane_ids={} req={} fetch={}",
                         fetcher::format_stream(&stream),
@@ -1194,7 +1205,13 @@ impl Dashboard {
                     }
 
                     for pane_id in pane_ids {
-                        self.complete_fetch(main_window, pane_id, req_id, fetch);
+                        self.complete_fetch(
+                            main_window,
+                            pane_id,
+                            req_id,
+                            fetch,
+                            empty_covered_tail,
+                        );
                     }
                 }
             },
@@ -2135,10 +2152,15 @@ impl From<fetcher::FetchUpdate> for Message {
                 fetcher::FetchTaskStatus::Loading(info) => {
                     Message::ChangePaneStatus(pane_id, pane::Status::Loading(info))
                 }
-                fetcher::FetchTaskStatus::Completed { req_id, fetch } => Message::FetchCompleted {
+                fetcher::FetchTaskStatus::Completed {
+                    req_id,
+                    fetch,
+                    empty_covered_tail,
+                } => Message::FetchCompleted {
                     pane_id,
                     req_id,
                     fetch,
+                    empty_covered_tail,
                 },
             },
             fetcher::FetchUpdate::Data {
