@@ -16,6 +16,7 @@ use crate::{
     style,
     widget::toast::Toast,
     window::{self, Window},
+    windowing::WindowingMode,
 };
 use data::{
     UserTimezone,
@@ -190,7 +191,11 @@ impl Dashboard {
         }
     }
 
-    pub fn load_layout(&mut self, main_window: window::Id) -> Task<Message> {
+    pub fn load_layout(
+        &mut self,
+        main_window: window::Id,
+        windowing_mode: WindowingMode,
+    ) -> Task<Message> {
         let mut open_popouts_tasks: Vec<Task<Message>> = vec![];
         let mut new_popout = Vec::new();
         let mut keys_to_remove = Vec::new();
@@ -199,25 +204,46 @@ impl Dashboard {
             keys_to_remove.push((*old_window_id, *specs));
         }
 
-        // remove keys and open new windows
-        for (old_window_id, window_spec) in keys_to_remove {
-            let (window, task) = window::open(window::Settings {
-                position: window::Position::Specific(window_spec.position()),
-                size: window_spec.size(),
-                exit_on_close_request: false,
-                ..window::settings()
-            });
+        if windowing_mode.allows_native_popout() {
+            // remove keys and open new windows
+            for (old_window_id, window_spec) in keys_to_remove {
+                let (window, task) = window::open(window::Settings {
+                    position: window::Position::Specific(window_spec.position()),
+                    size: window_spec.size(),
+                    exit_on_close_request: false,
+                    ..window::settings()
+                });
 
-            open_popouts_tasks.push(task.then(|_| Task::none()));
+                open_popouts_tasks.push(task.then(|_| Task::none()));
 
-            if let Some((removed_pane, specs)) = self.popout.remove(&old_window_id) {
-                new_popout.push((window, (removed_pane, specs)));
+                if let Some((removed_pane, specs)) = self.popout.remove(&old_window_id) {
+                    new_popout.push((window, (removed_pane, specs)));
+                }
             }
-        }
 
-        // assign new windows to old panes
-        for (window, (pane, specs)) in new_popout {
-            self.popout.insert(window, (pane, specs));
+            // assign new windows to old panes
+            for (window, (pane, specs)) in new_popout {
+                self.popout.insert(window, (pane, specs));
+            }
+        } else {
+            // In embedded mode, merge popout panes back into the main pane grid
+            log::info!(
+                "WINDOW NativePopoutBlocked | pane=load_layout reason={reason}",
+                reason = windowing_mode.reason()
+            );
+            for (_, (pane_state, _)) in keys_to_remove
+                .iter()
+                .filter_map(|(id, _)| self.popout.remove(id).map(|ps| (*id, ps)))
+            {
+                // Merge each popout pane into the main grid
+                for (_, state) in pane_state.panes {
+                    let _ = self.panes.split(
+                        pane_grid::Axis::Vertical,
+                        self.panes.iter().last().map(|(p, _)| *p).unwrap(),
+                        state,
+                    );
+                }
+            }
         }
 
         Task::batch(open_popouts_tasks).chain(self.refresh_streams(main_window))
@@ -229,6 +255,7 @@ impl Dashboard {
         message: Message,
         main_window: &Window,
         layout_id: &uuid::Uuid,
+        windowing_mode: WindowingMode,
     ) -> (Task<Message>, Option<Event>) {
         match message {
             Message::SavePopoutSpecs(specs) => {
@@ -416,7 +443,7 @@ impl Dashboard {
                     }
                 }
                 pane::Message::Popout => {
-                    return (self.popout_pane(main_window), None);
+                    return (self.popout_pane(main_window, windowing_mode), None);
                 }
                 pane::Message::Merge => {
                     return (self.merge_pane(main_window), None);
@@ -613,7 +640,23 @@ impl Dashboard {
         Task::none()
     }
 
-    fn popout_pane(&mut self, main_window: &Window) -> Task<Message> {
+    fn popout_pane(
+        &mut self,
+        main_window: &Window,
+        windowing_mode: WindowingMode,
+    ) -> Task<Message> {
+        if !windowing_mode.allows_native_popout() {
+            log::info!(
+                "WINDOW NativePopoutBlocked | reason={reason}",
+                reason = windowing_mode.reason()
+            );
+            // In embedded mode, maximize the pane instead of popping out
+            if let Some((_, pane_id)) = self.focus {
+                self.panes.maximize(pane_id);
+            }
+            return Task::none();
+        }
+
         if let Some((_, id)) = self.focus.take()
             && let Some((pane, _)) = self.panes.close(id)
         {
