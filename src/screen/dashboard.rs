@@ -16,6 +16,7 @@ use crate::{
     style,
     widget::toast::Toast,
     window::{self, Window},
+    windowing::WindowingMode,
 };
 use data::{
     UserTimezone,
@@ -190,7 +191,11 @@ impl Dashboard {
         }
     }
 
-    pub fn load_layout(&mut self, main_window: window::Id) -> Task<Message> {
+    pub fn load_layout(
+        &mut self,
+        main_window: window::Id,
+        windowing_mode: WindowingMode,
+    ) -> Task<Message> {
         let mut open_popouts_tasks: Vec<Task<Message>> = vec![];
         let mut new_popout = Vec::new();
         let mut keys_to_remove = Vec::new();
@@ -199,25 +204,46 @@ impl Dashboard {
             keys_to_remove.push((*old_window_id, *specs));
         }
 
-        // remove keys and open new windows
-        for (old_window_id, window_spec) in keys_to_remove {
-            let (window, task) = window::open(window::Settings {
-                position: window::Position::Specific(window_spec.position()),
-                size: window_spec.size(),
-                exit_on_close_request: false,
-                ..window::settings()
-            });
+        if windowing_mode.allows_native_popout() {
+            // remove keys and open new windows
+            for (old_window_id, window_spec) in keys_to_remove {
+                let (window, task) = window::open(window::Settings {
+                    position: window::Position::Specific(window_spec.position()),
+                    size: window_spec.size(),
+                    exit_on_close_request: false,
+                    ..window::settings()
+                });
 
-            open_popouts_tasks.push(task.then(|_| Task::none()));
+                open_popouts_tasks.push(task.then(|_| Task::none()));
 
-            if let Some((removed_pane, specs)) = self.popout.remove(&old_window_id) {
-                new_popout.push((window, (removed_pane, specs)));
+                if let Some((removed_pane, specs)) = self.popout.remove(&old_window_id) {
+                    new_popout.push((window, (removed_pane, specs)));
+                }
             }
-        }
 
-        // assign new windows to old panes
-        for (window, (pane, specs)) in new_popout {
-            self.popout.insert(window, (pane, specs));
+            // assign new windows to old panes
+            for (window, (pane, specs)) in new_popout {
+                self.popout.insert(window, (pane, specs));
+            }
+        } else {
+            // In embedded mode, merge popout panes back into the main pane grid
+            log::info!(
+                "WINDOW NativePopoutBlocked | pane=load_layout reason={reason}",
+                reason = windowing_mode.reason()
+            );
+            for (_, (pane_state, _)) in keys_to_remove
+                .iter()
+                .filter_map(|(id, _)| self.popout.remove(id).map(|ps| (*id, ps)))
+            {
+                // Merge each popout pane into the main grid
+                for (_, state) in pane_state.panes {
+                    let _ = self.panes.split(
+                        pane_grid::Axis::Vertical,
+                        self.panes.iter().last().map(|(p, _)| *p).unwrap(),
+                        state,
+                    );
+                }
+            }
         }
 
         Task::batch(open_popouts_tasks).chain(self.refresh_streams(main_window))
@@ -229,6 +255,7 @@ impl Dashboard {
         message: Message,
         main_window: &Window,
         layout_id: &uuid::Uuid,
+        windowing_mode: WindowingMode,
     ) -> (Task<Message>, Option<Event>) {
         match message {
             Message::SavePopoutSpecs(specs) => {
@@ -416,7 +443,7 @@ impl Dashboard {
                     }
                 }
                 pane::Message::Popout => {
-                    return (self.popout_pane(main_window), None);
+                    return (self.popout_pane(main_window, windowing_mode), None);
                 }
                 pane::Message::Merge => {
                     return (self.merge_pane(main_window), None);
@@ -613,7 +640,23 @@ impl Dashboard {
         Task::none()
     }
 
-    fn popout_pane(&mut self, main_window: &Window) -> Task<Message> {
+    fn popout_pane(
+        &mut self,
+        main_window: &Window,
+        windowing_mode: WindowingMode,
+    ) -> Task<Message> {
+        if !windowing_mode.allows_native_popout() {
+            log::info!(
+                "WINDOW NativePopoutBlocked | reason={reason}",
+                reason = windowing_mode.reason()
+            );
+            // In embedded mode, maximize the pane instead of popping out
+            if let Some((_, pane_id)) = self.focus {
+                self.panes.maximize(pane_id);
+            }
+            return Task::none();
+        }
+
         if let Some((_, id)) = self.focus.take()
             && let Some((pane, _)) = self.panes.close(id)
         {
@@ -693,6 +736,16 @@ impl Dashboard {
             .map(|(_, _, state)| state)
     }
 
+    fn get_pane_state_by_uuid(
+        &self,
+        main_window: window::Id,
+        uuid: uuid::Uuid,
+    ) -> Option<&pane::State> {
+        self.iter_all_panes(main_window)
+            .find(|(_, _, state)| state.unique_id() == uuid)
+            .map(|(_, _, state)| state)
+    }
+
     fn iter_all_panes(
         &self,
         main_window: window::Id,
@@ -724,6 +777,7 @@ impl Dashboard {
         main_window: &'a Window,
         tickers_table: &'a TickersTable,
         timezone: UserTimezone,
+        allow_native_popout: bool,
     ) -> Element<'a, Message> {
         let pane_grid: Element<_> = PaneGrid::new(&self.panes, |id, pane, maximized| {
             let is_focused = self.focus == Some((main_window.id, id));
@@ -736,6 +790,7 @@ impl Dashboard {
                 main_window,
                 timezone,
                 tickers_table,
+                allow_native_popout,
             )
         })
         .min_size(240)
@@ -755,6 +810,7 @@ impl Dashboard {
         main_window: &'a Window,
         tickers_table: &'a TickersTable,
         timezone: UserTimezone,
+        allow_native_popout: bool,
     ) -> Element<'a, Message> {
         if let Some((state, _)) = self.popout.get(&window) {
             let content = container(
@@ -769,6 +825,7 @@ impl Dashboard {
                         main_window,
                         timezone,
                         tickers_table,
+                        allow_native_popout,
                     )
                 })
                 .on_click(pane::Message::PaneClicked),
@@ -1234,11 +1291,24 @@ impl Dashboard {
 
                     // Backfill completion: mark covered ranges on each pane
                     // without going through per-pane RequestHandler.
+                    // Only mark panes that support the fetched data type.
                     for pane_id in pane_ids {
                         if let Some(pane_state) =
                             self.get_mut_pane_state_by_uuid(main_window, pane_id)
                         {
-                            pane_state.mark_backfill_completed(fetch, empty_covered_tail);
+                            let supports = fetch
+                                .map(|f| pane_state.supports_fetch_range(&f))
+                                .unwrap_or(true);
+
+                            if supports {
+                                pane_state.mark_backfill_completed(fetch, empty_covered_tail);
+                            } else {
+                                log::debug!(
+                                    "BACKFILL CompletionSkip | pane={} content={} reason=unsupported_fetch_range",
+                                    fetcher::short_id(pane_id),
+                                    pane_state.content
+                                );
+                            }
                         }
                     }
                 }
@@ -1284,6 +1354,22 @@ impl Dashboard {
                     data_summary
                 );
                 for pane_id in pane_ids {
+                    // Check if this pane supports the fetched data type
+                    let supports = self
+                        .get_pane_state_by_uuid(main_window, pane_id)
+                        .map(|s| s.supports_fetched_data(&data))
+                        .unwrap_or(false);
+
+                    if !supports {
+                        log::debug!(
+                            "BACKFILL DataSkip | pane={} stream={} data={} reason=unsupported_fetched_data",
+                            fetcher::short_id(pane_id),
+                            fetcher::format_stream(&stream),
+                            data_summary_type(&data)
+                        );
+                        continue;
+                    }
+
                     let _ = self.distribute_fetched_data(
                         main_window,
                         pane_id,
@@ -1388,18 +1474,20 @@ impl Dashboard {
                 )
             })?;
 
-        match &mut pane_state.status {
-            pane::Status::Loading(InfoKind::FetchingTrades(count)) => {
-                *count += trades.len();
-            }
-            _ => {
-                pane_state.status = pane::Status::Loading(InfoKind::FetchingTrades(trades.len()));
-            }
-        }
-
         match &mut pane_state.content {
             pane::Content::Kline { chart, .. } => {
                 if let Some(c) = chart {
+                    // Update loading status
+                    match &mut pane_state.status {
+                        pane::Status::Loading(InfoKind::FetchingTrades(count)) => {
+                            *count += trades.len();
+                        }
+                        _ => {
+                            pane_state.status =
+                                pane::Status::Loading(InfoKind::FetchingTrades(trades.len()));
+                        }
+                    }
+
                     c.insert_raw_trades(trades.to_owned(), is_batches_done);
 
                     if is_batches_done {
@@ -1410,14 +1498,23 @@ impl Dashboard {
                     }
                     Ok(())
                 } else {
-                    Err(DashboardError::Unknown(
-                        "fetched trades but no chart found".to_string(),
-                    ))
+                    log::debug!(
+                        "FETCH TradesSkip | pane={} content=Kline(no_chart) reason=no_chart",
+                        fetcher::short_id(pane_id)
+                    );
+                    Ok(())
                 }
             }
-            _ => Err(DashboardError::Unknown(
-                "No matching chart found for fetched trades".to_string(),
-            )),
+            // Non-Kline panes cannot consume fetched trades.
+            // This is an internal routing mismatch, not a user error.
+            _ => {
+                log::debug!(
+                    "FETCH TradesSkip | pane={} content={} reason=unsupported_content_type",
+                    fetcher::short_id(pane_id),
+                    pane_state.content
+                );
+                Ok(())
+            }
         }
     }
 
@@ -2025,6 +2122,23 @@ impl Dashboard {
                     continue;
                 }
 
+                // Check if this pane supports fetched data for this stream type
+                let fetch_range = match stream {
+                    StreamKind::Trades { .. } => FetchRange::Trades(from, to),
+                    StreamKind::Kline { .. } => FetchRange::Kline(from, to),
+                    _ => continue,
+                };
+
+                if !pane_state.supports_fetch_range(&fetch_range) {
+                    log::debug!(
+                        "BACKFILL PaneSkip | stream={} pane={} content={} reason=unsupported_fetch_range",
+                        fetcher::format_stream(stream),
+                        fetcher::short_id(pane_state.unique_id()),
+                        pane_state.content
+                    );
+                    continue;
+                }
+
                 let pane_id = pane_state.unique_id();
                 let Some((missing_from, missing_to)) = (match stream {
                     StreamKind::Trades { .. } => pane_state.missing_trade_range(from, to),
@@ -2307,5 +2421,15 @@ impl From<fetcher::FetchUpdate> for Message {
                 fetch,
             },
         }
+    }
+}
+
+/// Returns a short type label for fetched data (for logging).
+fn data_summary_type(data: &FetchedData) -> &'static str {
+    match data {
+        FetchedData::Trades { .. } => "Trades",
+        FetchedData::BubbleSummary { .. } => "BubbleSummary",
+        FetchedData::Klines { .. } => "Klines",
+        FetchedData::OI { .. } => "OI",
     }
 }

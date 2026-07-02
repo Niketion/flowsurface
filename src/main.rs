@@ -5,13 +5,17 @@ mod chart;
 mod connector;
 mod layout;
 mod logger;
+mod market_service;
 mod modal;
 mod notify;
+mod power_guard;
+mod render_scheduler;
 mod screen;
 mod style;
 mod version;
 mod widget;
 mod window;
+mod windowing;
 
 use data::config::theme::default_theme;
 use data::{layout::WindowSpec, sidebar};
@@ -37,7 +41,8 @@ use iced::{
         tooltip::Position as TooltipPosition,
     },
 };
-use std::{borrow::Cow, collections::HashMap, time::Duration, vec};
+use std::{borrow::Cow, collections::HashMap, sync::Arc, time::Duration, vec};
+use windowing::WindowingMode;
 
 /// Set to `true` to emit window focus/unfocus and tick diagnostic logs.
 /// These are useful for debugging multi-window issues but noisy in normal use.
@@ -103,8 +108,13 @@ struct Flowsurface {
     timezone: data::UserTimezone,
     theme: data::Theme,
     notifications: Notifications,
+    windowing_mode: WindowingMode,
+    market_store: Arc<market_service::MarketStore>,
+    market_diagnostics: market_service::MarketDiagnostics,
+    dirty_flag: render_scheduler::DirtyFlag,
     debug_terminal_enabled: bool,
     debug_terminal_window: Option<window::Id>,
+    debug_terminal_embedded: bool,
     debug_terminal_logs: Vec<String>,
     debug_terminal_level_filter: DebugLevelFilter,
     debug_terminal_category_filter: DebugLogCategory,
@@ -503,6 +513,22 @@ impl Flowsurface {
 
         let (audio_stream, audio_init_err) = AudioStream::new(saved_state.audio_cfg);
 
+        let windowing_mode = WindowingMode::platform_default();
+        log::info!(
+            "WINDOW Mode | mode={windowing_mode} reason={reason}",
+            reason = windowing_mode.reason()
+        );
+
+        let market_store = Arc::new(market_service::MarketStore::new());
+        let market_diagnostics = market_service::MarketDiagnostics::new(market_store.clone());
+        log::info!("MARKET ServiceStarted | runtime=dedicated");
+
+        // Initialize Windows power guard if on Windows
+        #[cfg(target_os = "windows")]
+        {
+            power_guard::windows_power::init();
+        }
+
         let mut state = Self {
             main_window: window::Window::new(main_window_id),
             layout_manager: saved_state.layout_manager,
@@ -517,8 +543,13 @@ impl Flowsurface {
             theme: saved_state.theme,
             notifications: Notifications::new(),
             network: NetworkManager::new(saved_state.proxy_cfg),
+            windowing_mode,
+            market_store,
+            market_diagnostics,
+            dirty_flag: render_scheduler::DirtyFlag::new(),
             debug_terminal_enabled: saved_state.debug_terminal_enabled,
             debug_terminal_window: None,
+            debug_terminal_embedded: false,
             debug_terminal_logs: logger::debug_terminal_snapshot(),
             debug_terminal_level_filter: DebugLevelFilter::DEFAULT,
             debug_terminal_category_filter: DebugLogCategory::All,
@@ -577,11 +608,20 @@ impl Flowsurface {
     fn update(&mut self, message: Message) -> Task<Message> {
         match message {
             Message::MarketWsEvent(event) => {
+                // Record WS event in market store for diagnostics
+                self.market_store.record_ws_event();
+                self.market_store.enqueue_event();
+                self.market_diagnostics.maybe_log();
+
+                // Mark UI dirty when market data arrives
+                self.dirty_flag.mark_dirty();
+
                 let main_window_id = self.main_window.id;
                 let dashboard = self.active_dashboard_mut();
 
                 match event {
                     exchange::Event::Connected(streams) => {
+                        self.market_store.set_streams_connected(true);
                         log::info!("WS Connected | streams={}", streams.len());
                         for (idx, stream) in streams.iter().enumerate() {
                             log::debug!(
@@ -604,6 +644,7 @@ impl Flowsurface {
                             });
                     }
                     exchange::Event::Disconnected(streams, reason) => {
+                        self.market_store.set_streams_connected(false);
                         let now = exchange::UnixMs::now();
                         log::info!(
                             "WS Disconnected | reason={reason:?} streams={} now={}",
@@ -706,6 +747,13 @@ impl Flowsurface {
                     }
                 }
 
+                // Drain market events and log UI lag diagnostics
+                let drained = self.market_store.drain_events();
+                if drained > 0 {
+                    self.market_diagnostics.log_ui_lag(drained, 0);
+                }
+                self.market_diagnostics.maybe_log();
+
                 let main_window_id = self.main_window.id;
                 let handles = self.handles.clone();
 
@@ -743,6 +791,7 @@ impl Flowsurface {
                     return window::collect_window_specs(active_windows, Message::ExitRequested);
                 }
                 window::Event::Focused(id) => {
+                    self.market_store.set_ui_focused(true);
                     if DEBUG_WINDOW_DIAGNOSTICS {
                         log::debug!(
                             "[window] Focused: id={:?} ({})",
@@ -752,6 +801,7 @@ impl Flowsurface {
                     }
                 }
                 window::Event::Unfocused(id) => {
+                    self.market_store.set_ui_focused(false);
                     if DEBUG_WINDOW_DIAGNOSTICS {
                         log::debug!(
                             "[window] Unfocused: id={:?} ({})",
@@ -763,6 +813,7 @@ impl Flowsurface {
             },
             Message::ExitRequested(windows) => {
                 self.save_state_to_disk(&windows);
+                power_guard::windows_power::cleanup();
                 return iced::exit();
             }
             Message::SaveStateRequested(windows) => {
@@ -827,8 +878,13 @@ impl Flowsurface {
                 let handles = self.handles.clone();
 
                 if let Some(dashboard) = self.layout_manager.mut_dashboard(layout_id) {
-                    let (main_task, event) =
-                        dashboard.update(&handles, msg, &main_window, &layout_id);
+                    let (main_task, event) = dashboard.update(
+                        &handles,
+                        msg,
+                        &main_window,
+                        &layout_id,
+                        self.windowing_mode,
+                    );
 
                     let additional_task = match event {
                         Some(dashboard::Event::DistributeFetchedData {
@@ -941,8 +997,11 @@ impl Flowsurface {
                 if enabled {
                     self.debug_terminal_logs = logger::debug_terminal_snapshot();
                     return self.open_debug_terminal();
-                } else if let Some(window) = self.debug_terminal_window.take() {
-                    return window::close(window);
+                } else {
+                    if let Some(window) = self.debug_terminal_window.take() {
+                        return window::close(window);
+                    }
+                    self.debug_terminal_embedded = false;
                 }
             }
             Message::DebugTerminalOpened(window) => {
@@ -1226,7 +1285,12 @@ impl Flowsurface {
                 .map(Message::Sidebar);
 
             let dashboard_view = dashboard
-                .view(&self.main_window, tickers_table, self.timezone)
+                .view(
+                    &self.main_window,
+                    tickers_table,
+                    self.timezone,
+                    self.windowing_mode.allows_native_popout(),
+                )
                 .map(move |msg| Message::Dashboard {
                     layout_id: None,
                     event: msg,
@@ -1264,15 +1328,39 @@ impl Flowsurface {
                 .padding(8),
             ];
 
-            if let Some(menu) = self.sidebar.active_menu() {
-                self.view_with_modal(base.into(), dashboard, menu)
+            // In embedded mode, show debug terminal as a docked bottom panel
+            let base_with_debug = if self.debug_terminal_embedded
+                && self.debug_terminal_enabled
+                && self.debug_terminal_window.is_none()
+            {
+                let debug_panel = container(self.debug_terminal_view())
+                    .height(Length::FillPortion(2))
+                    .width(Length::Fill);
+                column![
+                    container(base).height(Length::FillPortion(5)),
+                    iced::widget::rule::horizontal(2).style(style::split_ruler),
+                    debug_panel,
+                ]
+                .into()
             } else {
                 base.into()
+            };
+
+            if let Some(menu) = self.sidebar.active_menu() {
+                self.view_with_modal(base_with_debug, dashboard, menu)
+            } else {
+                base_with_debug
             }
         } else {
             container(
                 dashboard
-                    .view_window(id, &self.main_window, tickers_table, self.timezone)
+                    .view_window(
+                        id,
+                        &self.main_window,
+                        tickers_table,
+                        self.timezone,
+                        self.windowing_mode.allows_native_popout(),
+                    )
                     .map(move |msg| Message::Dashboard {
                         layout_id: None,
                         event: msg,
@@ -1363,21 +1451,34 @@ impl Flowsurface {
         }
     }
 
-    fn open_debug_terminal(&self) -> Task<Message> {
-        if self.debug_terminal_window.is_some() {
+    fn open_debug_terminal(&mut self) -> Task<Message> {
+        if self.debug_terminal_window.is_some() || self.debug_terminal_embedded {
             return Task::none();
         }
 
-        let config = window::Settings {
-            size: iced::Size::new(920.0, 520.0),
-            position: window::Position::Centered,
-            exit_on_close_request: false,
-            min_size: Some(iced::Size::new(560.0, 320.0)),
-            ..Default::default()
-        };
+        if self.windowing_mode.allows_native_popout() {
+            let config = window::Settings {
+                size: iced::Size::new(920.0, 520.0),
+                position: window::Position::Centered,
+                exit_on_close_request: false,
+                min_size: Some(iced::Size::new(560.0, 320.0)),
+                ..Default::default()
+            };
 
-        let (id, open) = window::open(config);
-        open.map(move |_| Message::DebugTerminalOpened(id))
+            let (id, open) = window::open(config);
+            open.map(move |_| Message::DebugTerminalOpened(id))
+        } else {
+            log::info!(
+                "WINDOW DebugTerminalEmbedded | reason={reason}",
+                reason = self.windowing_mode.reason()
+            );
+            self.debug_terminal_embedded = true;
+            self.debug_terminal_logs = logger::debug_terminal_snapshot();
+            if self.debug_terminal_auto_scroll {
+                return self.scroll_debug_terminal_to_bottom();
+            }
+            Task::none()
+        }
     }
 
     fn debug_terminal_view(&self) -> Element<'_, Message> {
@@ -1614,12 +1715,13 @@ impl Flowsurface {
         self.layout_manager
             .park_inactive_layouts(layout_uid, main_window);
 
+        let windowing_mode = self.windowing_mode;
         self.layout_manager
             .get_mut(layout_uid)
             .map(|layout| {
                 layout
                     .dashboard
-                    .load_layout(main_window)
+                    .load_layout(main_window, windowing_mode)
                     .map(move |msg| Message::Dashboard {
                         layout_id: Some(layout_uid),
                         event: msg,

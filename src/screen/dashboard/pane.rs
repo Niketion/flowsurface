@@ -630,6 +630,7 @@ impl State {
         main_window: &'a Window,
         timezone: UserTimezone,
         tickers_table: &'a TickersTable,
+        allow_native_popout: bool,
     ) -> pane_grid::Content<'a, Message, Theme, Renderer> {
         let mut top_left_buttons = if Content::Starter == self.content {
             row![]
@@ -718,9 +719,15 @@ impl State {
 
         let compact_controls = if self.modal == Some(Modal::Controls) {
             Some(
-                container(self.view_controls(id, panes, maximized, window != main_window.id))
-                    .style(style::chart_modal)
-                    .into(),
+                container(self.view_controls(
+                    id,
+                    panes,
+                    maximized,
+                    window != main_window.id,
+                    allow_native_popout,
+                ))
+                .style(style::chart_modal)
+                .into(),
             )
         } else {
             None
@@ -1229,7 +1236,13 @@ impl State {
                 pane_grid::Controls::new(compact_control)
             } else {
                 pane_grid::Controls::dynamic(
-                    self.view_controls(id, panes, maximized, window != main_window.id),
+                    self.view_controls(
+                        id,
+                        panes,
+                        maximized,
+                        window != main_window.id,
+                        allow_native_popout,
+                    ),
                     compact_control,
                 )
             }
@@ -1635,6 +1648,7 @@ impl State {
         total_panes: usize,
         is_maximized: bool,
         is_popout: bool,
+        allow_native_popout: bool,
     ) -> Element<'_, Message> {
         let modal_btn_style = |modal: Modal| {
             let is_active = self.modal == Some(modal);
@@ -1681,7 +1695,7 @@ impl State {
             ));
         }
 
-        if is_popout {
+        if is_popout && allow_native_popout {
             buttons = buttons.push(button_with_tooltip(
                 icon_text(Icon::Popout, 12),
                 Message::Merge,
@@ -1689,7 +1703,7 @@ impl State {
                 tooltip_pos,
                 control_btn_style(is_popout),
             ));
-        } else if total_panes > 1 {
+        } else if total_panes > 1 && allow_native_popout {
             buttons = buttons.push(button_with_tooltip(
                 icon_text(Icon::Popout, 12),
                 Message::Popout,
@@ -1824,6 +1838,40 @@ impl State {
 
     pub fn matches_stream(&self, stream: &StreamKind) -> bool {
         self.streams.matches_stream(stream)
+    }
+
+    /// Check if this pane can consume a specific type of fetched data.
+    ///
+    /// Live WS events (trades, depth) can be consumed by Heatmap, Ladder,
+    /// TimeAndSales etc. But historical fetched data (REST backfill) has
+    /// stricter requirements:
+    /// - `FetchedData::Trades` → only Kline chart panes
+    /// - `FetchedData::BubbleSummary` → only Kline chart panes
+    /// - `FetchedData::Klines` → only Kline chart panes
+    /// - `FetchedData::OI` → only Kline chart panes
+    pub fn supports_fetched_data(&self, data: &crate::connector::fetcher::FetchedData) -> bool {
+        use crate::connector::fetcher::FetchedData;
+        match data {
+            FetchedData::Trades { .. }
+            | FetchedData::BubbleSummary { .. }
+            | FetchedData::Klines { .. }
+            | FetchedData::OI { .. } => {
+                matches!(self.content, Content::Kline { chart: Some(_), .. })
+            }
+        }
+    }
+
+    /// Check if this pane supports a specific fetch range for backfill.
+    pub fn supports_fetch_range(&self, fetch: &crate::connector::fetcher::FetchRange) -> bool {
+        use crate::connector::fetcher::FetchRange;
+        match fetch {
+            FetchRange::Trades(_, _)
+            | FetchRange::BubbleSummary { .. }
+            | FetchRange::Kline(_, _)
+            | FetchRange::OpenInterest(_, _) => {
+                matches!(self.content, Content::Kline { chart: Some(_), .. })
+            }
+        }
     }
 
     fn show_modal_with_focus(&mut self, requested_modal: Modal) -> Option<Effect> {
@@ -2587,5 +2635,58 @@ fn by_basis_default<T>(
     match basis.unwrap_or(Basis::Time(default_tf)) {
         Basis::Time(tf) => on_time(tf),
         Basis::Tick(_) => on_tick(),
+    }
+}
+
+/// Determines whether the popout button should be shown in pane controls.
+///
+/// Returns `false` when native popout is not allowed (e.g., Windows / SingleWindowEmbedded)
+/// to avoid showing a button that would be blocked at runtime.
+#[cfg(test)]
+pub fn should_show_popout_button(
+    total_panes: usize,
+    is_popout: bool,
+    allow_native_popout: bool,
+) -> bool {
+    if is_popout {
+        // Merge button only shown for real native popout windows
+        allow_native_popout
+    } else {
+        // Pop out button only shown when there are multiple panes AND native popout is allowed
+        total_panes > 1 && allow_native_popout
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn popout_button_hidden_in_embedded_mode() {
+        // SingleWindowEmbedded (Windows): no popout button even with multiple panes
+        assert!(!should_show_popout_button(2, false, false));
+        assert!(!should_show_popout_button(3, false, false));
+    }
+
+    #[test]
+    fn popout_button_shown_in_native_multi_window() {
+        // NativeMultiWindow (macOS/Linux): popout button shown with multiple panes
+        assert!(should_show_popout_button(2, false, true));
+        assert!(should_show_popout_button(3, false, true));
+    }
+
+    #[test]
+    fn popout_button_hidden_for_single_pane() {
+        // Single pane: no popout button regardless of mode
+        assert!(!should_show_popout_button(1, false, true));
+        assert!(!should_show_popout_button(1, false, false));
+    }
+
+    #[test]
+    fn merge_button_only_for_native_popout() {
+        // Merge button shown only when is_popout AND native popout is allowed
+        assert!(should_show_popout_button(1, true, true));
+        // In embedded mode, no merge button (no native popout windows should exist)
+        assert!(!should_show_popout_button(1, true, false));
     }
 }
