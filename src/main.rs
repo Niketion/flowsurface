@@ -111,7 +111,7 @@ struct Flowsurface {
     windowing_mode: WindowingMode,
     market_store: Arc<market_service::MarketStore>,
     market_diagnostics: market_service::MarketDiagnostics,
-    dirty_scheduler: render_scheduler::DirtyScheduler,
+    dirty_flag: render_scheduler::DirtyFlag,
     debug_terminal_enabled: bool,
     debug_terminal_window: Option<window::Id>,
     debug_terminal_embedded: bool,
@@ -546,7 +546,7 @@ impl Flowsurface {
             windowing_mode,
             market_store,
             market_diagnostics,
-            dirty_scheduler: render_scheduler::DirtyScheduler::new(),
+            dirty_flag: render_scheduler::DirtyFlag::new(),
             debug_terminal_enabled: saved_state.debug_terminal_enabled,
             debug_terminal_window: None,
             debug_terminal_embedded: false,
@@ -613,8 +613,8 @@ impl Flowsurface {
                 self.market_store.enqueue_event();
                 self.market_diagnostics.maybe_log();
 
-                // Mark all panes dirty when market data arrives
-                self.dirty_scheduler.mark_all_dirty();
+                // Mark UI dirty when market data arrives
+                self.dirty_flag.mark_dirty();
 
                 let main_window_id = self.main_window.id;
                 let dashboard = self.active_dashboard_mut();
@@ -747,6 +747,13 @@ impl Flowsurface {
                     }
                 }
 
+                // Drain market events and log UI lag diagnostics
+                let drained = self.market_store.drain_events();
+                if drained > 0 {
+                    self.market_diagnostics.log_ui_lag(drained, 0);
+                }
+                self.market_diagnostics.maybe_log();
+
                 let main_window_id = self.main_window.id;
                 let handles = self.handles.clone();
 
@@ -806,6 +813,7 @@ impl Flowsurface {
             },
             Message::ExitRequested(windows) => {
                 self.save_state_to_disk(&windows);
+                power_guard::windows_power::cleanup();
                 return iced::exit();
             }
             Message::SaveStateRequested(windows) => {
