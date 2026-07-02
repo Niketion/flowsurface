@@ -811,12 +811,41 @@ impl KlineChart {
     }
 
     pub fn reset_request_handler(&mut self) {
-        log::info!("CHART Reset | reason=settings_changed");
-        self.request_handler = RequestHandler::default();
+        let old_generation = self.request_handler.generation_id();
+        let superseded_ids = self
+            .request_handler
+            .supersede_all_pending("settings_changed");
+
+        log::info!(
+            "CHART Reset | reason=settings_changed old_generation={} new_generation={} superseded_requests={}",
+            old_generation,
+            self.request_handler.generation_id(),
+            superseded_ids.len()
+        );
+
+        // The superseded requests are still in the handler with Superseded status.
+        // When their workers complete, they will be detected as stale generation.
+        // We keep the handler (don't replace it) so we can track stale results.
+
         self.fetching_trades = (false, None);
         self.covered_trade_ranges.clear();
         self.covered_bubble_summary_ranges.clear();
         self.bubble_auto_fetch_at = None;
+    }
+
+    /// Check if a fetch result should be applied or discarded as stale.
+    pub fn is_fetch_stale(&self, req_id: uuid::Uuid) -> bool {
+        self.request_handler.is_stale_generation(req_id)
+    }
+
+    /// Get the generation ID of a request for logging.
+    pub fn request_generation(&self, req_id: uuid::Uuid) -> Option<u64> {
+        self.request_handler.request_generation(req_id)
+    }
+
+    /// Get the current generation ID.
+    pub fn current_generation(&self) -> u64 {
+        self.request_handler.generation_id()
     }
 
     pub fn register_backfill_request(&mut self, req_id: uuid::Uuid, fetch: FetchRange) -> bool {

@@ -417,6 +417,16 @@ impl Dashboard {
                                     .map(|iter| iter.copied().collect::<Vec<_>>())
                                     .unwrap_or_default();
 
+                                // Get chart generation for stale detection
+                                let chart_generation =
+                                    if let pane::Content::Kline { chart: Some(c), .. } =
+                                        &state.content
+                                    {
+                                        c.current_generation()
+                                    } else {
+                                        0
+                                    };
+
                                 fetcher::request_fetch_many(
                                     handles.clone(),
                                     pane_id,
@@ -431,6 +441,7 @@ impl Dashboard {
                                             c.set_handle(handle);
                                         }
                                     },
+                                    chart_generation,
                                 )
                                 .map(Message::from)
                                 .chain(self.refresh_streams(main_window.id))
@@ -953,6 +964,34 @@ impl Dashboard {
         data: FetchedData,
         stream_type: StreamKind,
     ) -> Task<Message> {
+        // Check for stale generation before applying any data
+        let req_id = match &data {
+            FetchedData::Trades { req_id, .. } => *req_id,
+            FetchedData::BubbleSummary { req_id, .. } => *req_id,
+            FetchedData::Klines { req_id, .. } => *req_id,
+            FetchedData::OI { req_id, .. } => *req_id,
+        };
+
+        if let Some(req_id) = req_id {
+            if let Some(pane_state) = self.get_mut_pane_state_by_uuid(main_window, pane_id) {
+                if let pane::Content::Kline { chart: Some(c), .. } = &mut pane_state.content {
+                    if c.is_fetch_stale(req_id) {
+                        let request_gen = c.request_generation(req_id);
+                        let current_gen = c.current_generation();
+                        log::info!(
+                            "FETCH StaleResult | req={} request_generation={} current_generation={} action=discard",
+                            fetcher::short_id(req_id),
+                            request_gen.map_or("-".to_string(), |g| g.to_string()),
+                            current_gen
+                        );
+                        // Mark the request as completed to clean up pending state
+                        c.mark_trade_request_completed(req_id);
+                        return Task::none();
+                    }
+                }
+            }
+        }
+
         match data {
             FetchedData::Trades {
                 batch,
@@ -1210,6 +1249,29 @@ impl Dashboard {
                 req_id,
                 fetch,
             } => {
+                // Check for stale generation before applying error
+                if let Some(id) = req_id {
+                    if let Some(pane_state) = self.get_mut_pane_state_by_uuid(main_window, pane_id)
+                    {
+                        if let pane::Content::Kline { chart: Some(c), .. } = &mut pane_state.content
+                        {
+                            if c.is_fetch_stale(id) {
+                                let request_gen = c.request_generation(id);
+                                let current_gen = c.current_generation();
+                                log::info!(
+                                    "FETCH StaleResult | req={} request_generation={} current_generation={} action=discard_error",
+                                    fetcher::short_id(id),
+                                    request_gen.map_or("-".to_string(), |g| g.to_string()),
+                                    current_gen
+                                );
+                                // Mark the request as completed to clean up pending state
+                                c.mark_trade_request_completed(id);
+                                return;
+                            }
+                        }
+                    }
+                }
+
                 log::warn!(
                     "BACKFILL Update | kind=Error stream={} pane_ids={} source_pane={} req={} fetch={} error={}",
                     fetcher::format_stream(&stream),
@@ -1549,6 +1611,14 @@ impl Dashboard {
                         .map(|iter| iter.copied().collect::<Vec<_>>())
                         .unwrap_or_default();
 
+                    // Get chart generation for stale detection
+                    let chart_generation =
+                        if let pane::Content::Kline { chart: Some(c), .. } = &state.content {
+                            c.current_generation()
+                        } else {
+                            0
+                        };
+
                     let fetch_tasks = fetcher::request_fetch_many(
                         handles.clone(),
                         pane_id,
@@ -1562,6 +1632,7 @@ impl Dashboard {
                                 c.set_handle(handle);
                             }
                         },
+                        chart_generation,
                     )
                     .map(Message::from);
 
@@ -2015,6 +2086,7 @@ impl Dashboard {
                     fetch,
                     Some(*stream),
                     &mut |_handle| {},
+                    0, // backfill tasks don't have a specific chart generation
                 );
 
                 fetch_tasks.push(task.map(move |update| Message::BackfillFetchUpdate {

@@ -198,6 +198,10 @@ enum RequestStatus {
         failed_at: u64,
         retry_at: u64,
     },
+    Superseded {
+        reason: &'static str,
+        superseded_at: u64,
+    },
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -233,12 +237,19 @@ impl fmt::Display for FetchSuppressionReason {
 pub struct RequestHandler {
     requests: FxHashMap<Uuid, FetchRequest>,
     last_suppression: Cell<Option<FetchSuppressionReason>>,
+    generation_id: u64,
 }
 
 impl RequestHandler {
     const COMPLETED_RETENTION_MS: u64 = 30_000;
     const FAILED_RETENTION_MS: u64 = 5 * 60_000;
     const PENDING_TIMEOUT_MS: u64 = 90_000;
+    const SUPERSEDED_RETENTION_MS: u64 = 10_000;
+
+    /// Get the current generation ID.
+    pub fn generation_id(&self) -> u64 {
+        self.generation_id
+    }
 
     pub fn add_request(&mut self, fetch: FetchRange) -> Result<Option<Uuid>, ReqError> {
         self.add_request_with_id(Uuid::new_v4(), fetch)
@@ -324,6 +335,11 @@ impl RequestHandler {
                 {
                     remove_ids.push(*id);
                 }
+                RequestStatus::Superseded { superseded_at, .. }
+                    if now.saturating_sub(*superseded_at) > Self::SUPERSEDED_RETENTION_MS =>
+                {
+                    remove_ids.push(*id);
+                }
                 _ => {}
             }
         }
@@ -339,17 +355,70 @@ impl RequestHandler {
         }
     }
 
-    fn status_counts(&self) -> (usize, usize, usize) {
-        self.requests
-            .values()
-            .fold(
-                (0, 0, 0),
-                |(pending, completed, failed), request| match &request.status {
-                    RequestStatus::Pending => (pending + 1, completed, failed),
-                    RequestStatus::Completed(_) => (pending, completed + 1, failed),
-                    RequestStatus::Failed { .. } => (pending, completed, failed + 1),
-                },
-            )
+    /// Supersede all pending requests. Increments generation ID.
+    /// Returns the list of superseded request IDs for emitting terminal events.
+    pub fn supersede_all_pending(&mut self, reason: &'static str) -> Vec<Uuid> {
+        self.generation_id = self.generation_id.wrapping_add(1);
+        let now = chrono::Utc::now().timestamp_millis() as u64;
+        let mut superseded_ids = Vec::new();
+
+        for (id, request) in &mut self.requests {
+            if request.status == RequestStatus::Pending {
+                request.status = RequestStatus::Superseded {
+                    reason,
+                    superseded_at: now,
+                };
+                request.updated_at = now;
+                superseded_ids.push(*id);
+                log::info!(
+                    "FETCH Superseded | req={} {} reason={} generation={}",
+                    short_id(*id),
+                    format_fetch_range(&request.fetch_type),
+                    reason,
+                    self.generation_id
+                );
+                log::info!(
+                    "FETCH PendingRemove | req={} {} reason=superseded",
+                    short_id(*id),
+                    format_fetch_range(&request.fetch_type)
+                );
+            }
+        }
+
+        superseded_ids
+    }
+
+    /// Check if a request belongs to a stale generation.
+    pub fn is_stale_generation(&self, req_id: Uuid) -> bool {
+        if let Some(request) = self.requests.get(&req_id) {
+            request.generation != self.generation_id
+        } else {
+            // Request not found - treat as stale
+            true
+        }
+    }
+
+    /// Get the generation ID of a specific request.
+    pub fn request_generation(&self, req_id: Uuid) -> Option<u64> {
+        self.requests.get(&req_id).map(|r| r.generation)
+    }
+
+    /// Remove a request from the pending map and return its fetch range.
+    /// Used for explicit cancellation/superseding.
+    pub fn remove_request(&mut self, id: Uuid) -> Option<FetchRange> {
+        self.requests.remove(&id).map(|r| r.fetch_type)
+    }
+
+    fn status_counts(&self) -> (usize, usize, usize, usize) {
+        self.requests.values().fold(
+            (0, 0, 0, 0),
+            |(pending, completed, failed, superseded), request| match &request.status {
+                RequestStatus::Pending => (pending + 1, completed, failed, superseded),
+                RequestStatus::Completed(_) => (pending, completed + 1, failed, superseded),
+                RequestStatus::Failed { .. } => (pending, completed, failed + 1, superseded),
+                RequestStatus::Superseded { .. } => (pending, completed, failed, superseded + 1),
+            },
+        )
     }
 
     pub fn add_request_with_id(
@@ -364,7 +433,7 @@ impl RequestHandler {
             self.set_suppressed(FetchSuppressionReason::InvalidRange, id, &fetch, None);
             return Ok(None);
         }
-        let request = FetchRequest::new(fetch, now);
+        let request = FetchRequest::new(fetch, now, self.generation_id);
         let retryable_failed = self
             .requests
             .iter()
@@ -388,16 +457,17 @@ impl RequestHandler {
                 );
             }
         }
-        let (pending, completed, failed) = self.status_counts();
+        let (pending, completed, failed, superseded) = self.status_counts();
 
         log::debug!(
-            "FETCH AddRequest | req={} {} map_size={} pending={} completed={} failed={}",
+            "FETCH AddRequest | req={} {} map_size={} pending={} completed={} failed={} superseded={}",
             short_id(id),
             format_fetch_range(&fetch),
             self.requests.len(),
             pending,
             completed,
-            failed
+            failed,
+            superseded
         );
 
         if let FetchRange::Trades(new_from, new_to) = fetch {
@@ -631,21 +701,33 @@ impl RequestHandler {
                     );
                     Ok(None)
                 }
+                RequestStatus::Superseded { .. } => {
+                    // Previous request was superseded, allow new request
+                    log::info!(
+                        "FETCH RetryAllowed | reason=previous_superseded req={} previous_req={} {}",
+                        short_id(id),
+                        short_id(existing_id),
+                        format_fetch_range(&fetch)
+                    );
+                    Ok(Some(existing_id))
+                }
             };
         }
 
         log::info!(
-            "FETCH Queued | {} req={} pending_after={}",
+            "FETCH Queued | {} req={} pending_after={} generation={}",
             format_fetch_range(&fetch),
             short_id(id),
-            pending + 1
+            pending + 1,
+            self.generation_id
         );
         self.requests.insert(id, request);
         log::info!(
-            "FETCH PendingInsert | req={} {} pending_after={}",
+            "FETCH PendingInsert | req={} {} pending_after={} generation={}",
             short_id(id),
             format_fetch_range(&fetch),
-            pending + 1
+            pending + 1,
+            self.generation_id
         );
         Ok(Some(id))
     }
@@ -730,16 +812,18 @@ struct FetchRequest {
     created_at: u64,
     updated_at: u64,
     attempts: u32,
+    generation: u64,
 }
 
 impl FetchRequest {
-    fn new(fetch_type: FetchRange, now: u64) -> Self {
+    fn new(fetch_type: FetchRange, now: u64, generation: u64) -> Self {
         FetchRequest {
             fetch_type,
             status: RequestStatus::Pending,
             created_at: now,
             updated_at: now,
             attempts: 0,
+            generation,
         }
     }
 
@@ -853,7 +937,15 @@ pub fn request_fetch(
     fetch: FetchRange,
     stream: Option<StreamKind>,
     on_trade_handle: &mut impl FnMut(Handle),
+    chart_generation: u64,
 ) -> Task<FetchUpdate> {
+    log::info!(
+        "FETCH Owner | req={} pane={} chart_generation={} {}",
+        short_id(req_id),
+        short_id(pane_id),
+        chart_generation,
+        format_fetch_range(&fetch)
+    );
     log::debug!(
         "FETCH Dispatch | {} req={} pane={} layout={} ready_streams={} override_stream={}",
         format_fetch_range(&fetch),
@@ -1238,16 +1330,18 @@ pub fn request_fetch_many(
     layout_id: Uuid,
     reqs: impl IntoIterator<Item = (Uuid, FetchRange, Option<StreamKind>)>,
     mut on_trade_handle: impl FnMut(Handle),
+    chart_generation: u64,
 ) -> Task<FetchUpdate> {
     let mut tasks = Vec::new();
     let reqs = reqs.into_iter().collect::<Vec<_>>();
 
     log::debug!(
-        "FETCH Many | pane={} layout={} requests={} ready_streams={}",
+        "FETCH Many | pane={} layout={} requests={} ready_streams={} chart_generation={}",
         short_id(pane_id),
         short_id(layout_id),
         reqs.len(),
-        ready_streams.len()
+        ready_streams.len(),
+        chart_generation
     );
     for (idx, (req_id, fetch, stream)) in reqs.iter().enumerate() {
         log::debug!(
@@ -1268,6 +1362,7 @@ pub fn request_fetch_many(
             fetch,
             stream,
             &mut on_trade_handle,
+            chart_generation,
         ));
     }
 
