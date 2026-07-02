@@ -1826,6 +1826,40 @@ impl State {
         self.streams.matches_stream(stream)
     }
 
+    /// Check if this pane can consume a specific type of fetched data.
+    ///
+    /// Live WS events (trades, depth) can be consumed by Heatmap, Ladder,
+    /// TimeAndSales etc. But historical fetched data (REST backfill) has
+    /// stricter requirements:
+    /// - `FetchedData::Trades` → only Kline chart panes
+    /// - `FetchedData::BubbleSummary` → only Kline chart panes
+    /// - `FetchedData::Klines` → only Kline chart panes
+    /// - `FetchedData::OI` → only Kline chart panes
+    pub fn supports_fetched_data(&self, data: &crate::connector::fetcher::FetchedData) -> bool {
+        use crate::connector::fetcher::FetchedData;
+        match data {
+            FetchedData::Trades { .. }
+            | FetchedData::BubbleSummary { .. }
+            | FetchedData::Klines { .. }
+            | FetchedData::OI { .. } => {
+                matches!(self.content, Content::Kline { chart: Some(_), .. })
+            }
+        }
+    }
+
+    /// Check if this pane supports a specific fetch range for backfill.
+    pub fn supports_fetch_range(&self, fetch: &crate::connector::fetcher::FetchRange) -> bool {
+        use crate::connector::fetcher::FetchRange;
+        match fetch {
+            FetchRange::Trades(_, _)
+            | FetchRange::BubbleSummary { .. }
+            | FetchRange::Kline(_, _)
+            | FetchRange::OpenInterest(_, _) => {
+                matches!(self.content, Content::Kline { chart: Some(_), .. })
+            }
+        }
+    }
+
     fn show_modal_with_focus(&mut self, requested_modal: Modal) -> Option<Effect> {
         let should_toggle_close = match (&self.modal, &requested_modal) {
             (Some(Modal::StreamModifier(open)), Modal::StreamModifier(req)) => {

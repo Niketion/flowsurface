@@ -736,6 +736,16 @@ impl Dashboard {
             .map(|(_, _, state)| state)
     }
 
+    fn get_pane_state_by_uuid(
+        &self,
+        main_window: window::Id,
+        uuid: uuid::Uuid,
+    ) -> Option<&pane::State> {
+        self.iter_all_panes(main_window)
+            .find(|(_, _, state)| state.unique_id() == uuid)
+            .map(|(_, _, state)| state)
+    }
+
     fn iter_all_panes(
         &self,
         main_window: window::Id,
@@ -1277,11 +1287,24 @@ impl Dashboard {
 
                     // Backfill completion: mark covered ranges on each pane
                     // without going through per-pane RequestHandler.
+                    // Only mark panes that support the fetched data type.
                     for pane_id in pane_ids {
                         if let Some(pane_state) =
                             self.get_mut_pane_state_by_uuid(main_window, pane_id)
                         {
-                            pane_state.mark_backfill_completed(fetch, empty_covered_tail);
+                            let supports = fetch
+                                .map(|f| pane_state.supports_fetch_range(&f))
+                                .unwrap_or(true);
+
+                            if supports {
+                                pane_state.mark_backfill_completed(fetch, empty_covered_tail);
+                            } else {
+                                log::debug!(
+                                    "BACKFILL CompletionSkip | pane={} content={} reason=unsupported_fetch_range",
+                                    fetcher::short_id(pane_id),
+                                    pane_state.content
+                                );
+                            }
                         }
                     }
                 }
@@ -1327,6 +1350,22 @@ impl Dashboard {
                     data_summary
                 );
                 for pane_id in pane_ids {
+                    // Check if this pane supports the fetched data type
+                    let supports = self
+                        .get_pane_state_by_uuid(main_window, pane_id)
+                        .map(|s| s.supports_fetched_data(&data))
+                        .unwrap_or(false);
+
+                    if !supports {
+                        log::debug!(
+                            "BACKFILL DataSkip | pane={} stream={} data={} reason=unsupported_fetched_data",
+                            fetcher::short_id(pane_id),
+                            fetcher::format_stream(&stream),
+                            data_summary_type(&data)
+                        );
+                        continue;
+                    }
+
                     let _ = self.distribute_fetched_data(
                         main_window,
                         pane_id,
@@ -1431,18 +1470,20 @@ impl Dashboard {
                 )
             })?;
 
-        match &mut pane_state.status {
-            pane::Status::Loading(InfoKind::FetchingTrades(count)) => {
-                *count += trades.len();
-            }
-            _ => {
-                pane_state.status = pane::Status::Loading(InfoKind::FetchingTrades(trades.len()));
-            }
-        }
-
         match &mut pane_state.content {
             pane::Content::Kline { chart, .. } => {
                 if let Some(c) = chart {
+                    // Update loading status
+                    match &mut pane_state.status {
+                        pane::Status::Loading(InfoKind::FetchingTrades(count)) => {
+                            *count += trades.len();
+                        }
+                        _ => {
+                            pane_state.status =
+                                pane::Status::Loading(InfoKind::FetchingTrades(trades.len()));
+                        }
+                    }
+
                     c.insert_raw_trades(trades.to_owned(), is_batches_done);
 
                     if is_batches_done {
@@ -1453,14 +1494,23 @@ impl Dashboard {
                     }
                     Ok(())
                 } else {
-                    Err(DashboardError::Unknown(
-                        "fetched trades but no chart found".to_string(),
-                    ))
+                    log::debug!(
+                        "FETCH TradesSkip | pane={} content=Kline(no_chart) reason=no_chart",
+                        fetcher::short_id(pane_id)
+                    );
+                    Ok(())
                 }
             }
-            _ => Err(DashboardError::Unknown(
-                "No matching chart found for fetched trades".to_string(),
-            )),
+            // Non-Kline panes cannot consume fetched trades.
+            // This is an internal routing mismatch, not a user error.
+            _ => {
+                log::debug!(
+                    "FETCH TradesSkip | pane={} content={} reason=unsupported_content_type",
+                    fetcher::short_id(pane_id),
+                    pane_state.content
+                );
+                Ok(())
+            }
         }
     }
 
@@ -2068,6 +2118,23 @@ impl Dashboard {
                     continue;
                 }
 
+                // Check if this pane supports fetched data for this stream type
+                let fetch_range = match stream {
+                    StreamKind::Trades { .. } => FetchRange::Trades(from, to),
+                    StreamKind::Kline { .. } => FetchRange::Kline(from, to),
+                    _ => continue,
+                };
+
+                if !pane_state.supports_fetch_range(&fetch_range) {
+                    log::debug!(
+                        "BACKFILL PaneSkip | stream={} pane={} content={} reason=unsupported_fetch_range",
+                        fetcher::format_stream(stream),
+                        fetcher::short_id(pane_state.unique_id()),
+                        pane_state.content
+                    );
+                    continue;
+                }
+
                 let pane_id = pane_state.unique_id();
                 let Some((missing_from, missing_to)) = (match stream {
                     StreamKind::Trades { .. } => pane_state.missing_trade_range(from, to),
@@ -2350,5 +2417,15 @@ impl From<fetcher::FetchUpdate> for Message {
                 fetch,
             },
         }
+    }
+}
+
+/// Returns a short type label for fetched data (for logging).
+fn data_summary_type(data: &FetchedData) -> &'static str {
+    match data {
+        FetchedData::Trades { .. } => "Trades",
+        FetchedData::BubbleSummary { .. } => "BubbleSummary",
+        FetchedData::Klines { .. } => "Klines",
+        FetchedData::OI { .. } => "OI",
     }
 }

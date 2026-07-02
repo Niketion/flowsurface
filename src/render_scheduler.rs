@@ -71,9 +71,7 @@ impl DirtyScheduler {
 
     /// Register a pane with the scheduler.
     pub fn register_pane(&mut self, pane_id: uuid::Uuid) {
-        self.pane_states
-            .entry(pane_id)
-            .or_default();
+        self.pane_states.entry(pane_id).or_default();
     }
 
     /// Remove a pane from the scheduler.
