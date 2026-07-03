@@ -255,6 +255,21 @@ pub fn load_saved_state_from_path(path: &Path) -> StateLoadOutcome {
     if !warnings.is_empty() {
         let backup_path = backup_saved_state(path, "recovered").ok();
         warn!("SAVED_STATE Recovered | warnings={}", warnings.join("; "));
+        match serde_json::to_string(&state)
+            .map_err(std::io::Error::other)
+            .and_then(|json| write_json_to_file_atomic_at(&json, path))
+        {
+            Ok(()) => {
+                info!(
+                    "SAVED_STATE RecoveredWriteComplete | backup={}",
+                    backup_path
+                        .as_ref()
+                        .map(|p| p.display().to_string())
+                        .unwrap_or_else(|| "none".to_string())
+                );
+            }
+            Err(err) => warn!("SAVED_STATE RecoveredWriteFailed | error={err}"),
+        }
         return StateLoadOutcome::Recovered {
             state,
             warnings,
@@ -392,6 +407,32 @@ fn sanitize_state(state: &mut State, warnings: &mut Vec<String>) {
             .layouts
             .first()
             .map(|layout| layout.name.clone());
+    }
+
+    sanitize_main_window(state, warnings);
+}
+
+fn sanitize_main_window(state: &mut State, warnings: &mut Vec<String>) {
+    const MAX_REASONABLE_WINDOW_COORD: f32 = 20_000.0;
+
+    let Some(window) = state.main_window else {
+        return;
+    };
+
+    let invalid_size = !window.width.is_finite()
+        || !window.height.is_finite()
+        || window.width <= 0.0
+        || window.height <= 0.0;
+    let invalid_position = !window.pos_x.is_finite()
+        || !window.pos_y.is_finite()
+        || window.pos_x.abs() > MAX_REASONABLE_WINDOW_COORD
+        || window.pos_y.abs() > MAX_REASONABLE_WINDOW_COORD;
+
+    if invalid_size || invalid_position {
+        state.main_window = None;
+        warnings.push(
+            "main window position was invalid or off-screen; opening centered".to_string(),
+        );
     }
 }
 
@@ -610,6 +651,7 @@ fn sanitize_settings(value: &mut serde_json::Value, warnings: &mut Vec<String>) 
     };
 
     if let Some(visual_config) = settings.get_mut("visual_config")
+        && !visual_config.is_null()
         && !is_known_tagged_enum(
             visual_config,
             &["Heatmap", "TimeAndSales", "Kline", "Ladder", "Comparison"],
@@ -989,6 +1031,146 @@ mod tests {
         match load_saved_state_from_path(&path) {
             StateLoadOutcome::Recovered { warnings, .. } => {
                 assert!(warnings.iter().any(|warning| warning.contains("indicator")));
+            }
+            _ => panic!("unexpected outcome"),
+        }
+    }
+
+    #[test]
+    fn null_visual_config_loads_cleanly() {
+        let path = temp_state_path("saved-state.json");
+        let value = serde_json::json!({
+            "saved_state_version": CURRENT_SAVED_STATE_VERSION,
+            "layout_manager": {
+                "layouts": [{
+                    "name": "Default",
+                    "dashboard": {
+                        "pane": {
+                            "Ladder": {
+                                "stream_type": [],
+                                "settings": {
+                                    "tick_multiply": 200,
+                                    "visual_config": null,
+                                    "selected_basis": null
+                                },
+                                "link_group": null
+                            }
+                        },
+                        "popout": []
+                    }
+                }],
+                "active_layout": "Default"
+            }
+        });
+        std::fs::write(&path, serde_json::to_string(&value).unwrap()).unwrap();
+
+        match load_saved_state_from_path(&path) {
+            StateLoadOutcome::Loaded(state) => {
+                assert_eq!(state.layout_manager.layouts.len(), 1);
+            }
+            _ => panic!("unexpected outcome"),
+        }
+    }
+
+    #[test]
+    fn recovered_saved_state_is_persisted() {
+        let path = temp_state_path("saved-state.json");
+        let value = serde_json::json!({
+            "saved_state_version": CURRENT_SAVED_STATE_VERSION,
+            "layout_manager": {
+                "layouts": [{
+                    "name": "Default",
+                    "dashboard": {
+                        "pane": {
+                            "KlineChart": {
+                                "layout": { "splits": [], "autoscale": null },
+                                "kind": "Candles",
+                                "stream_type": [],
+                                "settings": {
+                                    "visual_config": { "RemovedConfig": {} }
+                                },
+                                "indicators": [],
+                                "link_group": null
+                            }
+                        },
+                        "popout": []
+                    }
+                }],
+                "active_layout": "Default"
+            }
+        });
+        std::fs::write(&path, serde_json::to_string(&value).unwrap()).unwrap();
+
+        match load_saved_state_from_path(&path) {
+            StateLoadOutcome::Recovered { warnings, .. } => {
+                assert!(
+                    warnings
+                        .iter()
+                        .any(|warning| warning.contains("visual config"))
+                );
+            }
+            _ => panic!("unexpected outcome"),
+        }
+
+        match load_saved_state_from_path(&path) {
+            StateLoadOutcome::Loaded(state) => {
+                assert_eq!(state.layout_manager.layouts.len(), 1);
+            }
+            _ => panic!("unexpected outcome"),
+        }
+    }
+
+    #[test]
+    fn offscreen_main_window_position_recovers_to_centered_startup() {
+        let path = temp_state_path("saved-state.json");
+        let mut state = valid_state();
+        state.main_window = Some(layout::Window {
+            width: 800.0,
+            height: 600.0,
+            pos_x: -25_600.0,
+            pos_y: -25_600.0,
+        });
+        std::fs::write(&path, serde_json::to_string(&state).unwrap()).unwrap();
+
+        match load_saved_state_from_path(&path) {
+            StateLoadOutcome::Recovered {
+                state, warnings, ..
+            } => {
+                assert!(state.main_window.is_none());
+                assert!(
+                    warnings
+                        .iter()
+                        .any(|warning| warning.contains("off-screen"))
+                );
+            }
+            _ => panic!("unexpected outcome"),
+        }
+
+        match load_saved_state_from_path(&path) {
+            StateLoadOutcome::Loaded(state) => {
+                assert!(state.main_window.is_none());
+            }
+            _ => panic!("unexpected outcome"),
+        }
+    }
+
+    #[test]
+    fn nearby_negative_main_window_position_is_preserved() {
+        let path = temp_state_path("saved-state.json");
+        let mut state = valid_state();
+        state.main_window = Some(layout::Window {
+            width: 800.0,
+            height: 600.0,
+            pos_x: 1912.0,
+            pos_y: -8.0,
+        });
+        std::fs::write(&path, serde_json::to_string(&state).unwrap()).unwrap();
+
+        match load_saved_state_from_path(&path) {
+            StateLoadOutcome::Loaded(state) => {
+                let window = state.main_window.expect("main window should be preserved");
+                assert_eq!(window.pos_x, 1912.0);
+                assert_eq!(window.pos_y, -8.0);
             }
             _ => panic!("unexpected outcome"),
         }
