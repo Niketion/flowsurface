@@ -88,6 +88,7 @@ pub fn setup(is_debug: bool) -> Result<(), data::log::Error> {
         .level_for("flowsurface_exchange", level_filter)
         .level_for("flowsurface_data", level_filter)
         .level_for("flowsurface", level_filter)
+        .level_for("marketdata", level_filter)
         .chain(io_sink)
         .chain(Box::new(DebugTerminalLogger) as Box<dyn Write + Send>)
         .apply()?;

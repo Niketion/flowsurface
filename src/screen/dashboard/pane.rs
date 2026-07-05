@@ -471,6 +471,20 @@ impl State {
         }
     }
 
+    pub fn insert_hist_oi_partial(&mut self, req_id: Option<uuid::Uuid>, oi: &[OpenInterest]) {
+        match &mut self.content {
+            Content::Kline { chart, .. } => {
+                let Some(chart) = chart else {
+                    panic!("Kline chart wasn't initialized when inserting open interest");
+                };
+                chart.insert_open_interest_partial(req_id, oi);
+            }
+            _ => {
+                log::error!("pane content not candlestick");
+            }
+        }
+    }
+
     pub fn insert_hist_klines(
         &mut self,
         req_id: Option<uuid::Uuid>,
@@ -499,6 +513,84 @@ impl State {
                         return;
                     }
                     chart.insert_hist_klines(id, klines);
+                } else {
+                    let (raw_trades, tick_size) = (chart.raw_trades(), chart.tick_size());
+                    let layout = chart.chart_layout();
+                    let visual_config = chart.visual_config();
+
+                    *chart = KlineChart::new(
+                        layout,
+                        Basis::Time(timeframe),
+                        tick_size,
+                        klines,
+                        raw_trades,
+                        indicators,
+                        ticker_info,
+                        chart.kind(),
+                        Some(visual_config),
+                    );
+                }
+            }
+            Content::Comparison(chart) => {
+                let Some(chart) = chart else {
+                    panic!("Comparison chart wasn't initialized when inserting klines");
+                };
+
+                if let Some(id) = req_id {
+                    if chart.timeframe != timeframe {
+                        log::warn!(
+                            "KLINE StaleFetch | pane={} req={} fetched_timeframe={:?} current_timeframe={:?} count={} reason=comparison_timeframe_mismatch",
+                            fetcher::short_id(self.id),
+                            fetcher::short_id(id),
+                            timeframe,
+                            chart.timeframe,
+                            klines.len()
+                        );
+                        return;
+                    }
+                    chart.insert_history(id, ticker_info, klines);
+                } else {
+                    *chart = ComparisonChart::new(
+                        Basis::Time(timeframe),
+                        &[ticker_info],
+                        Some(chart.serializable_config()),
+                    );
+                }
+            }
+            _ => {
+                log::error!("pane content not candlestick or footprint");
+            }
+        }
+    }
+
+    pub fn insert_hist_klines_partial(
+        &mut self,
+        req_id: Option<uuid::Uuid>,
+        timeframe: Timeframe,
+        ticker_info: TickerInfo,
+        klines: &[Kline],
+    ) {
+        match &mut self.content {
+            Content::Kline {
+                chart, indicators, ..
+            } => {
+                let Some(chart) = chart else {
+                    panic!("chart wasn't initialized when inserting klines");
+                };
+
+                if let Some(id) = req_id {
+                    if chart.basis() != Basis::Time(timeframe) {
+                        log::warn!(
+                            "KLINE StaleFetch | pane={} req={} fetched_timeframe={:?} current_basis={:?} count={} reason=timeframe_mismatch",
+                            fetcher::short_id(self.id),
+                            fetcher::short_id(id),
+                            timeframe,
+                            chart.basis(),
+                            klines.len()
+                        );
+                        return;
+                    }
+                    chart.insert_hist_klines_partial(id, klines);
                 } else {
                     let (raw_trades, tick_size) = (chart.raw_trades(), chart.tick_size());
                     let layout = chart.chart_layout();
@@ -1866,6 +1958,7 @@ impl State {
         use crate::connector::fetcher::FetchRange;
         match fetch {
             FetchRange::Trades(_, _)
+            | FetchRange::TradeHydration(_, _)
             | FetchRange::BubbleSummary { .. }
             | FetchRange::Kline(_, _)
             | FetchRange::OpenInterest(_, _) => {

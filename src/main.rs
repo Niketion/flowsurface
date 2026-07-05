@@ -5,6 +5,7 @@ mod chart;
 mod connector;
 mod layout;
 mod logger;
+mod market_data;
 mod market_service;
 mod modal;
 mod notify;

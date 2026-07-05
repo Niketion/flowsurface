@@ -183,6 +183,21 @@ pub struct KlineChart {
     last_tick: Instant,
     visual_config: Config,
     bubble_auto_fetch_at: Option<Instant>,
+    /// The initial TradeHydration target range (from, to). Set on first
+    /// hydration and used to detect backward extension loops.
+    trade_hydration_target: Option<(UnixMs, UnixMs)>,
+    /// The leftmost timestamp that has been hydrated (covers [trade_hydration_left, ...]).
+    /// Used to suppress backward extensions when the visible range has not changed.
+    trade_hydration_left: Option<UnixMs>,
+    /// The visible_earliest that was in effect when the initial hydration target was set.
+    /// Used to detect whether the visible range has changed materially.
+    trade_hydration_initial_visible_earliest: Option<UnixMs>,
+    /// The initial bubble backfill target range. Set on first bubble request.
+    bubble_target_range: Option<(UnixMs, UnixMs)>,
+    /// The rightmost timestamp that has been bubble-covered (covers [..., bubble_right]).
+    bubble_right: Option<UnixMs>,
+    /// The visible_earliest that was in effect when the initial bubble target was set.
+    bubble_initial_visible_earliest: Option<UnixMs>,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -293,6 +308,12 @@ impl KlineChart {
                     study_configurator: study::Configurator::new(),
                     last_tick: Instant::now(),
                     bubble_auto_fetch_at: None,
+                    trade_hydration_target: None,
+                    trade_hydration_left: None,
+                    trade_hydration_initial_visible_earliest: None,
+                    bubble_target_range: None,
+                    bubble_right: None,
+                    bubble_initial_visible_earliest: None,
                 }
             }
             Basis::Tick(interval) => {
@@ -356,6 +377,12 @@ impl KlineChart {
                     study_configurator: study::Configurator::new(),
                     last_tick: Instant::now(),
                     bubble_auto_fetch_at: None,
+                    trade_hydration_target: None,
+                    trade_hydration_left: None,
+                    trade_hydration_initial_visible_earliest: None,
+                    bubble_target_range: None,
+                    bubble_right: None,
+                    bubble_initial_visible_earliest: None,
                 }
             }
         }
@@ -559,6 +586,153 @@ impl KlineChart {
                     }
                 }
 
+                // TradeHydration: request raw trades for CVD/delta indicators on Candles
+                if matches!(self.kind, KlineChartKind::Candles)
+                    && !self.fetching_trades.0
+                    && is_trade_fetch_enabled()
+                {
+                    // Check if any trade-derived features are enabled
+                    let has_trade_derived = self.visual_config.volume_bubbles.enabled;
+                    if has_trade_derived {
+                        if let Some((fetch_from, fetch_to)) = timeseries
+                            .suggest_trade_fetch_range(visible_earliest_ms, visible_latest_ms)
+                        {
+                            if let Some((fetch_from, fetch_to)) =
+                                self.subtract_covered_trade_ranges(fetch_from, fetch_to)
+                            {
+                                // --- Hydration target policy ---
+                                // On first hydration: record the target and initial visible range.
+                                // On subsequent ticks: suppress backward extensions unless the
+                                // visible range has changed materially (user scrolled, etc.).
+                                if let Some(target_left) = self.trade_hydration_left {
+                                    let is_backward_extension = fetch_to <= target_left;
+                                    if is_backward_extension {
+                                        // Check if the visible range has changed materially
+                                        let visible_changed = self
+                                            .trade_hydration_initial_visible_earliest
+                                            .is_none_or(|initial_earliest| {
+                                                // Allow if visible_earliest moved backward by more than
+                                                // 2x the already-hydrated range (material scroll)
+                                                let hydrated_span =
+                                                    target_left.as_u64().saturating_sub(
+                                                        self.trade_hydration_target
+                                                            .map_or(0, |(_, to)| to.as_u64()),
+                                                    );
+                                                let visible_moved = initial_earliest
+                                                    .as_u64()
+                                                    .saturating_sub(visible_earliest_ms.as_u64());
+                                                visible_moved > hydrated_span
+                                                    && visible_earliest_ms < initial_earliest
+                                            });
+                                        if visible_changed {
+                                            log::info!(
+                                                "MARKETDATA TradeHydrationBackwardExtension | pane={} old_left={} new_range={} reason=visible_range_changed",
+                                                crate::connector::fetcher::short_id(
+                                                    uuid::Uuid::nil()
+                                                ),
+                                                crate::connector::fetcher::format_time_short(
+                                                    target_left
+                                                ),
+                                                fetcher::format_time_range(fetch_from, fetch_to)
+                                            );
+                                            // Allow: update target for next cycle
+                                            self.trade_hydration_target =
+                                                Some((fetch_from, fetch_to));
+                                            log::info!(
+                                                "CHART TradeHydration | action=fetch_trades reason=backward_extension range={}",
+                                                fetcher::format_time_range(fetch_from, fetch_to)
+                                            );
+                                            let range =
+                                                FetchRange::TradeHydration(fetch_from, fetch_to);
+                                            if let Some(action) = request_fetch(
+                                                &mut self.request_handler,
+                                                range,
+                                                Some(&self.chart.ticker_info),
+                                            ) {
+                                                self.fetching_trades = (true, None);
+                                                return Some(action);
+                                            } else {
+                                                log::debug!(
+                                                    "CHART TradeHydration | action=suppressed reason=request_handler range={}",
+                                                    fetcher::format_time_range(
+                                                        fetch_from, fetch_to
+                                                    )
+                                                );
+                                            }
+                                        } else {
+                                            log::info!(
+                                                "MARKETDATA TradeHydrationSkipped | pane={} requested={} hydrated_left={} reason=already_hydrated_no_target_change",
+                                                crate::connector::fetcher::short_id(
+                                                    uuid::Uuid::nil()
+                                                ),
+                                                fetcher::format_time_range(fetch_from, fetch_to),
+                                                crate::connector::fetcher::format_time_short(
+                                                    target_left
+                                                )
+                                            );
+                                            // Do not return — fall through to let Bubbles path run if needed
+                                        }
+                                    } else {
+                                        // Forward extension or new range — allow
+                                        log::info!(
+                                            "CHART TradeHydration | action=fetch_trades reason=cvd_delta_indicators range={}",
+                                            fetcher::format_time_range(fetch_from, fetch_to)
+                                        );
+                                        let range =
+                                            FetchRange::TradeHydration(fetch_from, fetch_to);
+                                        if let Some(action) = request_fetch(
+                                            &mut self.request_handler,
+                                            range,
+                                            Some(&self.chart.ticker_info),
+                                        ) {
+                                            self.fetching_trades = (true, None);
+                                            return Some(action);
+                                        } else {
+                                            log::debug!(
+                                                "CHART TradeHydration | action=suppressed reason=request_handler range={}",
+                                                fetcher::format_time_range(fetch_from, fetch_to)
+                                            );
+                                        }
+                                    }
+                                } else {
+                                    // First hydration request — record target and allow
+                                    log::info!(
+                                        "MARKETDATA TradeHydrationTarget | pane={} range={} reason=startup",
+                                        crate::connector::fetcher::short_id(uuid::Uuid::nil()),
+                                        fetcher::format_time_range(fetch_from, fetch_to)
+                                    );
+                                    self.trade_hydration_target = Some((fetch_from, fetch_to));
+                                    self.trade_hydration_initial_visible_earliest =
+                                        Some(visible_earliest_ms);
+                                    let range = FetchRange::TradeHydration(fetch_from, fetch_to);
+                                    if let Some(action) = request_fetch(
+                                        &mut self.request_handler,
+                                        range,
+                                        Some(&self.chart.ticker_info),
+                                    ) {
+                                        self.fetching_trades = (true, None);
+                                        return Some(action);
+                                    } else {
+                                        log::debug!(
+                                            "CHART TradeHydration | action=suppressed reason=request_handler range={}",
+                                            fetcher::format_time_range(fetch_from, fetch_to)
+                                        );
+                                    }
+                                }
+                            } else {
+                                log::debug!(
+                                    "CHART TradeHydration | action=skip reason=already_covered range={}",
+                                    fetcher::format_time_range(fetch_from, fetch_to)
+                                );
+                            }
+                        } else {
+                            log::debug!(
+                                "CHART TradeHydration | action=skip reason=no_missing_trades"
+                            );
+                        }
+                    }
+                }
+
                 if matches!(self.kind, KlineChartKind::Candles)
                     && self.visual_config.volume_bubbles.enabled
                 {
@@ -603,6 +777,21 @@ impl KlineChart {
                                         .use_raw_trades_when_available
                                         && self.is_trade_range_covered(fetch_from, fetch_to)
                                     {
+                                        let raw_trades_total = self.raw_trades.len();
+                                        let raw_trades_in_range = self
+                                            .raw_trades
+                                            .iter()
+                                            .filter(|t| t.time >= fetch_from && t.time <= fetch_to)
+                                            .count();
+
+                                        // Count chart candles that exist in the requested range
+                                        let chart_candles_in_range = match &self.data_source {
+                                            PlotData::TimeBased(ts) => {
+                                                ts.datapoints.range(fetch_from..=fetch_to).count()
+                                            }
+                                            PlotData::TickBased(_) => 0,
+                                        };
+
                                         let summaries = self.bubble_summaries_from_raw_trades(
                                             fetch_from,
                                             fetch_to,
@@ -621,16 +810,61 @@ impl KlineChart {
                                             .iter()
                                             .map(|summary| summary.candidates.len())
                                             .sum::<usize>();
+
+                                        // Validate the reuse result before marking complete.
+                                        // Empty summaries are only valid when there truly are
+                                        // no candles and no trades in the requested range.
+                                        let valid_reuse = if summaries.is_empty() {
+                                            if raw_trades_in_range > 0 {
+                                                log::warn!(
+                                                    "MARKETDATA BubbleReuseInvalid | range={} raw_trades_total={} raw_trades_in_range={} chart_candles_in_range={} summaries=0 candidates=0 reason=no_candidates_from_trades",
+                                                    fetcher::format_time_range(
+                                                        fetch_from, fetch_to
+                                                    ),
+                                                    raw_trades_total,
+                                                    raw_trades_in_range,
+                                                    chart_candles_in_range
+                                                );
+                                                false
+                                            } else if chart_candles_in_range == 0 {
+                                                // No candles and no trades — range is empty, mark complete
+                                                true
+                                            } else {
+                                                log::warn!(
+                                                    "MARKETDATA BubbleReuseInvalid | range={} raw_trades_total={} raw_trades_in_range={} chart_candles_in_range={} summaries=0 candidates=0 reason=no_trades_in_range_with_candles",
+                                                    fetcher::format_time_range(
+                                                        fetch_from, fetch_to
+                                                    ),
+                                                    raw_trades_total,
+                                                    raw_trades_in_range,
+                                                    chart_candles_in_range
+                                                );
+                                                false
+                                            }
+                                        } else {
+                                            true
+                                        };
+
+                                        if valid_reuse {
+                                            log::info!(
+                                                "BUBBLE Summary Reuse | source=footprint_raw_trades range={} candles={} candidates={} raw_trades_total={} raw_trades_in_range={} chart_candles_in_range={}",
+                                                fetcher::format_time_range(fetch_from, fetch_to),
+                                                summaries.len(),
+                                                candidates,
+                                                raw_trades_total,
+                                                raw_trades_in_range,
+                                                chart_candles_in_range
+                                            );
+                                            self.insert_bubble_summaries(
+                                                summaries, fetch_from, fetch_to, 0, 0, None,
+                                            );
+                                            return None;
+                                        }
+                                        // Invalid reuse: fall through to coordinator-derived path
                                         log::info!(
-                                            "BUBBLE Summary Reuse | source=footprint_raw_trades range={} candles={} candidates={}",
-                                            fetcher::format_time_range(fetch_from, fetch_to),
-                                            summaries.len(),
-                                            candidates
+                                            "MARKETDATA BubbleReuseFallback | reason=invalid_reuse range={}",
+                                            fetcher::format_time_range(fetch_from, fetch_to)
                                         );
-                                        self.insert_bubble_summaries(
-                                            summaries, fetch_from, fetch_to, 0, 0, None,
-                                        );
-                                        return None;
                                     }
 
                                     if self.bubble_auto_fetch_at.is_some_and(|last_fetch| {
@@ -643,41 +877,51 @@ impl KlineChart {
                                         return None;
                                     }
 
-                                    // Cap to the most recent portion to avoid
-                                    // huge single-shot Binance aggTrades fetches.
-                                    let max_range_ms = self
-                                        .visual_config
-                                        .volume_bubbles
-                                        .max_history_minutes_per_request
-                                        .max(1)
-                                        * 60
-                                        * 1_000;
-                                    let range_ms =
-                                        fetch_to.as_u64().saturating_sub(fetch_from.as_u64());
-                                    let (fetch_from, fetch_to, was_capped) = if range_ms
-                                        > max_range_ms
+                                    // Log the full logical range as the Bubble requirement.
+                                    // The coordinator handles chunking large ranges into network segments.
+                                    // --- Bubble target policy ---
+                                    // Record initial target on first request; suppress old-gap
+                                    // backfill unless the visible range moved backward.
+                                    if let Some((target_from, _target_to)) =
+                                        self.bubble_target_range
                                     {
-                                        let capped_from = UnixMs::new(
-                                            fetch_to.as_u64().saturating_sub(max_range_ms),
-                                        );
-                                        log::info!(
-                                            "BUBBLE Summary Cap | original_range={orig} capped_range={capped} session={session:?}",
-                                            orig = fetcher::format_time_range(fetch_from, fetch_to),
-                                            capped =
-                                                fetcher::format_time_range(capped_from, fetch_to),
-                                        );
-                                        (capped_from, fetch_to, true)
+                                        let is_old_gap = fetch_to <= target_from;
+                                        if is_old_gap {
+                                            let visible_changed = self
+                                                .bubble_initial_visible_earliest
+                                                .is_none_or(|initial_earliest| {
+                                                    let initial_ms = initial_earliest.as_u64();
+                                                    let current_ms = visible_earliest_ms.as_u64();
+                                                    // Allow only if visible_earliest moved backward
+                                                    current_ms < initial_ms
+                                                });
+                                            if !visible_changed {
+                                                log::info!(
+                                                    "MARKETDATA BubbleSkipped | range={} reason=old_gap_no_visible_change target_from={}",
+                                                    fetcher::format_time_range(
+                                                        fetch_from, fetch_to
+                                                    ),
+                                                    fetcher::format_time_short(target_from)
+                                                );
+                                                return None;
+                                            }
+                                        }
                                     } else {
-                                        (fetch_from, fetch_to, false)
-                                    };
-
-                                    if !was_capped {
+                                        // First bubble request — record target
+                                        self.bubble_target_range = Some((fetch_from, fetch_to));
+                                        self.bubble_initial_visible_earliest =
+                                            Some(visible_earliest_ms);
                                         log::info!(
-                                            "CHART Bubbles | action=fetch_summary session={:?} range={}",
-                                            session,
+                                            "MARKETDATA BubbleTarget | range={} reason=startup_or_visible",
                                             fetcher::format_time_range(fetch_from, fetch_to)
                                         );
                                     }
+
+                                    log::info!(
+                                        "MARKETDATA BubbleRequirement | source=chart session={:?} range={}",
+                                        session,
+                                        fetcher::format_time_range(fetch_from, fetch_to)
+                                    );
                                     let range = FetchRange::BubbleSummary {
                                         from: fetch_from,
                                         to: fetch_to,
@@ -725,6 +969,13 @@ impl KlineChart {
                             );
                         }
                     }
+                } else if matches!(self.kind, KlineChartKind::Candles)
+                    && !self.visual_config.volume_bubbles.enabled
+                {
+                    log::info!(
+                        "MARKETDATA BubbleSkipped | pane={} reason=disabled",
+                        crate::connector::fetcher::short_id(uuid::Uuid::nil())
+                    );
                 }
 
                 // priority 3, indicators
@@ -856,6 +1107,9 @@ impl KlineChart {
         self.covered_trade_ranges.clear();
         self.covered_bubble_summary_ranges.clear();
         self.bubble_auto_fetch_at = None;
+        self.trade_hydration_target = None;
+        self.trade_hydration_left = None;
+        self.trade_hydration_initial_visible_earliest = None;
     }
 
     /// Check if a fetch result should be applied or discarded as stale.
@@ -889,6 +1143,10 @@ impl KlineChart {
 
     pub fn mark_trade_request_completed(&mut self, req_id: uuid::Uuid) {
         self.request_handler.mark_completed(req_id);
+    }
+
+    pub fn mark_request_completed_if_present(&mut self, req_id: uuid::Uuid) -> bool {
+        self.request_handler.mark_completed_if_present(req_id)
     }
 
     pub fn mark_request_failed(&mut self, req_id: uuid::Uuid, error: String) {
@@ -1086,6 +1344,13 @@ impl KlineChart {
             }
             self.mark_trade_range_covered(from, to);
             self.mark_trade_buckets_checked(from, to);
+        } else if let Some(FetchRange::TradeHydration(from, to)) = fetch {
+            // Update the leftmost hydrated boundary to prevent backward loops
+            self.trade_hydration_left = Some(match self.trade_hydration_left {
+                Some(left) => left.min(from),
+                None => from,
+            });
+            self.mark_trade_range_covered(from, to);
         }
 
         self.fetching_trades = (false, None);
@@ -1139,6 +1404,11 @@ impl KlineChart {
         }
         self.mark_bubble_summary_range_covered(from, to);
         self.mark_trade_buckets_checked(from, to);
+        // Track rightmost bubble-covered boundary for target policy
+        self.bubble_right = Some(match self.bubble_right {
+            Some(right) => right.max(to),
+            None => to,
+        });
     }
 
     fn mark_trade_buckets_checked(&mut self, from: UnixMs, to: UnixMs) {
@@ -1494,28 +1764,85 @@ impl KlineChart {
         raw_discarded: usize,
         req_id: Option<uuid::Uuid>,
     ) {
+        self.insert_bubble_summaries_with_completion(
+            summaries,
+            from,
+            to,
+            trades_seen,
+            raw_discarded,
+            req_id,
+            true,
+        );
+    }
+
+    pub fn update_bubble_summaries_partial(
+        &mut self,
+        summaries: Vec<BubbleVolumeSummary>,
+        from: UnixMs,
+        to: UnixMs,
+        trades_seen: usize,
+        raw_discarded: usize,
+        req_id: Option<uuid::Uuid>,
+    ) {
+        self.insert_bubble_summaries_with_completion(
+            summaries,
+            from,
+            to,
+            trades_seen,
+            raw_discarded,
+            req_id,
+            false,
+        );
+    }
+
+    fn insert_bubble_summaries_with_completion(
+        &mut self,
+        summaries: Vec<BubbleVolumeSummary>,
+        from: UnixMs,
+        to: UnixMs,
+        trades_seen: usize,
+        raw_discarded: usize,
+        req_id: Option<uuid::Uuid>,
+        complete: bool,
+    ) {
         let candles = summaries.len();
         let candidates = summaries
             .iter()
             .map(|summary| summary.candidates.len())
             .sum::<usize>();
 
+        let raw_trades_total = self.raw_trades.len();
+        let raw_trades_in_range = self
+            .raw_trades
+            .iter()
+            .filter(|t| t.time >= from && t.time <= to)
+            .count();
+        let chart_candles_in_range = match &self.data_source {
+            PlotData::TimeBased(ts) => ts.datapoints.range(from..=to).count(),
+            PlotData::TickBased(_) => 0,
+        };
+
         log::info!(
-            "BUBBLE Summary Insert | req={} range={} candles={} candidates={} trades_seen={} raw_discarded={} raw_trades_kept={}",
+            "BUBBLE Summary Insert | req={} range={} candles={} candidates={} trades_seen={} raw_discarded={} raw_trades_total={} raw_trades_in_range={} chart_candles_in_range={} complete={}",
             fetcher::format_req_id(req_id),
             fetcher::format_time_range(from, to),
             candles,
             candidates,
             trades_seen,
             raw_discarded,
-            self.raw_trades.len()
+            raw_trades_total,
+            raw_trades_in_range,
+            chart_candles_in_range,
+            complete
         );
 
         if let PlotData::TimeBased(ref mut timeseries) = self.data_source {
             timeseries.insert_bubble_summaries(summaries);
         }
 
-        self.complete_bubble_summary_fetch(req_id, from, to);
+        if complete {
+            self.complete_bubble_summary_fetch(req_id, from, to);
+        }
         self.invalidate(None);
     }
 
@@ -1527,6 +1854,11 @@ impl KlineChart {
         price_step: PriceStep,
         max_candidates_per_candle: usize,
     ) -> Vec<BubbleVolumeSummary> {
+        // NOTE: This chart-local method is used ONLY as an optimization for the
+        // VolumeBubbles reuse path when raw trades are already in memory.
+        // SVP (SessionVolumeProfile) must NOT use this path — it must use the
+        // coordinator-derived path (MarketDataCoordinator::compute_bubble_summaries)
+        // which queries MarketDataStore directly from raw Trades.
         #[derive(Clone, Copy, Default)]
         struct Accum {
             buy_qty: Qty,
@@ -1598,12 +1930,25 @@ impl KlineChart {
     }
 
     pub fn insert_hist_klines(&mut self, req_id: uuid::Uuid, klines_raw: &[Kline]) {
+        self.insert_hist_klines_with_completion(req_id, klines_raw, true);
+    }
+
+    pub fn insert_hist_klines_partial(&mut self, req_id: uuid::Uuid, klines_raw: &[Kline]) {
+        self.insert_hist_klines_with_completion(req_id, klines_raw, false);
+    }
+
+    fn insert_hist_klines_with_completion(
+        &mut self,
+        req_id: uuid::Uuid,
+        klines_raw: &[Kline],
+        complete_request: bool,
+    ) {
         let count = klines_raw.len();
         let earliest = klines_raw.first().map(|k| k.time);
         let latest = klines_raw.last().map(|k| k.time);
 
         log::info!(
-            "DATA Klines | req={} records={count} first={} last={}",
+            "DATA Klines | req={} records={count} first={} last={} complete={complete_request}",
             fetcher::short_id(req_id),
             fetcher::format_optional_time(earliest),
             fetcher::format_optional_time(latest)
@@ -1619,20 +1964,28 @@ impl KlineChart {
                     .filter_map(Option::as_mut)
                     .for_each(|indi| indi.on_insert_klines(klines_raw, &self.data_source));
 
-                if klines_raw.is_empty() {
-                    log::warn!(
-                        "DATA Klines Complete | req={} records=0 transition=failed reason=no_data",
-                        fetcher::short_id(req_id)
-                    );
-                    self.request_handler
-                        .mark_failed(req_id, "No data received".to_string());
+                if complete_request {
+                    if klines_raw.is_empty() {
+                        log::warn!(
+                            "DATA Klines Complete | req={} records=0 transition=failed reason=no_data",
+                            fetcher::short_id(req_id)
+                        );
+                        self.request_handler
+                            .mark_failed(req_id, "No data received".to_string());
+                    } else {
+                        log::debug!(
+                            "DATA Klines Complete | req={} records={} transition=completed",
+                            fetcher::short_id(req_id),
+                            klines_raw.len()
+                        );
+                        self.request_handler.mark_completed(req_id);
+                    }
                 } else {
                     log::debug!(
-                        "DATA Klines Complete | req={} records={} transition=completed",
+                        "DATA Klines Partial | req={} records={} action=insert_only",
                         fetcher::short_id(req_id),
                         klines_raw.len()
                     );
-                    self.request_handler.mark_completed(req_id);
                 }
                 self.invalidate(None);
             }
@@ -1641,13 +1994,34 @@ impl KlineChart {
     }
 
     pub fn insert_open_interest(&mut self, req_id: Option<uuid::Uuid>, oi_data: &[OIData]) {
-        if let Some(req_id) = req_id {
-            if oi_data.is_empty() {
-                self.request_handler
-                    .mark_failed(req_id, "No data received".to_string());
-            } else {
-                self.request_handler.mark_completed(req_id);
+        self.insert_open_interest_with_completion(req_id, oi_data, true);
+    }
+
+    pub fn insert_open_interest_partial(&mut self, req_id: Option<uuid::Uuid>, oi_data: &[OIData]) {
+        self.insert_open_interest_with_completion(req_id, oi_data, false);
+    }
+
+    fn insert_open_interest_with_completion(
+        &mut self,
+        req_id: Option<uuid::Uuid>,
+        oi_data: &[OIData],
+        complete_request: bool,
+    ) {
+        if complete_request {
+            if let Some(req_id) = req_id {
+                if oi_data.is_empty() {
+                    self.request_handler
+                        .mark_failed(req_id, "No data received".to_string());
+                } else {
+                    self.request_handler.mark_completed(req_id);
+                }
             }
+        } else {
+            log::debug!(
+                "DATA OI Partial | req={} records={} action=insert_only",
+                req_id.map_or("-".to_string(), fetcher::short_id),
+                oi_data.len()
+            );
         }
 
         if let Some(indi) = self.indicators[KlineIndicator::OpenInterest].as_mut() {

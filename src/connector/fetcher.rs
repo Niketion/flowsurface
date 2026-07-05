@@ -119,6 +119,9 @@ pub fn format_fetch_range(fetch: &FetchRange) -> String {
         FetchRange::Trades(from, to) => {
             format!("Trades {}", format_time_range(*from, *to))
         }
+        FetchRange::TradeHydration(from, to) => {
+            format!("TradeHydration {}", format_time_range(*from, *to))
+        }
         FetchRange::BubbleSummary {
             from,
             to,
@@ -323,8 +326,10 @@ impl RequestHandler {
 
     pub fn has_pending_trade_requests(&self) -> bool {
         self.requests.values().any(|request| {
-            matches!(request.fetch_type, FetchRange::Trades(_, _))
-                && matches!(request.status, RequestStatus::Pending)
+            matches!(
+                request.fetch_type,
+                FetchRange::Trades(_, _) | FetchRange::TradeHydration(_, _)
+            ) && matches!(request.status, RequestStatus::Pending)
         })
     }
 
@@ -574,9 +579,13 @@ impl RequestHandler {
             superseded
         );
 
-        if let FetchRange::Trades(new_from, new_to) = fetch {
+        if let FetchRange::Trades(new_from, new_to) | FetchRange::TradeHydration(new_from, new_to) =
+            fetch
+        {
             for (existing_id, existing_req) in &self.requests {
-                let FetchRange::Trades(exist_from, exist_to) = existing_req.fetch_type else {
+                let (FetchRange::Trades(exist_from, exist_to)
+                | FetchRange::TradeHydration(exist_from, exist_to)) = existing_req.fetch_type
+                else {
                     continue;
                 };
 
@@ -817,21 +826,43 @@ impl RequestHandler {
             };
         }
 
-        log::info!(
-            "FETCH Queued | {} req={} pending_after={} generation={}",
-            format_fetch_range(&fetch),
-            short_id(id),
-            pending + 1,
-            self.generation_id
-        );
+        if let FetchRange::BubbleSummary { from, to, .. } = fetch {
+            log::info!(
+                target: "marketdata",
+                "MARKETDATA BubbleRequirement | req={} range={} pending_after={} generation={} owner=chart_local",
+                short_id(id),
+                format_time_range(from, to),
+                pending + 1,
+                self.generation_id
+            );
+        } else {
+            log::info!(
+                "FETCH Queued | {} req={} pending_after={} generation={}",
+                format_fetch_range(&fetch),
+                short_id(id),
+                pending + 1,
+                self.generation_id
+            );
+        }
         self.requests.insert(id, request);
-        log::info!(
-            "FETCH PendingInsert | req={} {} pending_after={} generation={}",
-            short_id(id),
-            format_fetch_range(&fetch),
-            pending + 1,
-            self.generation_id
-        );
+        if let FetchRange::BubbleSummary { from, to, .. } = fetch {
+            log::info!(
+                target: "marketdata",
+                "MARKETDATA BubblePendingInsert | req={} range={} pending_after={} generation={} owner=chart_local",
+                short_id(id),
+                format_time_range(from, to),
+                pending + 1,
+                self.generation_id
+            );
+        } else {
+            log::info!(
+                "FETCH PendingInsert | req={} {} pending_after={} generation={}",
+                short_id(id),
+                format_fetch_range(&fetch),
+                pending + 1,
+                self.generation_id
+            );
+        }
         Ok(Some(id))
     }
 
@@ -874,6 +905,15 @@ impl RequestHandler {
             );
         } else {
             log::warn!("FETCH NotFound | req={}", short_id(id));
+        }
+    }
+
+    pub fn mark_completed_if_present(&mut self, id: Uuid) -> bool {
+        if self.requests.contains_key(&id) {
+            self.mark_completed(id);
+            true
+        } else {
+            false
         }
     }
 
@@ -927,6 +967,8 @@ pub enum FetchRange {
     Kline(UnixMs, UnixMs),
     OpenInterest(UnixMs, UnixMs),
     Trades(UnixMs, UnixMs),
+    /// Raw trades for CVD/delta indicators (distinct from Footprint trades)
+    TradeHydration(UnixMs, UnixMs),
     BubbleSummary {
         from: UnixMs,
         to: UnixMs,
@@ -941,7 +983,8 @@ impl FetchRange {
         match *self {
             FetchRange::Kline(from, to)
             | FetchRange::OpenInterest(from, to)
-            | FetchRange::Trades(from, to) => from < to,
+            | FetchRange::Trades(from, to)
+            | FetchRange::TradeHydration(from, to) => from < to,
             FetchRange::BubbleSummary { from, to, .. } => from < to,
         }
     }
@@ -976,6 +1019,9 @@ impl FetchRequest {
                 e1 == e2 && s1 == s2
             }
             (FetchRange::Trades(s1, e1), FetchRange::Trades(s2, e2)) => e1 == e2 && s1 == s2,
+            (FetchRange::TradeHydration(s1, e1), FetchRange::TradeHydration(s2, e2)) => {
+                e1 == e2 && s1 == s2
+            }
             (
                 FetchRange::BubbleSummary {
                     from: s1,
@@ -1301,6 +1347,134 @@ pub fn request_fetch(
             } else {
                 log::warn!(
                     "TRADE Skip | pane={} req={} reason=no_trade_stream ready_streams={}",
+                    short_id(pane_id),
+                    short_id(req_id),
+                    format_streams(ready_streams)
+                );
+            }
+        }
+        FetchRange::TradeHydration(from_time, to_time) => {
+            // TradeHydration uses the same fetching mechanism as Trades
+            let trade_info = ready_streams.iter().find_map(|stream| {
+                if let StreamKind::Trades { ticker_info } = stream {
+                    Some((*ticker_info, pane_id, *stream))
+                } else {
+                    None
+                }
+            });
+
+            if let Some((ticker_info, pane_id, stream)) = trade_info {
+                let is_binance = matches!(
+                    ticker_info.exchange(),
+                    Exchange::BinanceSpot | Exchange::BinanceLinear | Exchange::BinanceInverse
+                );
+
+                if is_binance {
+                    let data_path = data::data_path(Some("market_data/binance/"));
+                    log::info!(
+                        "TRADE_HYDRATION Start | venue={} symbol={} range={} req={} pane={} stream={} path={}",
+                        format_venue(&ticker_info),
+                        format_symbol(&ticker_info),
+                        format_time_range(from_time, to_time),
+                        short_id(req_id),
+                        short_id(pane_id),
+                        format_stream(&stream),
+                        data_path.display()
+                    );
+
+                    let (task, handle) = Task::sip(
+                        fetch_trades_batched(
+                            handles.clone(),
+                            ticker_info,
+                            from_time,
+                            to_time,
+                            data_path,
+                            req_id,
+                        ),
+                        move |batch| {
+                            log::debug!(
+                                "TRADE_HYDRATION Batch | venue={} symbol={} trades={} req={}",
+                                format_venue(&ticker_info),
+                                format_symbol(&ticker_info),
+                                batch.len(),
+                                short_id(req_id)
+                            );
+                            let data = FetchedData::Trades {
+                                batch,
+                                until_time: to_time,
+                                req_id: Some(req_id),
+                            };
+
+                            FetchUpdate::Data {
+                                layout_id,
+                                pane_id,
+                                data,
+                                stream,
+                            }
+                        },
+                        move |result| match result {
+                            Ok(empty_covered_tail) => {
+                                log::info!(
+                                    "TRADE_HYDRATION Done | venue={} symbol={} req={} range={} tail={}",
+                                    format_venue(&ticker_info),
+                                    format_symbol(&ticker_info),
+                                    short_id(req_id),
+                                    format_time_range(from_time, to_time),
+                                    empty_covered_tail
+                                        .map(|(f, t)| format_time_range(f, t))
+                                        .unwrap_or_else(|| "-".to_string())
+                                );
+                                FetchUpdate::Status {
+                                    pane_id,
+                                    status: FetchTaskStatus::Completed {
+                                        req_id: Some(req_id),
+                                        fetch: Some(FetchRange::TradeHydration(from_time, to_time)),
+                                        empty_covered_tail,
+                                    },
+                                }
+                            }
+                            Err(err) => {
+                                let terminal = match &err {
+                                    AdapterError::InvalidRequest(message)
+                                        if message.starts_with("TimedOut:") =>
+                                    {
+                                        "TimedOut"
+                                    }
+                                    _ => "Failed",
+                                };
+                                log::error!(
+                                    "TRADE_HYDRATION {terminal} | venue={} symbol={} req={} range={} error={err}",
+                                    format_venue(&ticker_info),
+                                    format_symbol(&ticker_info),
+                                    short_id(req_id),
+                                    format_time_range(from_time, to_time)
+                                );
+                                FetchUpdate::Error {
+                                    pane_id,
+                                    error: err.ui_message(),
+                                    req_id: Some(req_id),
+                                    fetch: Some(FetchRange::TradeHydration(from_time, to_time)),
+                                }
+                            }
+                        },
+                    )
+                    .abortable();
+
+                    on_trade_handle(handle.abort_on_drop());
+
+                    return task;
+                } else {
+                    log::warn!(
+                        "TRADE_HYDRATION Skip | venue={} symbol={} req={} reason=unsupported_exchange range={}",
+                        format_venue(&ticker_info),
+                        format_symbol(&ticker_info),
+                        short_id(req_id),
+                        format_time_range(from_time, to_time)
+                    );
+                }
+            } else {
+                log::warn!(
+                    "TRADE_HYDRATION Skip | pane={} req={} reason=no_trade_stream ready_streams={}",
                     short_id(pane_id),
                     short_id(req_id),
                     format_streams(ready_streams)
@@ -1652,10 +1826,28 @@ pub fn kline_fetch_task(
                 let mut result = handles.fetch_klines(ticker_info, timeframe, range).await;
                 let raw_count = result.as_ref().map_or(0, Vec::len);
                 if let (Ok(klines), Some((from, to))) = (&mut result, range) {
-                    let timeframe_ms = timeframe.to_milliseconds();
-                    klines.retain(|kline| {
-                        kline.time.saturating_add(timeframe_ms) > from && kline.time <= to
-                    });
+                    let before_filter = klines.len();
+                    klines.retain(|kline| kline.time >= from && kline.time < to);
+                    let after_filter = klines.len();
+                    if after_filter != before_filter {
+                        log::info!(
+                            "MARKETDATA KlineOutOfRangeFiltered | worker_req={} requested={}->{} before={} after={}",
+                            format_req_id(req_id),
+                            format_time_short(from),
+                            format_time_short(to),
+                            before_filter,
+                            after_filter
+                        );
+                    }
+                    if klines.is_empty() && before_filter > 0 {
+                        log::info!(
+                            "MARKETDATA KlineWorkerEmpty | worker_req={} requested={}->{} raw_records={}",
+                            format_req_id(req_id),
+                            format_time_short(from),
+                            format_time_short(to),
+                            before_filter
+                        );
+                    }
                 }
 
                 match &result {
@@ -1830,12 +2022,14 @@ pub fn fetch_trades_batched(
                 Ok(Ok(batch)) => {
                     let elapsed = request_started.elapsed().as_millis() as u64;
                     let prev_latest_trade_t = latest_trade_t;
+                    let first_before = batch.first().map(|trade| trade.time);
+                    let last_before = batch.last().map(|trade| trade.time);
                     log::debug!(
                         "TRADE Response | venue={venue} symbol={symbol} req={} request_idx={request_count} trades={} first={} last={} duration={}",
                         short_id(req_id),
                         batch.len(),
-                        format_optional_time(batch.first().map(|trade| trade.time)),
-                        format_optional_time(batch.last().map(|trade| trade.time)),
+                        format_optional_time(first_before),
+                        format_optional_time(last_before),
                         format_duration_ms(elapsed)
                     );
 
@@ -1850,7 +2044,33 @@ pub fn fetch_trades_batched(
                         break;
                     }
 
-                    latest_trade_t = batch.last().map_or(latest_trade_t, |trade| trade.time);
+                    let raw_batch_len = batch.len();
+                    let raw_last_time = batch.last().map_or(latest_trade_t, |trade| trade.time);
+                    let filtered_batch = batch
+                        .into_iter()
+                        .filter(|trade| trade.time >= from_time && trade.time < to_time)
+                        .collect::<Vec<_>>();
+                    latest_trade_t = raw_last_time;
+                    let after_len = filtered_batch.len();
+                    if after_len != raw_batch_len {
+                        log::info!(
+                            "MARKETDATA TradeOutOfRangeFiltered | worker_req={} requested={} before={} after={} first_before={} last_before={}",
+                            short_id(req_id),
+                            format_time_range(from_time, to_time),
+                            raw_batch_len,
+                            after_len,
+                            format_optional_time(first_before),
+                            format_optional_time(last_before)
+                        );
+                    }
+                    if after_len == 0 && first_before.is_some_and(|first| first >= to_time) {
+                        log::info!(
+                            "MARKETDATA WorkerEmpty | worker_req={} requested={} reason=no_trades_in_requested_range",
+                            short_id(req_id),
+                            format_time_range(from_time, to_time)
+                        );
+                        break;
+                    }
                     if latest_trade_t <= prev_latest_trade_t {
                         consecutive_no_progress += 1;
                         let remaining_ms = to_time.saturating_diff(latest_trade_t);
@@ -1904,7 +2124,7 @@ pub fn fetch_trades_batched(
                     } else {
                         consecutive_no_progress = 0;
                     }
-                    total_trades += batch.len();
+                    total_trades += filtered_batch.len();
 
                     // Progress log every 5 seconds or every 10 requests
                     if last_progress_log.elapsed().as_secs() >= 5
@@ -1920,7 +2140,9 @@ pub fn fetch_trades_batched(
                         last_progress_log = Instant::now();
                     }
 
-                    let () = progress.send(batch).await;
+                    if !filtered_batch.is_empty() {
+                        let () = progress.send(filtered_batch).await;
+                    }
                 }
                 Ok(Err(err)) => {
                     log::error!(
@@ -2337,5 +2559,48 @@ mod tests {
         // Unknown request should be treated as stale
         assert!(handler.is_stale_generation(random_id));
         assert_eq!(handler.request_generation(random_id), None);
+    }
+
+    #[test]
+    fn worker_req_id_completion_does_not_complete_chart_local_req_id() {
+        let mut handler = RequestHandler::default();
+        let chart_req = handler
+            .add_request(FetchRange::Trades(UnixMs::new(1000), UnixMs::new(2000)))
+            .unwrap()
+            .unwrap();
+        let worker_req = Uuid::new_v4();
+
+        handler.mark_completed(worker_req);
+
+        let request = handler.requests.get(&chart_req).unwrap();
+        assert_eq!(request.status, RequestStatus::Pending);
+        assert!(handler.request_generation(worker_req).is_none());
+    }
+
+    #[test]
+    fn bubble_chart_local_req_id_completes_once() {
+        let mut handler = RequestHandler::default();
+        let req = handler
+            .add_request(FetchRange::BubbleSummary {
+                from: UnixMs::new(1000),
+                to: UnixMs::new(2000),
+                timeframe_ms: 60_000,
+                price_step: exchange::unit::PriceStep {
+                    units: 100_000_000_000,
+                },
+                max_candidates_per_candle: 4,
+            })
+            .unwrap()
+            .unwrap();
+
+        handler.mark_completed(req);
+        handler.mark_completed(req);
+
+        let (_, completed, _, _) = handler.status_counts();
+        assert_eq!(completed, 1);
+        assert!(matches!(
+            handler.requests.get(&req).unwrap().status,
+            RequestStatus::Completed(_)
+        ));
     }
 }

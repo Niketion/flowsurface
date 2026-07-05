@@ -119,13 +119,22 @@ impl KlineIndicatorImpl for VolumeIndicator {
         old_dp_len: usize,
         source: &PlotData<KlineDataPoint>,
     ) {
-        let Some(data) = self.data.tick_mut() else {
-            return;
-        };
-
         match source {
-            PlotData::TimeBased(_) => {}
+            PlotData::TimeBased(_) => {
+                // Option A: TimeBased Volume panel reflects Kline OHLCV volume only.
+                // Raw trades update the kline buckets via insert_trades_existing_buckets,
+                // but the volume series is rebuilt from klines, not trades directly.
+                // This avoids double-counting: kline volume already includes hydrated trades.
+                //
+                // The CVD indicator handles trade-level delta for TimeBased separately.
+                //
+                // No-op here: volume series stays synced via rebuild_from_source/on_insert_klines.
+            }
             PlotData::TickBased(tickseries) => {
+                let Some(data) = self.data.tick_mut() else {
+                    return;
+                };
+
                 let start_idx = old_dp_len.saturating_sub(1);
                 for (idx, dp) in tickseries.datapoints.iter().enumerate().skip(start_idx) {
                     data.insert(idx as u64, dp.kline.volume);
