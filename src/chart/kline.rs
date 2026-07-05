@@ -301,7 +301,7 @@ impl KlineChart {
                 };
                 chart.translation.x = x_translation;
 
-                let data_source = PlotData::TickBased(TickAggr::new(interval, step, &raw_trades));
+                let data_source = PlotData::TickBased(TickAggr::new(interval, step, &[]));
 
                 let mut indicators = EnumMap::default();
                 for &i in enabled_indicators {
@@ -564,18 +564,31 @@ impl KlineChart {
     }
 
     pub fn set_basis(&mut self, new_basis: Basis) -> Option<Action> {
+        let previous_basis = self.chart.basis;
+
         self.chart.last_price = None;
         self.chart.basis = new_basis;
 
         match new_basis {
             Basis::Time(interval) => {
+                if matches!(previous_basis, Basis::Tick(_)) {
+                    self.raw_trades.clear();
+                };
+
                 let step = self.chart.tick_size;
                 let timeseries = TimeSeries::<KlineDataPoint>::new(interval, step, &[]);
                 self.data_source = PlotData::TimeBased(timeseries);
             }
             Basis::Tick(tick_count) => {
+                let trades = if matches!(previous_basis, Basis::Tick(_)) {
+                    &self.raw_trades
+                } else {
+                    self.raw_trades.clear();
+                    &vec![]
+                };
+
                 let step = self.chart.tick_size;
-                let tick_aggr = TickAggr::new(tick_count, step, &self.raw_trades);
+                let tick_aggr = TickAggr::new(tick_count, step, trades);
                 self.data_source = PlotData::TickBased(tick_aggr);
             }
         }
@@ -643,13 +656,15 @@ impl KlineChart {
     }
 
     pub fn insert_raw_trades(&mut self, raw_trades: Vec<Trade>, is_batches_done: bool) {
-        match self.data_source {
-            PlotData::TickBased(ref mut tick_aggr) => {
-                tick_aggr.insert_trades(&raw_trades);
+        if matches!(&self.data_source, PlotData::TickBased(_)) {
+            if is_batches_done {
+                self.fetching_trades = (false, None);
             }
-            PlotData::TimeBased(ref mut timeseries) => {
-                timeseries.insert_trades_existing_buckets(&raw_trades);
-            }
+            return;
+        }
+
+        if let PlotData::TimeBased(ref mut timeseries) = self.data_source {
+            timeseries.insert_trades_existing_buckets(&raw_trades);
         }
 
         self.raw_trades.extend_from_slice(&raw_trades);

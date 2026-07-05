@@ -1435,6 +1435,8 @@ impl State {
                                                         },
                                                     ]);
                                                     c.set_basis(new_basis);
+
+                                                    self.status = Status::Ready;
                                                     effect = Some(Effect::RefreshStreams);
                                                 }
                                             }
