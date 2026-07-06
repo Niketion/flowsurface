@@ -2018,15 +2018,14 @@ fn volume_cell_background(
     qty: f64,
     max_qty: f64,
 ) -> Color {
-    const MIN_ALPHA: f32 = 0.10;
-    const MAX_ALPHA: f32 = 0.64;
+    const MIN_ALPHA: f32 = 0.04;
 
     let intensity = if max_qty > 0.0 {
         (qty / max_qty).clamp(0.0, 1.0) as f32
     } else {
         0.0
     };
-    let alpha = MIN_ALPHA + intensity * (MAX_ALPHA - MIN_ALPHA);
+    let alpha = MIN_ALPHA + intensity * (1.0 - MIN_ALPHA);
 
     match side {
         ImbalanceSide::Buy => palette.success.base.color.scale_alpha(alpha),
@@ -2063,51 +2062,30 @@ fn draw_table_imbalance_marker(
     max_qty: f64,
     cell: Rectangle,
 ) {
-    let marker_width = (cell.width * 0.24).clamp(5.0, 11.0).min(cell.width * 0.42);
-    let marker_height = (cell.height * 0.72)
-        .clamp(6.0, 13.0)
-        .min(cell.height.max(0.0));
-    if marker_width <= 0.0 || marker_height <= 0.0 {
+    if cell.height <= 0.0 {
         return;
     }
 
-    let inset = (cell.width * 0.04).clamp(1.0, 3.0);
-    let center_y = cell.y + (cell.height / 2.0);
-    let top = center_y - (marker_height / 2.0);
-    let bottom = center_y + (marker_height / 2.0);
+    let bar_width = 2.5;
+    let gap = 1.5;
+
     let volume_intensity = if max_qty > 0.0 {
         (qty / max_qty).clamp(0.0, 1.0) as f32
     } else {
         0.0
     };
     let imbalance_strength = alpha.clamp(0.0, 1.0);
-    let marker_alpha = 0.58 + (volume_intensity * 0.34) + (imbalance_strength * 0.08);
-    let marker_alpha = marker_alpha.clamp(0.58, 1.0);
-    let color = match side {
-        ImbalanceSide::Buy => palette.success.strong.color.scale_alpha(marker_alpha),
-        ImbalanceSide::Sell => palette.danger.strong.color.scale_alpha(marker_alpha),
+    let marker_alpha = 0.38 + (volume_intensity * 0.24) + (imbalance_strength * 0.38);
+    let marker_alpha = marker_alpha.clamp(0.38, 1.0);
+
+    let color = palette.warning.strong.color.scale_alpha(marker_alpha);
+
+    let (x, bar_w) = match side {
+        ImbalanceSide::Sell => (cell.x - bar_width - gap, bar_width),
+        ImbalanceSide::Buy => (cell.x + cell.width + gap, bar_width),
     };
 
-    let mut builder = canvas::path::Builder::new();
-    match side {
-        ImbalanceSide::Buy => {
-            let right = cell.x + cell.width - inset;
-            let left = right - marker_width;
-            builder.move_to(Point::new(right, top));
-            builder.line_to(Point::new(left, center_y));
-            builder.line_to(Point::new(right, bottom));
-        }
-        ImbalanceSide::Sell => {
-            let left = cell.x + inset;
-            let right = left + marker_width;
-            builder.move_to(Point::new(left, top));
-            builder.line_to(Point::new(right, center_y));
-            builder.line_to(Point::new(left, bottom));
-        }
-    }
-    builder.close();
-
-    frame.fill(&builder.build(), color);
+    frame.fill_rectangle(Point::new(x, cell.y), Size::new(bar_w, cell.height), color);
 }
 
 fn composite_color(foreground: Color, background: Color) -> Color {
