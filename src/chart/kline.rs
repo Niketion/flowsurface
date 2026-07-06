@@ -1640,12 +1640,6 @@ fn draw_clusters(
             let half_width = table_width / 2.0;
             let cell_border = 1.0;
             let grid_color = layout.pal.background.weakest.text.scale_alpha(0.32);
-            let max_table_qty = footprint.trades.values().fold(0.0_f64, |max_qty, group| {
-                max_qty
-                    .max(group.buy_qty.to_f64())
-                    .max(group.sell_qty.to_f64())
-            });
-
             for (price, group) in &footprint.trades {
                 let buy_qty = group.buy_qty.to_f64();
                 let sell_qty = group.sell_qty.to_f64();
@@ -1659,26 +1653,31 @@ fn draw_clusters(
                         layout.pal,
                         ImbalanceSide::Sell,
                         sell_qty,
-                        max_table_qty,
+                        max_cluster_qty,
                     ),
                 );
                 frame.fill_rectangle(
                     Point::new(area.table_left + half_width, row_top),
                     Size::new(half_width, layout.cell_h),
-                    volume_cell_background(layout.pal, ImbalanceSide::Buy, buy_qty, max_table_qty),
+                    volume_cell_background(
+                        layout.pal,
+                        ImbalanceSide::Buy,
+                        buy_qty,
+                        max_cluster_qty,
+                    ),
                 );
                 let sell_text_color = volume_cell_text_color(
                     layout.pal,
                     ImbalanceSide::Sell,
                     sell_qty,
-                    max_table_qty,
+                    max_cluster_qty,
                     text_color,
                 );
                 let buy_text_color = volume_cell_text_color(
                     layout.pal,
                     ImbalanceSide::Buy,
                     buy_qty,
-                    max_table_qty,
+                    max_cluster_qty,
                     text_color,
                 );
 
@@ -1698,7 +1697,7 @@ fn draw_clusters(
                             ImbalanceSide::Sell,
                             alpha,
                             sell_qty,
-                            max_table_qty,
+                            max_cluster_qty,
                             Rectangle::new(
                                 Point::new(area.table_left, row_top),
                                 Size::new(half_width, layout.cell_h),
@@ -1721,7 +1720,7 @@ fn draw_clusters(
                             ImbalanceSide::Buy,
                             alpha,
                             buy_qty,
-                            max_table_qty,
+                            max_cluster_qty,
                             Rectangle::new(
                                 Point::new(area.table_left + half_width, row_top),
                                 Size::new(half_width, layout.cell_h),
