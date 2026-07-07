@@ -1,3 +1,4 @@
+use crate::market_data::chart_need::ChartDataNeed;
 use crate::{
     chart::{self, comparison::ComparisonChart, heatmap::HeatmapChart, kline::KlineChart},
     connector::{
@@ -51,6 +52,7 @@ use std::time::Instant;
 pub enum Effect {
     RefreshStreams,
     RequestFetch(Vec<FetchSpec>),
+    RequestMarketDataNeeds(Vec<ChartDataNeed>),
     SwitchTickersInGroup(TickerInfo),
     FocusWidget(iced::widget::Id),
 }
@@ -1616,11 +1618,25 @@ impl State {
                                                     self.streams = ResolvedStream::Ready(streams);
                                                     let action = c.set_basis(new_basis);
 
-                                                    if let Some(chart::Action::RequestFetch(
-                                                        fetch,
-                                                    )) = action
-                                                    {
-                                                        effect = Some(Effect::RequestFetch(fetch));
+                                                    match action {
+                                                        Some(chart::Action::RequestFetch(
+                                                            fetch,
+                                                        )) => {
+                                                            effect =
+                                                                Some(Effect::RequestFetch(fetch));
+                                                        }
+                                                        Some(
+                                                            chart::Action::RequestMarketDataNeeds(
+                                                                needs,
+                                                            ),
+                                                        ) => {
+                                                            effect = Some(
+                                                                Effect::RequestMarketDataNeeds(
+                                                                    needs,
+                                                                ),
+                                                            );
+                                                        }
+                                                        _ => {}
                                                     }
                                                 }
                                                 Basis::Tick(_) => {
@@ -1650,9 +1666,17 @@ impl State {
                                             self.streams = ResolvedStream::Ready(streams);
                                             let action = c.set_basis(new_basis);
 
-                                            if let Some(chart::Action::RequestFetch(fetch)) = action
-                                            {
-                                                effect = Some(Effect::RequestFetch(fetch));
+                                            match action {
+                                                Some(chart::Action::RequestFetch(fetch)) => {
+                                                    effect = Some(Effect::RequestFetch(fetch));
+                                                }
+                                                Some(chart::Action::RequestMarketDataNeeds(
+                                                    needs,
+                                                )) => {
+                                                    effect =
+                                                        Some(Effect::RequestMarketDataNeeds(needs));
+                                                }
+                                                _ => {}
                                             }
                                         }
                                     }

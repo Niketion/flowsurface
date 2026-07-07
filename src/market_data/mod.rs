@@ -8,13 +8,16 @@
 //! # Architecture (Bridge Pattern)
 //!
 //! ```text
-//! KlineChart / Indicator
+//! KlineChart
 //!         │
-//!         │ emits FetchSpec/FetchRange (compatibility signal)
+//!         │ emits ChartDataNeed (Phase 2 path)
 //!         ↓
-//! Dashboard::route_fetch_specs_through_market_data()
+//! Dashboard::route_market_data_needs_through_market_data()
 //!         │
-//!         ├── bridge converts FetchRange → DataRequirement
+//!         ├── bridge converts ChartDataNeed → DataRequirement
+//!         │
+//!         ├── legacy charts/indicators may still emit FetchSpec/FetchRange
+//!         │   through route_fetch_specs_through_market_data()
 //!         │
 //!         ↓
 //! MarketDataCoordinator
@@ -49,11 +52,11 @@
 //!
 //! | Concern | Owner |
 //! |---------|-------|
-//! | FetchSpec emission | `chart/kline.rs` (compatibility) |
+//! | Data need declaration | `chart/kline.rs` via `ChartDataNeed` |
 //! | Requirement registration + planning | `coordinator.rs` |
 //! | Cache serve + persistence | `cache.rs` + `live.rs` |
 //! | Active job dedup | `coordinator.rs` |
-//! | Consumer completion tracking | `dashboard.rs` (bridge) |
+//! | Consumer completion tracking | `market_data::runtime` + dashboard chart effects bridge |
 //! | Network dispatch | `connector::fetcher.rs` |
 //! | Progress UI | `ui.rs` |
 
@@ -67,6 +70,9 @@ pub mod range;
 pub mod requirement;
 pub mod session;
 
+// Chart-side data needs (Phase 2)
+pub mod chart_need;
+
 // Storage and caching (Phase 2 + Phase 5)
 pub mod cache;
 pub mod coverage;
@@ -77,6 +83,7 @@ pub mod coordinator;
 pub mod job;
 pub mod planner;
 pub mod progress;
+pub mod runtime;
 
 // Compatibility bridge (Phase 4)
 pub mod bridge;

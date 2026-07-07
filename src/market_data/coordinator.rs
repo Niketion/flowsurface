@@ -398,6 +398,11 @@ impl MarketDataCoordinator {
         self.store.insert_klines(key, klines);
     }
 
+    /// Feed open interest rows into the store.
+    pub fn feed_open_interest(&mut self, key: &MarketDataKey, rows: &[exchange::OpenInterest]) {
+        self.store.insert_open_interest(key, rows);
+    }
+
     /// Get a progress snapshot for UI display.
     pub fn progress_snapshot(&self) -> MarketDataProgressSnapshot {
         let active_jobs: Vec<FetchJob> = self
@@ -589,6 +594,28 @@ mod tests {
         )
     }
 
+    fn make_kline_key() -> MarketDataKey {
+        MarketDataKey::klines(
+            Venue::BinanceLinear,
+            Symbol::new("BTCUSDT"),
+            MarketKind::LinearPerps,
+            exchange::Timeframe::M1,
+        )
+    }
+
+    fn make_oi_key() -> MarketDataKey {
+        MarketDataKey::open_interest(
+            Venue::BinanceLinear,
+            Symbol::new("BTCUSDT"),
+            MarketKind::LinearPerps,
+            exchange::Timeframe::M5,
+        )
+    }
+
+    fn md_range(from: u64, to: u64) -> MarketDataRange {
+        MarketDataRange::new(UnixMs::new(from), UnixMs::new(to)).unwrap()
+    }
+
     #[test]
     fn test_coordinator_new() {
         let coord = MarketDataCoordinator::new();
@@ -615,6 +642,215 @@ mod tests {
         let plan = coord.plan();
         assert!(plan.needs_network_fetch());
         assert!(!coord.has_pending_requirements());
+    }
+
+    #[test]
+    fn test_kline_cold_start_from_empty_cache_fetches_full_range() {
+        let mut coord = MarketDataCoordinator::new();
+        let key = make_kline_key();
+        let requested = md_range(60_000, 300_000);
+
+        coord.require(DataRequirement::new(
+            ConsumerId::global(ConsumerFeature::ChartKlines),
+            key.clone(),
+            requested,
+            Priority::High,
+            "cold_start",
+        ));
+
+        let plan = coord.plan().clone();
+
+        assert!(plan.cached_segments.is_empty());
+        assert_eq!(plan.network_segments.len(), 1);
+        assert_eq!(plan.network_segments[0].key, key);
+        assert_eq!(plan.network_segments[0].range, requested);
+    }
+
+    #[test]
+    fn test_kline_warm_restart_from_cache_fetches_tail_only() {
+        let mut coord = MarketDataCoordinator::new();
+        let key = make_kline_key();
+        coord
+            .coverage
+            .mark_complete(key.clone(), md_range(60_000, 180_000), 2);
+
+        coord.require(DataRequirement::new(
+            ConsumerId::global(ConsumerFeature::ChartKlines),
+            key,
+            md_range(60_000, 300_000),
+            Priority::High,
+            "warm_restart_tail",
+        ));
+
+        let plan = coord.plan().clone();
+
+        assert_eq!(plan.cached_segments.len(), 1);
+        assert_eq!(plan.cached_segments[0].range, md_range(60_000, 180_000));
+        assert_eq!(plan.network_segments.len(), 1);
+        assert_eq!(plan.network_segments[0].range, md_range(180_000, 300_000));
+    }
+
+    #[test]
+    fn test_trade_hydration_warm_restart_fetches_only_missing_tail() {
+        let mut coord = MarketDataCoordinator::new();
+        let key = make_trade_key();
+        coord
+            .coverage
+            .mark_complete(key.clone(), md_range(1_000, 2_000), 10);
+
+        coord.require(DataRequirement::new(
+            ConsumerId::global(ConsumerFeature::TradeHydration),
+            key,
+            md_range(1_000, 4_000),
+            Priority::Normal,
+            "trade_hydration_warm_restart",
+        ));
+
+        let plan = coord.plan().clone();
+
+        assert_eq!(plan.cached_segments.len(), 1);
+        assert_eq!(plan.network_segments.len(), 1);
+        assert_eq!(plan.network_segments[0].range, md_range(2_000, 4_000));
+        assert_eq!(
+            plan.network_segments[0].consumers[0].feature,
+            ConsumerFeature::TradeHydration
+        );
+    }
+
+    #[test]
+    fn test_footprint_trade_fetch_plans_raw_trade_job() {
+        let mut coord = MarketDataCoordinator::new();
+        let key = make_trade_key();
+
+        coord.require(DataRequirement::new(
+            ConsumerId::global(ConsumerFeature::Footprint),
+            key.clone(),
+            md_range(10_000, 20_000),
+            Priority::Normal,
+            "footprint",
+        ));
+        coord.plan();
+        let jobs = coord.execute_plan();
+
+        assert_eq!(jobs.len(), 1);
+        let job = coord.job(jobs[0]).unwrap();
+        assert_eq!(job.key, key);
+        assert!(job.key.kind.is_trades());
+        assert_eq!(job.consumers[0].feature, ConsumerFeature::Footprint);
+    }
+
+    #[test]
+    fn test_bubble_coordinator_derived_path_uses_cached_raw_trades() {
+        let mut coord = MarketDataCoordinator::new();
+        let key = make_trade_key();
+        let range = md_range(60_000, 120_000);
+        coord.coverage.mark_complete(key.clone(), range, 2);
+        coord.feed_trades(
+            &key,
+            &[
+                exchange::Trade {
+                    time: UnixMs::new(61_000),
+                    is_sell: false,
+                    price: exchange::unit::Price::from_f64(100.0),
+                    qty: exchange::unit::Qty::from_f64(2.0),
+                },
+                exchange::Trade {
+                    time: UnixMs::new(62_000),
+                    is_sell: true,
+                    price: exchange::unit::Price::from_f64(100.0),
+                    qty: exchange::unit::Qty::from_f64(1.0),
+                },
+            ],
+        );
+
+        coord.require(DataRequirement::new(
+            ConsumerId::global(ConsumerFeature::VolumeBubbles),
+            key.clone(),
+            range,
+            Priority::Low,
+            "bubbles",
+        ));
+        let plan = coord.plan().clone();
+        let summaries = coord
+            .compute_bubble_summaries(
+                &key,
+                &range,
+                60_000,
+                exchange::unit::PriceStep {
+                    units: 100_000_000_000,
+                },
+                5,
+            )
+            .expect("raw trades should derive bubble summaries");
+
+        assert_eq!(plan.cached_segments.len(), 1);
+        assert!(plan.network_segments.is_empty());
+        assert_eq!(summaries.len(), 1);
+        assert_eq!(summaries[0].candidates.len(), 1);
+    }
+
+    #[test]
+    fn test_bubble_fallback_when_raw_trades_unavailable_fetches_trades() {
+        let mut coord = MarketDataCoordinator::new();
+        let key = make_trade_key();
+        let range = md_range(60_000, 120_000);
+
+        coord.require(DataRequirement::new(
+            ConsumerId::global(ConsumerFeature::VolumeBubbles),
+            key.clone(),
+            range,
+            Priority::Low,
+            "bubbles_raw_unavailable",
+        ));
+        let plan = coord.plan().clone();
+
+        assert!(plan.cached_segments.is_empty());
+        assert_eq!(plan.network_segments.len(), 1);
+        assert_eq!(plan.network_segments[0].key, key);
+        assert!(plan.network_segments[0].key.kind.is_trades());
+    }
+
+    #[test]
+    fn test_open_interest_fetch_plans_oi_job() {
+        let mut coord = MarketDataCoordinator::new();
+        let key = make_oi_key();
+
+        coord.require(DataRequirement::new(
+            ConsumerId::global(ConsumerFeature::OpenInterest),
+            key.clone(),
+            md_range(300_000, 900_000),
+            Priority::Normal,
+            "oi_history",
+        ));
+        coord.plan();
+        let jobs = coord.execute_plan();
+
+        assert_eq!(jobs.len(), 1);
+        let job = coord.job(jobs[0]).unwrap();
+        assert_eq!(job.key, key);
+        assert!(job.key.kind.is_open_interest());
+    }
+
+    #[test]
+    fn test_comparison_chart_kline_fetch_plans_kline_job() {
+        let mut coord = MarketDataCoordinator::new();
+        let key = make_kline_key();
+
+        coord.require(DataRequirement::new(
+            ConsumerId::global(ConsumerFeature::ComparisonChart),
+            key.clone(),
+            md_range(60_000, 180_000),
+            Priority::High,
+            "comparison",
+        ));
+        coord.plan();
+        let jobs = coord.execute_plan();
+
+        assert_eq!(jobs.len(), 1);
+        let job = coord.job(jobs[0]).unwrap();
+        assert_eq!(job.key, key);
+        assert!(job.key.kind.is_klines());
+        assert_eq!(job.consumers[0].feature, ConsumerFeature::ComparisonChart);
     }
 
     #[test]

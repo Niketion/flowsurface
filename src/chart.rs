@@ -5,6 +5,7 @@ pub mod kline;
 mod scale;
 
 use crate::connector::fetcher::{FetchRange, FetchSpec, ReqError, RequestHandler};
+use crate::market_data::chart_need::ChartDataNeed;
 use crate::style;
 use crate::widget::multi_split::{DRAG_SIZE, MultiSplit};
 use crate::widget::tooltip;
@@ -276,6 +277,9 @@ fn canvas_interaction<T: Chart>(
 pub enum Action {
     ErrorOccurred(data::InternalError),
     RequestFetch(Vec<FetchSpec>),
+    /// Phase 2 data-need path: charts declare required market data and
+    /// MarketDataRuntime/Coordinator decide cache, coverage, dedupe and worker specs.
+    RequestMarketDataNeeds(Vec<ChartDataNeed>),
     RequestPalette,
 }
 

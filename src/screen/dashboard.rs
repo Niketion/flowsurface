@@ -7,10 +7,13 @@ pub use sidebar::Sidebar;
 
 use super::DashboardError;
 use crate::market_data::{
-    job::FetchJobId,
     key::{MarketDataKey, MarketDataKind},
-    range::{MarketDataRange, add_required_segment_dedup, compute_missing},
+    range::MarketDataRange,
     requirement::ConsumerFeature,
+    runtime::{
+        DashboardChartNeedRoute, DashboardFetchRoute, MarketDataChartEffect,
+        MarketDataRouteOutcome, MarketDataRuntime, PendingMarketDataConsumer,
+    },
 };
 use crate::{
     chart,
@@ -93,41 +96,6 @@ struct PendingDisconnect {
     stream_last_seen: HashMap<StreamKind, UnixMs>,
 }
 
-/// Logical segment status for accurate logging/debug reporting.
-#[derive(Debug, Clone, PartialEq)]
-struct ConsumerSegmentStatus {
-    completed_logical: usize,
-    total_logical: usize,
-    missing: Vec<MarketDataRange>,
-    coverage_complete: bool,
-}
-
-#[derive(Debug, Clone)]
-struct PendingMarketDataConsumer {
-    pane_id: uuid::Uuid,
-    req_id: uuid::Uuid,
-    fetch: fetcher::FetchRange,
-    stream: Option<StreamKind>,
-    key: MarketDataKey,
-    range: MarketDataRange,
-    feature: ConsumerFeature,
-    chart_generation: u64,
-    has_partial_updates: bool,
-    completed: bool,
-    required_segments: Vec<MarketDataRange>,
-    completed_segments: Vec<MarketDataRange>,
-    failed_segments: Vec<MarketDataRange>,
-    delivered_segments: Vec<MarketDataRange>,
-}
-
-#[derive(Debug, Clone)]
-struct DashboardFetchRoute {
-    pane_id: uuid::Uuid,
-    ready_streams: Vec<StreamKind>,
-    chart_generation: u64,
-    reqs: Vec<fetcher::FetchSpec>,
-}
-
 pub struct Dashboard {
     pub panes: pane_grid::State<pane::State>,
     pub focus: Option<(window::Id, pane_grid::Pane)>,
@@ -146,45 +114,12 @@ pub struct Dashboard {
     backfill_handles: Vec<iced::task::Handle>,
     /// Pending WS disconnect awaiting reconnect to compute real backfill gap.
     pending_disconnect: Option<PendingDisconnect>,
-    /// Market data coordinator for unified data management.
-    pub market_coordinator: crate::market_data::coordinator::MarketDataCoordinator,
-    /// Local market data cache for persistence.
-    pub market_cache: crate::market_data::cache::LocalMarketCache,
-    /// Live data adapter for WebSocket routing.
-    pub live_adapter: crate::market_data::live::LiveDataAdapter,
-    /// Last time coverage was saved to disk.
-    last_coverage_save: std::time::Instant,
-    /// Pane/chart requests waiting for coordinator-owned market data.
-    pending_market_consumers: Vec<PendingMarketDataConsumer>,
-    worker_req_to_job: HashMap<uuid::Uuid, FetchJobId>,
-    job_to_worker_req: HashMap<FetchJobId, uuid::Uuid>,
-    job_to_consumers: HashMap<FetchJobId, Vec<uuid::Uuid>>,
+    /// Runtime owner for market-data coordinator, cache, live ingestion, and worker mappings.
+    pub market_data_runtime: MarketDataRuntime,
 }
 
 impl Default for Dashboard {
     fn default() -> Self {
-        let mut cache = crate::market_data::cache::LocalMarketCache::default_cache();
-        let mut coordinator = crate::market_data::coordinator::MarketDataCoordinator::new();
-
-        // Load persisted coverage
-        match cache.load_coverage() {
-            Ok(coverage) => {
-                coordinator.coverage = coverage;
-                log::info!(
-                    target: "marketdata",
-                    "MARKETDATA CoverageLoaded | keys={}",
-                    coordinator.coverage.len()
-                );
-            }
-            Err(e) => {
-                log::warn!(
-                    target: "marketdata",
-                    "MARKETDATA CoverageLoadFailed | error={}",
-                    e
-                );
-            }
-        }
-
         Self {
             panes: pane_grid::State::with_configuration(Self::default_pane_config()),
             focus: None,
@@ -195,14 +130,7 @@ impl Default for Dashboard {
             pending_backfills: HashMap::new(),
             backfill_handles: Vec::new(),
             pending_disconnect: None,
-            market_coordinator: coordinator,
-            market_cache: cache,
-            live_adapter: crate::market_data::live::LiveDataAdapter::new(),
-            last_coverage_save: std::time::Instant::now(),
-            pending_market_consumers: Vec::new(),
-            worker_req_to_job: HashMap::new(),
-            job_to_worker_req: HashMap::new(),
-            job_to_consumers: HashMap::new(),
+            market_data_runtime: MarketDataRuntime::new(),
         }
     }
 }
@@ -221,30 +149,6 @@ pub enum Event {
         streams: Vec<PersistStreamKind>,
     },
     RequestPalette,
-}
-
-/// Check whether a consumer has effective gaps remaining, accounting for
-/// tiny Trade/TradeHydration gap suppression.
-fn consumer_has_effective_gaps(consumer: &PendingMarketDataConsumer) -> bool {
-    let terminal_segments = consumer
-        .completed_segments
-        .iter()
-        .chain(consumer.failed_segments.iter())
-        .copied()
-        .collect::<Vec<_>>();
-    let raw_missing = compute_missing(consumer.range, &terminal_segments);
-    if matches!(
-        consumer.feature,
-        ConsumerFeature::TradeHydration | ConsumerFeature::Footprint
-    ) {
-        let filtered = crate::market_data::range::filter_tiny_trade_gaps(
-            raw_missing,
-            crate::market_data::coordinator::MIN_TRADE_BACKFILL_SEGMENT_MS,
-        );
-        !filtered.is_empty()
-    } else {
-        !raw_missing.is_empty()
-    }
 }
 
 impl Dashboard {
@@ -288,28 +192,6 @@ impl Dashboard {
             );
         }
 
-        // Reuse the same initialization logic as Default
-        let mut cache = crate::market_data::cache::LocalMarketCache::default_cache();
-        let mut coordinator = crate::market_data::coordinator::MarketDataCoordinator::new();
-
-        match cache.load_coverage() {
-            Ok(coverage) => {
-                coordinator.coverage = coverage;
-                log::info!(
-                    target: "marketdata",
-                    "MARKETDATA CoverageLoaded | keys={} source=from_config",
-                    coordinator.coverage.len()
-                );
-            }
-            Err(e) => {
-                log::warn!(
-                    target: "marketdata",
-                    "MARKETDATA CoverageLoadFailed | error={} source=from_config",
-                    e
-                );
-            }
-        }
-
         Self {
             panes,
             focus: None,
@@ -320,14 +202,7 @@ impl Dashboard {
             pending_backfills: HashMap::new(),
             backfill_handles: Vec::new(),
             pending_disconnect: None,
-            market_coordinator: coordinator,
-            market_cache: cache,
-            live_adapter: crate::market_data::live::LiveDataAdapter::new(),
-            last_coverage_save: std::time::Instant::now(),
-            pending_market_consumers: Vec::new(),
-            worker_req_to_job: HashMap::new(),
-            job_to_worker_req: HashMap::new(),
-            job_to_consumers: HashMap::new(),
+            market_data_runtime: MarketDataRuntime::from_config(),
         }
     }
 
@@ -626,6 +501,34 @@ impl Dashboard {
                                 )
                                 .chain(self.refresh_streams(main_window.id))
                             }
+                            pane::Effect::RequestMarketDataNeeds(needs) => {
+                                let pane_id = state.unique_id();
+                                let ready_streams = state
+                                    .streams
+                                    .ready_iter()
+                                    .map(|iter| iter.copied().collect::<Vec<_>>())
+                                    .unwrap_or_default();
+                                let chart_generation =
+                                    if let pane::Content::Kline { chart: Some(c), .. } =
+                                        &state.content
+                                    {
+                                        c.current_generation()
+                                    } else {
+                                        0
+                                    };
+
+                                self.route_market_data_needs_through_market_data(
+                                    handles.clone(),
+                                    main_window.id,
+                                    DashboardChartNeedRoute {
+                                        pane_id,
+                                        ready_streams,
+                                        chart_generation,
+                                        needs,
+                                    },
+                                )
+                                .chain(self.refresh_streams(main_window.id))
+                            }
                             pane::Effect::SwitchTickersInGroup(ticker_info) => {
                                 self.switch_tickers_in_group(handles, main_window.id, ticker_info)
                             }
@@ -660,35 +563,18 @@ impl Dashboard {
                 fetch,
             } => {
                 if let Some(worker_req) = req_id
-                    && let Some(job_id) = self.worker_req_to_job.get(&worker_req).copied()
+                    && let Some(failure) = self
+                        .market_data_runtime
+                        .fail_worker_request(worker_req, error.clone())
                 {
                     log::warn!(
                         target: "marketdata",
                         "MARKETDATA WorkerFailed | worker_req={} job={} error={}",
                         fetcher::short_id(worker_req),
-                        crate::market_data::job::short_id(job_id),
+                        crate::market_data::job::short_id(failure.job_id),
                         error
                     );
-                    if let Some(job) = self.market_coordinator.job(job_id).cloned() {
-                        for chart_req in self
-                            .job_to_consumers
-                            .get(&job_id)
-                            .cloned()
-                            .unwrap_or_default()
-                        {
-                            if let Some(consumer) = self
-                                .pending_market_consumers
-                                .iter_mut()
-                                .find(|consumer| consumer.req_id == chart_req)
-                            {
-                                consumer.failed_segments.push(job.range);
-                            }
-                        }
-                    }
-                    self.market_coordinator.fail_and_remove_job(job_id, error);
-                    self.worker_req_to_job.remove(&worker_req);
-                    self.job_to_worker_req.remove(&job_id);
-                    self.job_to_consumers.remove(&job_id);
+                    let _ = failure.range;
                     return (Task::none(), None);
                 }
 
@@ -968,7 +854,7 @@ impl Dashboard {
         .into();
 
         // Add unified market data progress overlay when loading
-        let progress = self.market_coordinator.progress_snapshot();
+        let progress = self.market_data_runtime.progress_snapshot();
         if progress.is_loading() {
             let progress_widget = crate::market_data::ui::unified_progress_view(&progress)
                 .map(|_msg| Message::RequestPalette); // Map widget messages to dashboard messages
@@ -1216,159 +1102,261 @@ impl Dashboard {
         main_window: window::Id,
         route: DashboardFetchRoute,
     ) -> Task<Message> {
-        let DashboardFetchRoute {
-            pane_id,
-            ready_streams,
-            chart_generation,
-            reqs,
-        } = route;
+        let outcome = self.market_data_runtime.route_fetch_specs(route);
+        self.handle_market_data_route_outcome(handles, main_window, outcome)
+    }
 
-        let ticker_info = ready_streams.iter().find_map(stream_ticker_info);
-        let mut registered_any = false;
+    fn route_market_data_needs_through_market_data(
+        &mut self,
+        handles: AdapterHandles,
+        main_window: window::Id,
+        route: DashboardChartNeedRoute,
+    ) -> Task<Message> {
+        let outcome = self.market_data_runtime.route_chart_data_needs(route);
+        self.handle_market_data_route_outcome(handles, main_window, outcome)
+    }
 
-        for spec in &reqs {
-            let feature = crate::market_data::bridge::fetch_range_to_feature(&spec.fetch);
-            let timeframe = self.resolve_fetch_timeframe(spec, &ready_streams);
-            let Some(key) =
-                crate::market_data::bridge::fetch_range_to_key(&spec.fetch, ticker_info, timeframe)
-            else {
-                log::warn!(
-                    target: "marketdata",
-                    "MARKETDATA RequirementSkip | pane={} fetch={} reason=no_key",
-                    crate::market_data::job::short_id(pane_id),
-                    fetcher::format_fetch_range(&spec.fetch)
-                );
-                continue;
-            };
-            let Some(range) = crate::market_data::bridge::fetch_range_to_range(&spec.fetch) else {
-                continue;
-            };
-
-            if matches!(feature, ConsumerFeature::VolumeBubbles) {
-                log::info!(
-                    target: "marketdata",
-                    "MARKETDATA BubbleRequirement | pane={} range={} key={}",
-                    crate::market_data::job::short_id(pane_id),
-                    range.format_display(),
-                    key.display_key()
-                );
-            }
-
-            self.pending_market_consumers
-                .push(PendingMarketDataConsumer {
-                    pane_id,
-                    req_id: spec.req_id,
-                    fetch: spec.fetch,
-                    stream: spec.stream,
-                    key: key.clone(),
-                    range,
-                    feature,
-                    chart_generation,
-                    has_partial_updates: false,
-                    completed: false,
-                    required_segments: Vec::new(),
-                    completed_segments: Vec::new(),
-                    failed_segments: Vec::new(),
-                    delivered_segments: Vec::new(),
-                });
-
-            if let Some(requirement) = crate::market_data::bridge::fetch_range_to_requirement(
-                &spec.fetch,
-                pane_id,
-                feature,
-                ticker_info,
-                timeframe,
-            ) {
-                self.market_coordinator.require(requirement);
-                registered_any = true;
-            }
+    fn handle_market_data_route_outcome(
+        &mut self,
+        handles: AdapterHandles,
+        main_window: window::Id,
+        outcome: MarketDataRouteOutcome,
+    ) -> Task<Message> {
+        for dispatch in outcome.cached_dispatches {
+            let effects = self
+                .market_data_runtime
+                .effects_for_cached_dispatch(dispatch);
+            self.apply_market_data_effects(main_window, effects);
         }
 
-        if !registered_any || !self.market_coordinator.has_pending_requirements() {
-            return self.forward_legacy_fetches(
-                handles,
-                main_window,
-                pane_id,
-                &ready_streams,
-                reqs,
-                chart_generation,
-                "no_coordinator_requirement",
-            );
-        }
-
-        let plan = self.market_coordinator.plan().clone();
-        log::info!(
-            target: "marketdata",
-            "MARKETDATA RuntimePlan | pane={} {}",
-            crate::market_data::job::short_id(pane_id),
-            plan.runtime_summary(self.market_coordinator.active_job_count())
-        );
-
-        self.register_required_segments_from_plan(&plan);
-        let mut cache_desync_specs = self.serve_cached_market_segments(main_window, &plan);
-
-        let created_jobs = self.market_coordinator.execute_plan();
-        for job_id in &created_jobs {
-            self.market_coordinator.start_job(*job_id);
-        }
-
-        let mut network_specs = Vec::new();
-        for job_id in &created_jobs {
-            let Some(job) = self.market_coordinator.job(*job_id).cloned() else {
-                continue;
-            };
-            if let Some(spec) = self.fetch_spec_for_market_job(
-                *job_id,
-                &job.key,
-                job.range,
-                &ready_streams,
-                pane_id,
-            ) {
-                if matches!(job.key.kind, MarketDataKind::Trades)
-                    && self.pending_market_consumers.iter().any(|c| {
-                        c.key == job.key
-                            && c.range.overlaps(&job.range)
-                            && c.feature == ConsumerFeature::VolumeBubbles
-                    })
-                {
-                    log::info!(
-                        target: "marketdata",
-                        "MARKETDATA BubbleRawTradesFetch | range={}",
-                        job.range.format_display()
-                    );
-                }
-                network_specs.push(spec);
-            }
-        }
-        self.attach_pending_consumers_to_active_jobs("dedup_active_job");
-
-        network_specs.append(&mut cache_desync_specs);
-
-        let reason = if !network_specs.is_empty() {
-            "coordinator_new_network_jobs"
-        } else if plan.has_cached_data() {
-            "coordinator_served_cache"
-        } else {
-            "coordinator_active_job"
-        };
-
-        if network_specs.is_empty() {
+        if outcome.fetch_specs.is_empty() {
             log::info!(
                 target: "marketdata",
-                "MARKETDATA RuntimeLegacy | pane={} count=0 reason={reason}",
-                crate::market_data::job::short_id(pane_id)
+                "MARKETDATA RuntimeLegacy | pane={} count=0 reason={}",
+                crate::market_data::job::short_id(outcome.pane_id),
+                outcome.reason
             );
             Task::none()
         } else {
             self.forward_legacy_fetches(
                 handles,
                 main_window,
-                pane_id,
-                &ready_streams,
-                network_specs,
-                chart_generation,
-                reason,
+                outcome.pane_id,
+                &outcome.ready_streams,
+                outcome.fetch_specs,
+                outcome.chart_generation,
+                outcome.reason,
             )
+        }
+    }
+
+    fn apply_market_data_effects(
+        &mut self,
+        main_window: window::Id,
+        effects: Vec<MarketDataChartEffect>,
+    ) {
+        for effect in effects {
+            self.apply_market_data_effect(main_window, effect);
+        }
+    }
+
+    fn apply_market_data_effect(&mut self, main_window: window::Id, effect: MarketDataChartEffect) {
+        match effect {
+            MarketDataChartEffect::InsertKlinesPartial {
+                consumer,
+                stream,
+                timeframe,
+                ticker_info,
+                rows,
+            } => {
+                if self.pending_consumer_is_stale(main_window, &consumer) {
+                    return;
+                }
+                let stream = stream.or_else(|| {
+                    self.stream_for_consumer_key(main_window, consumer.pane_id, &consumer.key)
+                });
+                if matches!(stream, Some(StreamKind::Kline { .. }))
+                    && let Some(pane_state) =
+                        self.get_mut_pane_state_by_uuid(main_window, consumer.pane_id)
+                {
+                    pane_state.status = pane::Status::Ready;
+                    pane_state.insert_hist_klines_partial(
+                        Some(consumer.req_id),
+                        timeframe,
+                        ticker_info,
+                        &rows,
+                    );
+                }
+            }
+            MarketDataChartEffect::InsertTrades {
+                consumer,
+                stream,
+                batch,
+                until_time,
+            } => {
+                if self.pending_consumer_is_stale(main_window, &consumer) {
+                    return;
+                }
+                let stream = stream.or_else(|| {
+                    self.stream_for_consumer_key(main_window, consumer.pane_id, &consumer.key)
+                });
+                if let Some(stream) = stream {
+                    let _ = self.distribute_fetched_data(
+                        main_window,
+                        consumer.pane_id,
+                        FetchedData::Trades {
+                            batch,
+                            until_time,
+                            req_id: Some(consumer.req_id),
+                        },
+                        stream,
+                        true,
+                    );
+                }
+            }
+            MarketDataChartEffect::InsertOpenInterestPartial { consumer, rows } => {
+                if self.pending_consumer_is_stale(main_window, &consumer) {
+                    return;
+                }
+                if let Some(pane_state) =
+                    self.get_mut_pane_state_by_uuid(main_window, consumer.pane_id)
+                {
+                    pane_state.status = pane::Status::Ready;
+                    pane_state.insert_hist_oi_partial(Some(consumer.req_id), &rows);
+                }
+            }
+            MarketDataChartEffect::InsertBubbleSummaries {
+                consumer,
+                summaries,
+                range,
+                trades_seen,
+                raw_discarded,
+                complete,
+            } => {
+                if self.pending_consumer_is_stale(main_window, &consumer) {
+                    return;
+                }
+                let stream = consumer.stream.or_else(|| {
+                    self.stream_for_consumer_key(main_window, consumer.pane_id, &consumer.key)
+                });
+                if let Some(stream) = stream {
+                    self.apply_bubble_summaries_to_chart(
+                        main_window,
+                        consumer.pane_id,
+                        stream,
+                        summaries,
+                        range,
+                        trades_seen,
+                        raw_discarded,
+                        Some(consumer.req_id),
+                        complete,
+                    );
+                    if complete {
+                        log::info!(
+                            target: "marketdata",
+                            "MARKETDATA BubbleChartComplete | req={}",
+                            fetcher::short_id(consumer.req_id)
+                        );
+                    }
+                }
+            }
+            MarketDataChartEffect::CompleteConsumer {
+                consumer,
+                empty_covered_tail,
+            } => {
+                if self.pending_consumer_is_stale(main_window, &consumer) {
+                    return;
+                }
+                let _ = self.complete_pending_consumer(main_window, &consumer, empty_covered_tail);
+            }
+            MarketDataChartEffect::MarkConsumerCompleted { .. } => {}
+            MarketDataChartEffect::CompleteLegacyTradeFetch {
+                pane_id,
+                req_id,
+                fetch,
+                empty_covered_tail,
+            } => {
+                if let Some(pane_state) = self.get_mut_pane_state_by_uuid(main_window, pane_id)
+                    && let pane::Content::Kline { chart: Some(c), .. } = &mut pane_state.content
+                {
+                    c.complete_trade_fetch(req_id, Some(fetch), empty_covered_tail);
+                }
+            }
+            MarketDataChartEffect::MarkPaneReady { pane_id } => {
+                if let Some(pane_state) = self.get_mut_pane_state_by_uuid(main_window, pane_id) {
+                    pane_state.status = pane::Status::Ready;
+                }
+            }
+            MarketDataChartEffect::InsertLegacyTrades {
+                pane_id,
+                req_id,
+                batch,
+                is_batches_done,
+            } => {
+                if let Err(reason) = self.insert_fetched_trades(
+                    main_window,
+                    pane_id,
+                    &batch,
+                    is_batches_done,
+                    req_id,
+                ) {
+                    log::warn!(
+                        "MARKETDATA LegacyTradeEffectFailed | pane={} error={}",
+                        fetcher::short_id(pane_id),
+                        reason
+                    );
+                }
+            }
+            MarketDataChartEffect::InsertLegacyBubbleSummaries {
+                pane_id,
+                req_id,
+                summaries,
+                range,
+                trades_seen,
+                raw_discarded,
+            } => {
+                if let Some(pane_state) = self.get_mut_pane_state_by_uuid(main_window, pane_id) {
+                    pane_state.status = pane::Status::Ready;
+                    if let pane::Content::Kline { chart: Some(c), .. } = &mut pane_state.content {
+                        c.insert_bubble_summaries(
+                            summaries,
+                            range.0,
+                            range.1,
+                            trades_seen,
+                            raw_discarded,
+                            req_id,
+                        );
+                    }
+                }
+            }
+            MarketDataChartEffect::InsertLegacyKlines {
+                pane_id,
+                req_id,
+                stream,
+                rows,
+            } => {
+                if let Some(pane_state) = self.get_mut_pane_state_by_uuid(main_window, pane_id) {
+                    pane_state.status = pane::Status::Ready;
+                    if let StreamKind::Kline {
+                        timeframe,
+                        ticker_info,
+                    } = stream
+                    {
+                        pane_state.insert_hist_klines(req_id, timeframe, ticker_info, &rows);
+                    }
+                }
+            }
+            MarketDataChartEffect::InsertLegacyOpenInterest {
+                pane_id,
+                req_id,
+                rows,
+            } => {
+                if let Some(pane_state) = self.get_mut_pane_state_by_uuid(main_window, pane_id) {
+                    pane_state.status = pane::Status::Ready;
+                    pane_state.insert_hist_oi(req_id, &rows);
+                }
+            }
+            MarketDataChartEffect::ProgressSnapshot => self.log_market_data_progress_snapshot(),
         }
     }
 
@@ -1416,589 +1404,10 @@ impl Dashboard {
         task
     }
 
-    fn resolve_fetch_timeframe(
-        &self,
-        spec: &fetcher::FetchSpec,
-        ready_streams: &[StreamKind],
-    ) -> Option<exchange::Timeframe> {
-        if let Some(StreamKind::Kline { timeframe, .. }) = spec.stream {
-            return Some(timeframe);
-        }
-        ready_streams.iter().find_map(|stream| match stream {
-            StreamKind::Kline { timeframe, .. } => Some(*timeframe),
-            _ => None,
-        })
-    }
-
-    fn fetch_spec_for_market_job(
-        &mut self,
-        job_id: FetchJobId,
-        key: &MarketDataKey,
-        range: MarketDataRange,
-        ready_streams: &[StreamKind],
-        fallback_pane: uuid::Uuid,
-    ) -> Option<fetcher::FetchSpec> {
-        let stream = ready_streams
-            .iter()
-            .copied()
-            .find(|stream| stream_matches_market_key(stream, key));
-        let source = self
-            .pending_market_consumers
-            .iter()
-            .find(|c| c.key == *key && c.range.overlaps(&range));
-        let req_id = uuid::Uuid::new_v4();
-        let fetch = match key.kind {
-            MarketDataKind::Klines { .. } => fetcher::FetchRange::Kline(range.from, range.to),
-            MarketDataKind::Trades => fetcher::FetchRange::Trades(range.from, range.to),
-            MarketDataKind::OpenInterest { .. } => {
-                fetcher::FetchRange::OpenInterest(range.from, range.to)
-            }
-        };
-        let stream = stream.or_else(|| source.and_then(|c| c.stream));
-        if stream.is_none() {
-            log::warn!(
-                target: "marketdata",
-                "MARKETDATA RuntimeLegacy | pane={} count=0 reason=no_matching_stream key={} range={}",
-                crate::market_data::job::short_id(source.map_or(fallback_pane, |c| c.pane_id)),
-                key.display_key(),
-                range.format_display()
-            );
-        }
-        let consumers = self
-            .pending_market_consumers
-            .iter()
-            .filter(|consumer| {
-                if consumer.key != *key || !consumer.range.overlaps(&range) {
-                    return false;
-                }
-                if consumer.completed {
-                    log::warn!(
-                        target: "marketdata",
-                        "MARKETDATA ConsumerAttachRejected | chart_req={} job={} reason=consumer_already_completed",
-                        fetcher::short_id(consumer.req_id),
-                        crate::market_data::job::short_id(job_id)
-                    );
-                    return false;
-                }
-                true
-            })
-            .map(|consumer| consumer.req_id)
-            .collect::<Vec<_>>();
-        self.worker_req_to_job.insert(req_id, job_id);
-        self.job_to_worker_req.insert(job_id, req_id);
-        self.job_to_consumers.insert(job_id, consumers.clone());
-        for consumer_id in &consumers {
-            self.add_required_segment_to_consumer(*consumer_id, range);
-        }
-        log::info!(
-            target: "marketdata",
-            "MARKETDATA WorkerLaunch | job={} worker_req={} key={} range={} consumers={}",
-            crate::market_data::job::short_id(job_id),
-            fetcher::short_id(req_id),
-            key.display_key(),
-            range.format_display(),
-            consumers
-                .iter()
-                .map(|id| fetcher::short_id(*id))
-                .collect::<Vec<_>>()
-                .join(",")
-        );
-        Some(fetcher::FetchSpec {
-            req_id,
-            fetch,
-            stream,
-        })
-    }
-
+    #[cfg(test)]
     fn attach_pending_consumers_to_active_jobs(&mut self, reason: &'static str) -> usize {
-        let active_jobs = self
-            .market_coordinator
-            .active_jobs()
-            .into_iter()
-            .map(|job| (job.id, job.key.clone(), job.range))
-            .collect::<Vec<_>>();
-        let mut attached = 0usize;
-
-        for (job_id, key, job_range) in active_jobs {
-            let matching_req_ids = self
-                .pending_market_consumers
-                .iter()
-                .filter_map(|consumer| {
-                    if consumer.key != key || !consumer.range.overlaps(&job_range) {
-                        return None;
-                    }
-                    if consumer.completed {
-                        log::warn!(
-                            target: "marketdata",
-                            "MARKETDATA ConsumerAttachRejected | chart_req={} job={} reason=consumer_already_completed",
-                            fetcher::short_id(consumer.req_id),
-                            crate::market_data::job::short_id(job_id)
-                        );
-                        return None;
-                    }
-                    Some((consumer.req_id, consumer.feature))
-                })
-                .collect::<Vec<_>>();
-
-            for (chart_req, feature) in matching_req_ids {
-                let consumers = self.job_to_consumers.entry(job_id).or_default();
-                if consumers.contains(&chart_req) {
-                    continue;
-                }
-
-                consumers.push(chart_req);
-                self.add_required_segment_to_consumer(chart_req, job_range);
-                attached = attached.saturating_add(1);
-                log::info!(
-                    target: "marketdata",
-                    "MARKETDATA ConsumerAttach | job={} chart_req={} feature={} reason={}",
-                    crate::market_data::job::short_id(job_id),
-                    fetcher::short_id(chart_req),
-                    feature.short_name(),
-                    reason
-                );
-            }
-        }
-
-        attached
-    }
-
-    fn fetch_spec_for_market_refetch(
-        &self,
-        key: &MarketDataKey,
-        range: MarketDataRange,
-        ready_streams: &[StreamKind],
-        fallback_pane: uuid::Uuid,
-    ) -> Option<fetcher::FetchSpec> {
-        let stream = ready_streams
-            .iter()
-            .copied()
-            .find(|stream| stream_matches_market_key(stream, key));
-        let source = self
-            .pending_market_consumers
-            .iter()
-            .find(|c| c.key == *key && c.range.overlaps(&range));
-        let fetch = match key.kind {
-            MarketDataKind::Klines { .. } => fetcher::FetchRange::Kline(range.from, range.to),
-            MarketDataKind::Trades => fetcher::FetchRange::Trades(range.from, range.to),
-            MarketDataKind::OpenInterest { .. } => {
-                fetcher::FetchRange::OpenInterest(range.from, range.to)
-            }
-        };
-        let stream = stream.or_else(|| source.and_then(|c| c.stream));
-        if stream.is_none() {
-            log::warn!(
-                target: "marketdata",
-                "MARKETDATA RuntimeLegacy | pane={} count=0 reason=no_matching_stream key={} range={}",
-                crate::market_data::job::short_id(source.map_or(fallback_pane, |c| c.pane_id)),
-                key.display_key(),
-                range.format_display()
-            );
-        }
-        Some(fetcher::FetchSpec {
-            req_id: uuid::Uuid::new_v4(),
-            fetch,
-            stream,
-        })
-    }
-
-    fn serve_cached_market_segments(
-        &mut self,
-        main_window: window::Id,
-        plan: &crate::market_data::planner::DataLoadPlan,
-    ) -> Vec<fetcher::FetchSpec> {
-        let mut refetch = Vec::new();
-        for cached in &plan.cached_segments {
-            match &cached.key.kind {
-                MarketDataKind::Klines { timeframe } => {
-                    let rows = self.market_cache.query_klines(&cached.key, &cached.range);
-                    log::info!(
-                        target: "marketdata",
-                        "MARKETDATA CacheLoad | key={} range={} kind=Klines records={}",
-                        cached.key.display_key(),
-                        cached.range.format_display(),
-                        rows.len()
-                    );
-                    if rows.is_empty() {
-                        self.mark_cache_desync_and_refetch(&cached.key, cached.range, &mut refetch);
-                        continue;
-                    }
-
-                    // Step 1: Range filter — reject klines outside cache segment bounds
-                    let from_ms = cached.range.from.as_u64();
-                    let to_ms = cached.range.to.as_u64();
-                    let before_count = rows.len();
-                    let first_before = rows.first().map(|k| k.time);
-                    let last_before = rows.last().map(|k| k.time);
-                    let filtered_rows: Vec<_> = rows
-                        .into_iter()
-                        .filter(|kline| {
-                            kline.time.as_u64() >= from_ms && kline.time.as_u64() < to_ms
-                        })
-                        .collect();
-                    if filtered_rows.len() != before_count {
-                        log::warn!(
-                            target: "marketdata",
-                            "MARKETDATA KlineCacheOutOfRangeFiltered | key={} cache_range={} before={} after={} first_before={} last_before={}",
-                            cached.key.display_key(),
-                            cached.range.format_display(),
-                            before_count,
-                            filtered_rows.len(),
-                            first_before.map_or("-".to_string(), crate::connector::fetcher::format_time_short),
-                            last_before.map_or("-".to_string(), crate::connector::fetcher::format_time_short)
-                        );
-                    }
-
-                    // Step 2: Density check — too many rows for the timeframe is corrupt data
-                    let duration_ms = cached.range.duration_ms();
-                    let tf_ms = timeframe.to_milliseconds();
-                    let expected_max = (duration_ms / tf_ms) + 2; // small tolerance for boundary candles
-                    if filtered_rows.len() as u64 > expected_max {
-                        log::warn!(
-                            target: "marketdata",
-                            "MARKETDATA KlineCacheCorrupt | key={} range={} records={} expected_max={} reason=too_many_rows_for_timeframe",
-                            cached.key.display_key(),
-                            cached.range.format_display(),
-                            filtered_rows.len(),
-                            expected_max
-                        );
-                        self.mark_cache_corrupt_and_refetch(
-                            &cached.key,
-                            cached.range,
-                            "too_many_rows_for_timeframe",
-                            &mut refetch,
-                        );
-                        continue;
-                    }
-
-                    // Step 3: After range filter, if filtered rows are empty
-                    if filtered_rows.is_empty() {
-                        self.mark_cache_desync_and_refetch(&cached.key, cached.range, &mut refetch);
-                        continue;
-                    }
-
-                    // Step 4: Valid data — feed and dispatch
-                    self.market_coordinator
-                        .feed_klines(&cached.key, filtered_rows.as_slice());
-                    self.market_coordinator
-                        .record_cache_served(filtered_rows.len());
-                    self.dispatch_cached_klines(
-                        main_window,
-                        &cached.key,
-                        cached.range,
-                        *timeframe,
-                        filtered_rows,
-                    );
-                }
-                MarketDataKind::Trades => {
-                    let rows = self.market_cache.query_trades(&cached.key, &cached.range);
-                    log::info!(
-                        target: "marketdata",
-                        "MARKETDATA CacheLoad | key={} range={} kind=Trades records={}",
-                        cached.key.display_key(),
-                        cached.range.format_display(),
-                        rows.len()
-                    );
-                    if rows.is_empty() {
-                        self.mark_cache_desync_and_refetch(&cached.key, cached.range, &mut refetch);
-                        continue;
-                    }
-                    self.market_coordinator
-                        .feed_trades(&cached.key, rows.as_slice());
-                    self.market_coordinator.record_cache_served(rows.len());
-                    self.dispatch_cached_trades(main_window, &cached.key, cached.range, rows);
-                }
-                MarketDataKind::OpenInterest { timeframe } => {
-                    let rows = self
-                        .market_cache
-                        .query_open_interest(&cached.key, &cached.range);
-                    log::info!(
-                        target: "marketdata",
-                        "MARKETDATA CacheLoad | key={} range={} kind=OpenInterest records={}",
-                        cached.key.display_key(),
-                        cached.range.format_display(),
-                        rows.len()
-                    );
-                    if rows.is_empty() {
-                        self.mark_cache_desync_and_refetch(&cached.key, cached.range, &mut refetch);
-                        continue;
-                    }
-
-                    // Range filter — reject OI rows outside cache segment bounds
-                    let from_ms = cached.range.from.as_u64();
-                    let to_ms = cached.range.to.as_u64();
-                    let before_count = rows.len();
-                    let first_before = rows.first().map(|oi| oi.time);
-                    let last_before = rows.last().map(|oi| oi.time);
-                    let filtered_rows: Vec<_> = rows
-                        .into_iter()
-                        .filter(|oi| oi.time.as_u64() >= from_ms && oi.time.as_u64() < to_ms)
-                        .collect();
-                    if filtered_rows.len() != before_count {
-                        log::warn!(
-                            target: "marketdata",
-                            "MARKETDATA OICacheOutOfRangeFiltered | key={} cache_range={} before={} after={} first_before={} last_before={}",
-                            cached.key.display_key(),
-                            cached.range.format_display(),
-                            before_count,
-                            filtered_rows.len(),
-                            first_before.map_or("-".to_string(), crate::connector::fetcher::format_time_short),
-                            last_before.map_or("-".to_string(), crate::connector::fetcher::format_time_short)
-                        );
-                    }
-
-                    if filtered_rows.is_empty() {
-                        self.mark_cache_desync_and_refetch(&cached.key, cached.range, &mut refetch);
-                        continue;
-                    }
-
-                    self.market_coordinator
-                        .store
-                        .insert_open_interest(&cached.key, filtered_rows.as_slice());
-                    self.market_coordinator
-                        .record_cache_served(filtered_rows.len());
-                    self.dispatch_cached_oi(
-                        main_window,
-                        &cached.key,
-                        cached.range,
-                        *timeframe,
-                        filtered_rows,
-                    );
-                }
-            }
-        }
-        if plan.has_cached_data() {
-            self.log_market_data_progress_snapshot();
-        }
-        refetch
-    }
-
-    fn register_required_segments_from_plan(
-        &mut self,
-        plan: &crate::market_data::planner::DataLoadPlan,
-    ) {
-        // Only register cached segments as logical required segments.
-        // Network segments must NOT be registered here because they can be
-        // modified by execute_plan (kline canonicalization, active job subtraction,
-        // tiny gap suppression, dedup). The concrete job ranges are registered
-        // later by fetch_spec_for_market_job() and attach_pending_consumers_to_active_jobs().
-        for segment in &plan.cached_segments {
-            // Skip tiny cached segments for Trade/TradeHydration features —
-            // these represent tiny tail offsets and should not block completion.
-            if segment.range.duration_ms()
-                < crate::market_data::coordinator::MIN_TRADE_BACKFILL_SEGMENT_MS
-            {
-                let should_skip = self.pending_market_consumers.iter().any(|consumer| {
-                    consumer.key == segment.key
-                        && consumer.range.overlaps(&segment.range)
-                        && matches!(
-                            consumer.feature,
-                            ConsumerFeature::TradeHydration | ConsumerFeature::Footprint
-                        )
-                });
-                if should_skip {
-                    log::info!(
-                        target: "marketdata",
-                        "MARKETDATA TinyCachedSegmentSkipped | key={} segment={} duration_ms={}",
-                        segment.key.display_key(),
-                        segment.range.format_display(),
-                        segment.range.duration_ms()
-                    );
-                    continue;
-                }
-            }
-
-            let req_ids = self
-                .pending_market_consumers
-                .iter()
-                .filter(|consumer| {
-                    consumer.key == segment.key && consumer.range.overlaps(&segment.range)
-                })
-                .map(|consumer| consumer.req_id)
-                .collect::<Vec<_>>();
-
-            for req_id in req_ids {
-                self.add_required_segment_to_consumer(req_id, segment.range);
-            }
-        }
-    }
-
-    fn mark_cache_corrupt_and_refetch(
-        &mut self,
-        key: &MarketDataKey,
-        range: MarketDataRange,
-        reason: &str,
-        refetch: &mut Vec<fetcher::FetchSpec>,
-    ) {
-        log::warn!(
-            target: "marketdata",
-            "MARKETDATA CacheServeSkipped | key={} range={} reason={}",
-            key.display_key(),
-            range.format_display(),
-            reason
-        );
-        self.market_coordinator
-            .coverage
-            .mark_stale(key.clone(), range, "corrupt_cache");
-        if matches!(key.kind, MarketDataKind::Trades)
-            && range.duration_ms() < crate::market_data::coordinator::MIN_TRADE_BACKFILL_SEGMENT_MS
-        {
-            self.market_coordinator
-                .coverage
-                .mark_empty(key.clone(), range);
-            return;
-        }
-        if let Some(spec) = self.fetch_spec_for_market_refetch(key, range, &[], uuid::Uuid::nil()) {
-            refetch.push(spec);
-        }
-    }
-
-    fn mark_cache_desync_and_refetch(
-        &mut self,
-        key: &MarketDataKey,
-        range: MarketDataRange,
-        refetch: &mut Vec<fetcher::FetchSpec>,
-    ) {
-        log::warn!(
-            target: "marketdata",
-            "MARKETDATA CacheCoverageDesync | key={} range={} action=network_refetch",
-            key.display_key(),
-            range.format_display()
-        );
-        self.market_coordinator
-            .coverage
-            .mark_stale(key.clone(), range, "cache_desync");
-        if matches!(key.kind, MarketDataKind::Trades)
-            && range.duration_ms() < crate::market_data::coordinator::MIN_TRADE_BACKFILL_SEGMENT_MS
-        {
-            log::info!(
-                target: "marketdata",
-                "MARKETDATA TinyTradeGapSuppressed | key={} range={} reason=below_threshold_cache_desync",
-                key.display_key(),
-                range.format_display()
-            );
-            self.market_coordinator
-                .coverage
-                .mark_empty(key.clone(), range);
-            return;
-        }
-        if let Some(spec) = self.fetch_spec_for_market_refetch(key, range, &[], uuid::Uuid::nil()) {
-            refetch.push(spec);
-        }
-    }
-
-    fn dispatch_cached_klines(
-        &mut self,
-        main_window: window::Id,
-        key: &MarketDataKey,
-        range: MarketDataRange,
-        timeframe: exchange::Timeframe,
-        rows: Vec<Kline>,
-    ) {
-        let consumers = self.matching_pending_consumers(key, &range);
-        log::info!(
-            target: "marketdata",
-            "MARKETDATA CacheServe | key={} range={} consumers={}",
-            key.display_key(),
-            range.format_display(),
-            consumers.len()
-        );
-        for consumer in consumers {
-            if self.pending_consumer_is_stale(main_window, &consumer) {
-                continue;
-            }
-            if consumer.feature != ConsumerFeature::ChartKlines {
-                continue;
-            }
-            let stream = consumer
-                .stream
-                .or_else(|| self.stream_for_consumer_key(main_window, consumer.pane_id, key));
-            if let Some(StreamKind::Kline { ticker_info, .. }) = stream {
-                if !self.mark_consumer_segment_delivered(consumer.req_id, range) {
-                    continue;
-                }
-                if let Some(pane_state) =
-                    self.get_mut_pane_state_by_uuid(main_window, consumer.pane_id)
-                {
-                    pane_state.status = pane::Status::Ready;
-                    pane_state.insert_hist_klines_partial(
-                        Some(consumer.req_id),
-                        timeframe,
-                        ticker_info,
-                        &rows,
-                    );
-                }
-                self.complete_cached_segment_for_consumer(main_window, &consumer, range);
-            }
-        }
-    }
-
-    fn dispatch_cached_trades(
-        &mut self,
-        main_window: window::Id,
-        key: &MarketDataKey,
-        range: MarketDataRange,
-        rows: Vec<Trade>,
-    ) {
-        let consumers = self.matching_pending_consumers(key, &range);
-        log::info!(
-            target: "marketdata",
-            "MARKETDATA CacheServe | key={} range={} consumers={}",
-            key.display_key(),
-            range.format_display(),
-            consumers.len()
-        );
-        for consumer in consumers {
-            if self.pending_consumer_is_stale(main_window, &consumer) {
-                continue;
-            }
-            if !self.mark_consumer_segment_delivered(consumer.req_id, range) {
-                continue;
-            }
-            self.dispatch_trades_to_consumer(main_window, &consumer, rows.clone(), range);
-            self.complete_cached_segment_for_consumer(main_window, &consumer, range);
-        }
-    }
-
-    fn dispatch_cached_oi(
-        &mut self,
-        main_window: window::Id,
-        key: &MarketDataKey,
-        range: MarketDataRange,
-        _timeframe: exchange::Timeframe,
-        rows: Vec<exchange::OpenInterest>,
-    ) {
-        let consumers = self.matching_pending_consumers(key, &range);
-        log::info!(
-            target: "marketdata",
-            "MARKETDATA CacheServe | key={} range={} consumers={}",
-            key.display_key(),
-            range.format_display(),
-            consumers.len()
-        );
-        for consumer in consumers {
-            if self.pending_consumer_is_stale(main_window, &consumer) {
-                continue;
-            }
-            if consumer.feature != ConsumerFeature::OpenInterest {
-                continue;
-            }
-            let stream = consumer
-                .stream
-                .or_else(|| self.stream_for_consumer_key(main_window, consumer.pane_id, key));
-            if let Some(StreamKind::Kline { .. }) = stream {
-                if !self.mark_consumer_segment_delivered(consumer.req_id, range) {
-                    continue;
-                }
-                if let Some(pane_state) =
-                    self.get_mut_pane_state_by_uuid(main_window, consumer.pane_id)
-                {
-                    pane_state.status = pane::Status::Ready;
-                    pane_state.insert_hist_oi_partial(Some(consumer.req_id), &rows);
-                }
-                self.complete_cached_segment_for_consumer(main_window, &consumer, range);
-            }
-        }
+        self.market_data_runtime
+            .attach_pending_consumers_to_active_jobs(reason)
     }
 
     fn dispatch_pending_for_fetched_data(
@@ -2007,410 +1416,11 @@ impl Dashboard {
         stream_type: StreamKind,
         data: &FetchedData,
     ) -> bool {
-        let coordinator_job = fetched_data_req_id(data)
-            .and_then(|req_id| self.worker_req_to_job.get(&req_id).copied())
-            .and_then(|job_id| {
-                self.market_coordinator
-                    .job(job_id)
-                    .cloned()
-                    .map(|job| (job_id, job))
-            });
-
-        // Track raw record count before normalization to distinguish
-        // true empty responses from out-of-range filtered responses.
-        let raw_kline_count = match &data {
-            FetchedData::Klines { data, .. } => data.len(),
-            FetchedData::OI { data, .. } => data.len(),
-            _ => 0,
-        };
-
-        let data =
-            self.normalize_fetched_data_for_job(data, coordinator_job.as_ref().map(|(_, job)| job));
-
-        let Some((key, range, record_count)) = self.store_fetched_market_data(
-            stream_type,
-            &data,
-            coordinator_job.as_ref().map(|(_, job)| job),
-        ) else {
-            // If store returned None for a coordinator-owned Kline/OI job,
-            // it means the filtered data is empty.
-            // Distinguish between true empty and out-of-range filtered.
-            if let Some((job_id, job)) = &coordinator_job
-                && matches!(data, FetchedData::Klines { .. } | FetchedData::OI { .. })
-                && let Some(worker_req) = fetched_data_req_id(&data)
-            {
-                if raw_kline_count > 0 {
-                    // Records existed but were outside the authoritative job range.
-                    // This is an invalid response — must NOT mark coverage Empty/Complete.
-                    log::info!(
-                        target: "marketdata",
-                        "MARKETDATA KlineOutOfRangeFiltered | before={} after=0",
-                        raw_kline_count
-                    );
-                    log::info!(
-                        target: "marketdata",
-                        "MARKETDATA KlineInvalidResponse | worker_req={} requested={} reason=all_records_out_of_range",
-                        fetcher::short_id(worker_req),
-                        job.range.format_display()
-                    );
-                    log::info!(
-                        target: "marketdata",
-                        "MARKETDATA JobFailed | job={} reason=invalid_out_of_range_response",
-                        crate::market_data::job::short_id(*job_id)
-                    );
-                    self.finish_coordinator_worker_job_invalid(main_window, worker_req);
-                } else {
-                    // True empty response — exchange returned no records.
-                    log::info!(
-                        target: "marketdata",
-                        "MARKETDATA JobEmpty | job={} reason=zero_records_after_filter",
-                        crate::market_data::job::short_id(*job_id)
-                    );
-                    self.finish_coordinator_worker_job(main_window, worker_req, None);
-                }
-            }
-            return false;
-        };
-
-        let consumers = if let Some((job_id, _)) = &coordinator_job {
-            self.consumers_for_job(*job_id)
-        } else {
-            self.matching_pending_consumers(&key, &range)
-        };
-        if consumers.is_empty() {
-            if coordinator_job.is_some()
-                && matches!(data, FetchedData::Klines { .. } | FetchedData::OI { .. })
-                && let Some(worker_req) = fetched_data_req_id(&data)
-            {
-                self.finish_coordinator_worker_job(main_window, worker_req, None);
-                return true;
-            }
-            return false;
-        }
-
-        log::info!(
-            target: "marketdata",
-            "MARKETDATA ConsumerDispatch | key={} range={} consumers={} kind={}",
-            key.display_key(),
-            range.format_display(),
-            consumers.len(),
-            market_kind_label(&key.kind)
-        );
-
-        match &data {
-            FetchedData::Klines { data, .. } => {
-                for consumer in consumers {
-                    if self.pending_consumer_is_stale(main_window, &consumer) {
-                        continue;
-                    }
-                    if consumer.feature != ConsumerFeature::ChartKlines {
-                        continue;
-                    }
-                    let stream = consumer.stream.unwrap_or(stream_type);
-                    if let StreamKind::Kline {
-                        timeframe,
-                        ticker_info,
-                    } = stream
-                        && let Some(pane_state) =
-                            self.get_mut_pane_state_by_uuid(main_window, consumer.pane_id)
-                    {
-                        pane_state.status = pane::Status::Ready;
-                        pane_state.insert_hist_klines_partial(
-                            Some(consumer.req_id),
-                            timeframe,
-                            ticker_info,
-                            data,
-                        );
-                    }
-                }
-            }
-            FetchedData::Trades {
-                batch, until_time, ..
-            } => {
-                for consumer in consumers {
-                    if self.pending_consumer_is_stale(main_window, &consumer) {
-                        continue;
-                    }
-                    self.dispatch_trades_to_consumer(main_window, &consumer, batch.clone(), range);
-                    if consumer.feature == ConsumerFeature::Footprint {
-                        let _ = until_time;
-                    }
-                }
-            }
-            FetchedData::OI { data, .. } => {
-                for consumer in consumers {
-                    if self.pending_consumer_is_stale(main_window, &consumer) {
-                        continue;
-                    }
-                    if consumer.feature != ConsumerFeature::OpenInterest {
-                        continue;
-                    }
-                    if let Some(pane_state) =
-                        self.get_mut_pane_state_by_uuid(main_window, consumer.pane_id)
-                    {
-                        pane_state.status = pane::Status::Ready;
-                        pane_state.insert_hist_oi_partial(Some(consumer.req_id), data);
-                    }
-                }
-            }
-            FetchedData::BubbleSummary { .. } => {}
-        }
-
-        for job_id in coordinator_job
-            .as_ref()
-            .map(|(job_id, _)| vec![*job_id])
-            .unwrap_or_else(|| {
-                self.market_coordinator
-                    .active_jobs()
-                    .iter()
-                    .filter(|job| job.key == key && job.range.contains(&range))
-                    .map(|job| job.id)
-                    .collect::<Vec<_>>()
-            })
-        {
-            if let Some(job) = self.market_coordinator.job_mut(job_id) {
-                job.progress.records_fetched =
-                    job.progress.records_fetched.saturating_add(record_count);
-            }
-        }
-        if coordinator_job.is_some() {
-            self.market_coordinator.record_network_fetched(record_count);
-        }
-
-        if coordinator_job.is_some()
-            && matches!(data, FetchedData::Klines { .. } | FetchedData::OI { .. })
-            && let Some(worker_req) = fetched_data_req_id(&data)
-        {
-            self.finish_coordinator_worker_job(main_window, worker_req, None);
-        }
-
-        true
-    }
-
-    fn dispatch_trades_to_consumer(
-        &mut self,
-        main_window: window::Id,
-        consumer: &PendingMarketDataConsumer,
-        trades: Vec<Trade>,
-        range: MarketDataRange,
-    ) {
-        match consumer.feature {
-            ConsumerFeature::Footprint => {
-                let stream = consumer.stream.or_else(|| {
-                    self.stream_for_consumer_key(main_window, consumer.pane_id, &consumer.key)
-                });
-                if let Some(stream) = stream {
-                    let _ = self.distribute_fetched_data(
-                        main_window,
-                        consumer.pane_id,
-                        FetchedData::Trades {
-                            batch: trades,
-                            until_time: range.to,
-                            req_id: Some(consumer.req_id),
-                        },
-                        stream,
-                        true,
-                    );
-                }
-            }
-            ConsumerFeature::VolumeBubbles => {
-                log::info!(
-                    target: "marketdata",
-                    "MARKETDATA ConsumerDispatch | key={} range={} consumer=VolumeBubbles action=derive_bubbles",
-                    consumer.key.display_key(),
-                    range.format_display()
-                );
-                let fetcher::FetchRange::BubbleSummary {
-                    timeframe_ms,
-                    price_step,
-                    max_candidates_per_candle,
-                    ..
-                } = consumer.fetch
-                else {
-                    return;
-                };
-                log::info!(
-                    target: "marketdata",
-                    "MARKETDATA BubbleDerivedStart | source=Trades range={}",
-                    consumer.range.format_display()
-                );
-                match self.market_coordinator.compute_bubble_summaries(
-                    &consumer.key,
-                    &consumer.range,
-                    timeframe_ms,
-                    price_step,
-                    max_candidates_per_candle,
-                ) {
-                    Some(summaries) => {
-                        let trades_seen = trades.len();
-                        let candidates: usize = summaries.iter().map(|s| s.candidates.len()).sum();
-                        log::info!(
-                            target: "marketdata",
-                            "MARKETDATA BubbleReuse | source=coordinatorDerived range={} summaries={} candidates={}",
-                            consumer.range.format_display(),
-                            summaries.len(),
-                            candidates
-                        );
-                        log::info!(
-                            target: "marketdata",
-                            "MARKETDATA BubblePartialUpdate | req={} batch={} summaries={}",
-                            fetcher::short_id(consumer.req_id),
-                            trades_seen,
-                            summaries.len()
-                        );
-                        log::info!(
-                            target: "marketdata",
-                            "MARKETDATA BubbleChartUpdate | pane={} req={} partial=true summaries={}",
-                            crate::market_data::job::short_id(consumer.pane_id),
-                            fetcher::short_id(consumer.req_id),
-                            summaries.len()
-                        );
-                        if let Some(stream) = consumer.stream.or_else(|| {
-                            self.stream_for_consumer_key(
-                                main_window,
-                                consumer.pane_id,
-                                &consumer.key,
-                            )
-                        }) {
-                            self.apply_bubble_summaries_to_chart(
-                                main_window,
-                                consumer.pane_id,
-                                stream,
-                                summaries,
-                                consumer.range,
-                                trades_seen,
-                                0,
-                                Some(consumer.req_id),
-                                false,
-                            );
-                            self.mark_bubble_consumer_partial(consumer.req_id);
-                        }
-                    }
-                    None => {
-                        log::warn!(
-                            target: "marketdata",
-                            "MARKETDATA BubbleFallbackLegacy | reason=no_raw_trades_after_fetch"
-                        );
-                    }
-                }
-            }
-            ConsumerFeature::TradeHydration => {
-                // Insert raw trades into the owning KlineChart for CVD/delta indicators.
-                // This uses the same insertion path as Footprint trades.
-                log::info!(
-                    target: "marketdata",
-                    "MARKETDATA TradeHydrationDispatch | pane={} records={} range={} partial=true",
-                    crate::market_data::job::short_id(consumer.pane_id),
-                    trades.len(),
-                    range.format_display()
-                );
-                let stream = consumer.stream.or_else(|| {
-                    self.stream_for_consumer_key(main_window, consumer.pane_id, &consumer.key)
-                });
-                if let Some(stream) = stream {
-                    let _ = self.distribute_fetched_data(
-                        main_window,
-                        consumer.pane_id,
-                        FetchedData::Trades {
-                            batch: trades,
-                            until_time: range.to,
-                            req_id: Some(consumer.req_id),
-                        },
-                        stream,
-                        true,
-                    );
-                }
-            }
-            _ => {}
-        }
-    }
-
-    fn dispatch_final_bubbles_to_consumer(
-        &mut self,
-        main_window: window::Id,
-        consumer: &PendingMarketDataConsumer,
-    ) {
-        if consumer.completed {
-            log::info!(
-                target: "marketdata",
-                "MARKETDATA BubbleDuplicateCompleteSuppressed | req={}",
-                fetcher::short_id(consumer.req_id)
-            );
-            return;
-        }
-
-        let fetcher::FetchRange::BubbleSummary {
-            timeframe_ms,
-            price_step,
-            max_candidates_per_candle,
-            ..
-        } = consumer.fetch
-        else {
-            return;
-        };
-
-        match self.market_coordinator.compute_bubble_summaries(
-            &consumer.key,
-            &consumer.range,
-            timeframe_ms,
-            price_step,
-            max_candidates_per_candle,
-        ) {
-            Some(summaries) => {
-                log::info!(
-                    target: "marketdata",
-                    "MARKETDATA BubbleFinalUpdate | req={} summaries={} had_partial={}",
-                    fetcher::short_id(consumer.req_id),
-                    summaries.len(),
-                    consumer.has_partial_updates
-                );
-                log::info!(
-                    target: "marketdata",
-                    "MARKETDATA Derived | kind=VolumeBubbles source=Trades range={} candles={} candidates={}",
-                    consumer.range.format_display(),
-                    summaries.len(),
-                    summaries
-                        .iter()
-                        .map(|summary| summary.candidates.len())
-                        .sum::<usize>()
-                );
-                log::info!(
-                    target: "marketdata",
-                    "MARKETDATA BubbleChartUpdate | pane={} req={} partial=false summaries={}",
-                    crate::market_data::job::short_id(consumer.pane_id),
-                    fetcher::short_id(consumer.req_id),
-                    summaries.len()
-                );
-
-                if let Some(stream) = consumer.stream.or_else(|| {
-                    self.stream_for_consumer_key(main_window, consumer.pane_id, &consumer.key)
-                }) {
-                    self.apply_bubble_summaries_to_chart(
-                        main_window,
-                        consumer.pane_id,
-                        stream,
-                        summaries,
-                        consumer.range,
-                        0,
-                        0,
-                        Some(consumer.req_id),
-                        true,
-                    );
-                    self.mark_bubble_consumer_completed(consumer.req_id);
-                    log::info!(
-                        target: "marketdata",
-                        "MARKETDATA BubbleChartComplete | req={}",
-                        fetcher::short_id(consumer.req_id)
-                    );
-                }
-            }
-            None => {
-                log::warn!(
-                    target: "marketdata",
-                    "MARKETDATA BubbleFallbackLegacy | reason=no_raw_trades_on_complete"
-                );
-            }
-        }
+        let outcome = self
+            .market_data_runtime
+            .effects_for_fetched_data(stream_type, data);
+        self.apply_market_data_effects(main_window, outcome.effects);
+        outcome.handled
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -2470,42 +1480,13 @@ impl Dashboard {
         }
     }
 
-    fn mark_bubble_consumer_partial(&mut self, req_id: uuid::Uuid) {
-        if let Some(consumer) = self
-            .pending_market_consumers
-            .iter_mut()
-            .find(|consumer| consumer.req_id == req_id)
-        {
-            consumer.has_partial_updates = true;
-        }
-    }
-
     fn mark_bubble_consumer_completed(&mut self, req_id: uuid::Uuid) {
-        if let Some(consumer) = self
-            .pending_market_consumers
-            .iter_mut()
-            .find(|consumer| consumer.req_id == req_id)
-        {
-            if consumer.completed {
-                log::info!(
-                    target: "marketdata",
-                    "MARKETDATA BubbleDuplicateCompleteSuppressed | req={}",
-                    fetcher::short_id(req_id)
-                );
-            } else {
-                consumer.completed = true;
-            }
-        }
+        self.market_data_runtime
+            .mark_bubble_consumer_completed(req_id);
     }
 
     fn mark_generic_consumer_completed(&mut self, req_id: uuid::Uuid) {
-        if let Some(consumer) = self
-            .pending_market_consumers
-            .iter_mut()
-            .find(|consumer| consumer.req_id == req_id)
-        {
-            consumer.completed = true;
-        }
+        self.market_data_runtime.mark_consumer_completed(req_id);
     }
 
     fn pending_consumer_is_stale(
@@ -2533,375 +1514,54 @@ impl Dashboard {
         stale
     }
 
-    fn store_fetched_market_data(
-        &mut self,
-        stream_type: StreamKind,
-        data: &FetchedData,
-        coordinator_job: Option<&crate::market_data::job::FetchJob>,
-    ) -> Option<(MarketDataKey, MarketDataRange, usize)> {
-        let key = coordinator_job
-            .map(|job| job.key.clone())
-            .or_else(|| key_for_fetched_data(stream_type, data))?;
-        match data {
-            FetchedData::Trades { batch, .. } => {
-                let range = coordinator_job
-                    .map(|job| job.range)
-                    .or_else(|| range_from_trades(batch))?;
-                self.market_coordinator.feed_trades(&key, batch);
-                self.market_cache.insert_trades(&key, batch);
-                Some((key, range, batch.len()))
-            }
-            FetchedData::Klines { data, .. } => {
-                if data.is_empty() {
-                    log::info!(
-                        target: "marketdata",
-                        "MARKETDATA KlineStoreSkipped | key={} reason=zero_records_after_filter",
-                        key.display_key()
-                    );
-                    return None;
-                }
-                let range = coordinator_job
-                    .map(|job| job.range)
-                    .or_else(|| range_from_klines(data))?;
-                self.market_coordinator.feed_klines(&key, data);
-                self.market_cache.insert_klines(&key, data);
-                Some((key, range, data.len()))
-            }
-            FetchedData::OI { data, .. } => {
-                if data.is_empty() {
-                    log::info!(
-                        target: "marketdata",
-                        "MARKETDATA OIStoreSkipped | key={} reason=zero_records_after_filter",
-                        key.display_key()
-                    );
-                    return None;
-                }
-                let range = coordinator_job
-                    .map(|job| job.range)
-                    .or_else(|| range_from_oi(data))?;
-                self.market_coordinator
-                    .store
-                    .insert_open_interest(&key, data);
-                self.market_cache.insert_open_interest(&key, data);
-                Some((key, range, data.len()))
-            }
-            FetchedData::BubbleSummary { .. } => None,
-        }
-    }
-
     fn matching_pending_consumers(
         &self,
         key: &MarketDataKey,
         range: &MarketDataRange,
     ) -> Vec<PendingMarketDataConsumer> {
-        self.pending_market_consumers
-            .iter()
-            .filter(|consumer| consumer.key == *key && consumer.range.overlaps(range))
-            .cloned()
-            .collect()
-    }
-
-    fn consumers_for_job(&self, job_id: FetchJobId) -> Vec<PendingMarketDataConsumer> {
-        self.job_to_consumers
-            .get(&job_id)
-            .into_iter()
-            .flatten()
-            .filter_map(|req_id| {
-                self.pending_market_consumers
-                    .iter()
-                    .find(|consumer| consumer.req_id == *req_id)
-                    .cloned()
-            })
-            .collect()
-    }
-
-    fn normalize_fetched_data_for_job(
-        &self,
-        data: &FetchedData,
-        coordinator_job: Option<&crate::market_data::job::FetchJob>,
-    ) -> FetchedData {
-        let Some(job) = coordinator_job else {
-            return data.clone();
-        };
-        match data {
-            FetchedData::Trades {
-                batch,
-                until_time: _,
-                req_id,
-            } => {
-                let before = batch.len();
-                let first_before = batch.first().map(|trade| trade.time);
-                let last_before = batch.last().map(|trade| trade.time);
-                let filtered = batch
-                    .iter()
-                    .filter(|trade| job.range.contains_timestamp(trade.time))
-                    .copied()
-                    .collect::<Vec<_>>();
-                if filtered.len() != before {
-                    log::info!(
-                        target: "marketdata",
-                        "MARKETDATA TradeOutOfRangeFiltered | worker_req={} requested={} before={} after={} first_before={} last_before={}",
-                        req_id.map_or("-".to_string(), fetcher::short_id),
-                        job.range.format_display(),
-                        before,
-                        filtered.len(),
-                        fetcher::format_optional_time(first_before),
-                        fetcher::format_optional_time(last_before)
-                    );
-                }
-                FetchedData::Trades {
-                    batch: filtered,
-                    until_time: job.range.to,
-                    req_id: *req_id,
-                }
-            }
-            FetchedData::Klines { data, req_id } => {
-                let before = data.len();
-                let first_before = data.first().map(|k| k.time);
-                let last_before = data.last().map(|k| k.time);
-
-                let filtered = data
-                    .iter()
-                    .filter(|kline| job.range.contains_timestamp(kline.time))
-                    .copied()
-                    .collect::<Vec<_>>();
-
-                if filtered.len() != before {
-                    log::info!(
-                        target: "marketdata",
-                        "MARKETDATA KlineOutOfRangeFiltered | worker_req={} requested={} before={} after={} first_before={} last_before={}",
-                        req_id.map_or("-".to_string(), fetcher::short_id),
-                        job.range.format_display(),
-                        before,
-                        filtered.len(),
-                        fetcher::format_optional_time(first_before),
-                        fetcher::format_optional_time(last_before)
-                    );
-                }
-
-                FetchedData::Klines {
-                    data: filtered,
-                    req_id: *req_id,
-                }
-            }
-            _ => data.clone(),
-        }
+        self.market_data_runtime
+            .matching_pending_consumers(key, range)
     }
 
     fn remove_pending_consumers(&mut self, key: &MarketDataKey, range: &MarketDataRange) {
-        self.pending_market_consumers.retain(|consumer| {
-            !(consumer.key == *key
-                && consumer.completed
-                && !consumer_has_effective_gaps(consumer)
-                && consumer.range.overlaps(range))
-        });
+        self.market_data_runtime
+            .remove_completed_consumers_for(key, range);
     }
 
+    #[cfg(test)]
     fn add_required_segment_to_consumer(&mut self, req_id: uuid::Uuid, segment: MarketDataRange) {
-        if let Some(consumer) = self
-            .pending_market_consumers
-            .iter_mut()
-            .find(|consumer| consumer.req_id == req_id)
-        {
-            // Use dedup (not merge) to keep adjacent logical segments separate
-            // for accurate completed/total logging counters.
-            add_required_segment_dedup(&mut consumer.required_segments, segment);
-        }
+        self.market_data_runtime
+            .add_required_segment_to_consumer(req_id, segment);
     }
 
+    #[cfg(test)]
     fn mark_consumer_segment_complete(
         &mut self,
         req_id: uuid::Uuid,
         segment: MarketDataRange,
-    ) -> Option<ConsumerSegmentStatus> {
-        let consumer = self
-            .pending_market_consumers
-            .iter_mut()
-            .find(|consumer| consumer.req_id == req_id)?;
-        crate::market_data::range::add_segment_merged(&mut consumer.completed_segments, segment);
-        let raw_missing = compute_missing(consumer.range, &consumer.completed_segments);
-
-        // For Trade/TradeHydration/Footprint features, suppress tiny gaps
-        let missing = if matches!(
-            consumer.feature,
-            ConsumerFeature::TradeHydration | ConsumerFeature::Footprint
-        ) {
-            crate::market_data::range::filter_tiny_trade_gaps(
-                raw_missing.clone(),
-                crate::market_data::coordinator::MIN_TRADE_BACKFILL_SEGMENT_MS,
-            )
-        } else {
-            raw_missing.clone()
-        };
-
-        // Logical segment counting: count how many required segments are fully covered
-        // by the accumulated completed coverage.
-        let total_logical = consumer.required_segments.len();
-        let completed_logical = consumer
-            .required_segments
-            .iter()
-            .filter(|required| compute_missing(**required, &consumer.completed_segments).is_empty())
-            .count();
-
-        Some(ConsumerSegmentStatus {
-            completed_logical,
-            total_logical,
-            coverage_complete: missing.is_empty(),
-            missing,
-        })
+    ) -> Option<crate::market_data::runtime::ConsumerSegmentStatus> {
+        self.market_data_runtime
+            .mark_consumer_segment_complete(req_id, segment)
     }
 
+    #[cfg(test)]
     fn mark_consumer_segment_delivered(
         &mut self,
         req_id: uuid::Uuid,
         segment: MarketDataRange,
     ) -> bool {
-        let Some(consumer) = self
-            .pending_market_consumers
-            .iter_mut()
-            .find(|consumer| consumer.req_id == req_id)
-        else {
-            return false;
-        };
-        // Check if this segment is already fully covered by delivered segments
-        let missing =
-            crate::market_data::range::compute_missing(segment, &consumer.delivered_segments);
-        if missing.is_empty() {
-            log::info!(
-                target: "marketdata",
-                "MARKETDATA ConsumerSegmentAlreadyDelivered | req={} segment={} action=skip",
-                fetcher::short_id(req_id),
-                segment.format_display()
-            );
-            return false;
-        }
-        crate::market_data::range::add_segment_merged(&mut consumer.delivered_segments, segment);
-        true
+        self.market_data_runtime
+            .mark_consumer_segment_delivered(req_id, segment)
     }
 
-    fn complete_cached_segment_for_consumer(
-        &mut self,
-        main_window: window::Id,
-        consumer: &PendingMarketDataConsumer,
-        segment: MarketDataRange,
-    ) {
-        let Some(status) = self.mark_consumer_segment_complete(consumer.req_id, segment) else {
-            return;
-        };
-        if status.coverage_complete {
-            log::info!(
-                target: "marketdata",
-                "MARKETDATA ConsumerSegmentComplete | req={} segment={} completed={}/{} source=cache coverage_complete=true missing=",
-                fetcher::short_id(consumer.req_id),
-                segment.format_display(),
-                status.completed_logical,
-                status.total_logical
-            );
-        } else {
-            log::info!(
-                target: "marketdata",
-                "MARKETDATA ConsumerSegmentComplete | req={} segment={} completed={}/{} source=cache coverage_complete=false missing={}",
-                fetcher::short_id(consumer.req_id),
-                segment.format_display(),
-                status.completed_logical,
-                status.total_logical,
-                status.missing.iter().map(MarketDataRange::format_display).collect::<Vec<_>>().join(",")
-            );
-        }
-
-        if self.consumer_is_fully_satisfied(consumer.req_id) {
-            log::info!(
-                target: "marketdata",
-                "MARKETDATA ChartReqComplete | chart_req={} feature={}",
-                fetcher::short_id(consumer.req_id),
-                consumer.feature.short_name()
-            );
-            match consumer.feature {
-                ConsumerFeature::VolumeBubbles => {
-                    if let Some(updated) = self
-                        .pending_market_consumers
-                        .iter()
-                        .find(|pending| pending.req_id == consumer.req_id)
-                        .cloned()
-                    {
-                        self.dispatch_final_bubbles_to_consumer(main_window, &updated);
-                    }
-                }
-                _ => {
-                    self.complete_pending_consumer(main_window, consumer, None);
-                    self.mark_generic_consumer_completed(consumer.req_id);
-                }
-            }
-        } else {
-            let remaining = self.consumer_remaining_segments(consumer.req_id).join(",");
-            log::info!(
-                target: "marketdata",
-                "MARKETDATA ConsumerWaiting | req={} remaining={}",
-                fetcher::short_id(consumer.req_id),
-                remaining
-            );
-        }
-    }
-
-    /// Compute "effective" missing ranges for a consumer, suppressing tiny
-    /// Trade/TradeHydration gaps that are below the backfill segment threshold.
-    fn effective_missing_for_consumer(&self, req_id: uuid::Uuid) -> Vec<MarketDataRange> {
-        self.pending_market_consumers
-            .iter()
-            .find(|consumer| consumer.req_id == req_id)
-            .map(|consumer| {
-                let raw_missing = compute_missing(consumer.range, &consumer.completed_segments);
-                if matches!(
-                    consumer.feature,
-                    ConsumerFeature::TradeHydration | ConsumerFeature::Footprint
-                ) {
-                    crate::market_data::range::filter_tiny_trade_gaps(
-                        raw_missing,
-                        crate::market_data::coordinator::MIN_TRADE_BACKFILL_SEGMENT_MS,
-                    )
-                } else {
-                    raw_missing
-                }
-            })
-            .unwrap_or_default()
-    }
-
+    #[cfg(test)]
     fn consumer_remaining_segments(&self, req_id: uuid::Uuid) -> Vec<String> {
-        self.pending_market_consumers
-            .iter()
-            .find(|consumer| consumer.req_id == req_id)
-            .map(|consumer| {
-                let terminal_segments = consumer
-                    .completed_segments
-                    .iter()
-                    .chain(consumer.failed_segments.iter())
-                    .copied()
-                    .collect::<Vec<_>>();
-                let raw_missing = compute_missing(consumer.range, &terminal_segments);
-                let missing = if matches!(
-                    consumer.feature,
-                    ConsumerFeature::TradeHydration | ConsumerFeature::Footprint
-                ) {
-                    crate::market_data::range::filter_tiny_trade_gaps(
-                        raw_missing,
-                        crate::market_data::coordinator::MIN_TRADE_BACKFILL_SEGMENT_MS,
-                    )
-                } else {
-                    raw_missing
-                };
-                missing.into_iter().map(|r| r.format_display()).collect()
-            })
-            .unwrap_or_default()
+        self.market_data_runtime.consumer_remaining_segments(req_id)
     }
 
+    #[cfg(test)]
     fn consumer_is_fully_satisfied(&self, req_id: uuid::Uuid) -> bool {
-        self.pending_market_consumers
-            .iter()
-            .find(|consumer| consumer.req_id == req_id)
-            .is_some_and(|consumer| {
-                consumer.required_segments.is_empty()
-                    || self.effective_missing_for_consumer(req_id).is_empty()
-            })
+        self.market_data_runtime.consumer_is_fully_satisfied(req_id)
     }
 
     fn complete_pending_consumer(
@@ -2912,7 +1572,11 @@ impl Dashboard {
     ) -> bool {
         if let Some(pane_state) = self.get_mut_pane_state_by_uuid(main_window, consumer.pane_id) {
             if let pane::Content::Kline { chart: Some(c), .. } = &mut pane_state.content {
-                if matches!(consumer.fetch, fetcher::FetchRange::Trades(_, _)) {
+                if consumer.feature == ConsumerFeature::VolumeBubbles {
+                    // Bubble chart completion is driven by the runtime-derived final
+                    // InsertBubbleSummaries effect so partial batch updates cannot
+                    // remove the pending chart-local request.
+                } else if matches!(consumer.fetch, fetcher::FetchRange::Trades(_, _)) {
                     c.complete_trade_fetch(
                         Some(consumer.req_id),
                         Some(consumer.fetch),
@@ -2925,9 +1589,6 @@ impl Dashboard {
                         Some(consumer.fetch),
                         empty_covered_tail,
                     );
-                } else if matches!(consumer.fetch, fetcher::FetchRange::BubbleSummary { .. }) {
-                    // Bubble chart completion is driven by dispatch_final_bubbles_to_consumer so
-                    // partial batch updates cannot remove the pending chart-local request.
                 } else {
                     if !c.mark_request_completed_if_present(consumer.req_id) {
                         log::info!(
@@ -2981,7 +1642,7 @@ impl Dashboard {
             return Task::none();
         }
 
-        // Check for stale generation before applying any data
+        // Check for stale generation before applying legacy/non-runtime data.
         if !skip_stale_check {
             let req_id = match &data {
                 FetchedData::Trades { req_id, .. } => *req_id,
@@ -3004,141 +1665,16 @@ impl Dashboard {
                     request_gen.map_or("-".to_string(), |g| g.to_string()),
                     current_gen
                 );
-                // Mark the request as completed to clean up pending state
+                // Mark the request as completed to clean up pending state.
                 c.mark_trade_request_completed(req_id);
                 return Task::none();
             }
         }
 
-        match data {
-            FetchedData::Trades {
-                batch,
-                until_time,
-                req_id,
-            } => {
-                let last_trade_time = batch.last().map_or(UnixMs::ZERO, |trade| trade.time);
-                let received = batch.len();
-                let first_received = batch.first().map(|trade| trade.time);
-                let last_received = batch.last().map(|trade| trade.time);
-
-                if last_trade_time < until_time {
-                    log::debug!(
-                        "DATA Trades Distribute | pane={} req={} stream={} received={} inserted={} dropped_after_until=0 until_time={} first_received={} last_received={}",
-                        fetcher::short_id(pane_id),
-                        fetcher::format_req_id(req_id),
-                        fetcher::format_stream(&stream_type),
-                        received,
-                        received,
-                        fetcher::format_time_short(until_time),
-                        fetcher::format_optional_time(first_received),
-                        fetcher::format_optional_time(last_received)
-                    );
-                    if let Err(reason) =
-                        self.insert_fetched_trades(main_window, pane_id, &batch, false, req_id)
-                    {
-                        return self.handle_error(Some(pane_id), &reason, main_window);
-                    }
-                } else {
-                    let filtered_batch = batch
-                        .iter()
-                        .filter(|trade| trade.time <= until_time)
-                        .copied()
-                        .collect::<Vec<_>>();
-                    let dropped_after_until = received.saturating_sub(filtered_batch.len());
-
-                    log::debug!(
-                        "DATA Trades Distribute | pane={} req={} stream={} received={received} inserted={} dropped_after_until={dropped_after_until} until_time={} first_received={} last_received={}",
-                        fetcher::short_id(pane_id),
-                        fetcher::format_req_id(req_id),
-                        fetcher::format_stream(&stream_type),
-                        filtered_batch.len(),
-                        fetcher::format_time_short(until_time),
-                        fetcher::format_optional_time(first_received),
-                        fetcher::format_optional_time(last_received)
-                    );
-
-                    if let Err(reason) = self.insert_fetched_trades(
-                        main_window,
-                        pane_id,
-                        &filtered_batch,
-                        true,
-                        req_id,
-                    ) {
-                        return self.handle_error(Some(pane_id), &reason, main_window);
-                    }
-                }
-            }
-            FetchedData::BubbleSummary {
-                data,
-                range,
-                trades_seen,
-                raw_discarded,
-                req_id,
-            } => {
-                log::debug!(
-                    "BUBBLE Summary Distribute | pane={} req={} stream={} range={} candles={} trades_seen={} raw_discarded={}",
-                    fetcher::short_id(pane_id),
-                    fetcher::format_req_id(req_id),
-                    fetcher::format_stream(&stream_type),
-                    fetcher::format_time_range(range.0, range.1),
-                    data.len(),
-                    trades_seen,
-                    raw_discarded
-                );
-                if let Some(pane_state) = self.get_mut_pane_state_by_uuid(main_window, pane_id) {
-                    pane_state.status = pane::Status::Ready;
-                    if let pane::Content::Kline { chart: Some(c), .. } = &mut pane_state.content {
-                        c.insert_bubble_summaries(
-                            data,
-                            range.0,
-                            range.1,
-                            trades_seen,
-                            raw_discarded,
-                            req_id,
-                        );
-                    }
-                }
-            }
-            FetchedData::Klines { data, req_id } => {
-                log::debug!(
-                    "DATA Klines Distribute | pane={} req={} stream={} count={} first={} last={}",
-                    fetcher::short_id(pane_id),
-                    fetcher::format_req_id(req_id),
-                    fetcher::format_stream(&stream_type),
-                    data.len(),
-                    fetcher::format_optional_time(data.first().map(|kline| kline.time)),
-                    fetcher::format_optional_time(data.last().map(|kline| kline.time))
-                );
-                if let Some(pane_state) = self.get_mut_pane_state_by_uuid(main_window, pane_id) {
-                    pane_state.status = pane::Status::Ready;
-
-                    if let StreamKind::Kline {
-                        timeframe,
-                        ticker_info,
-                    } = stream_type
-                    {
-                        pane_state.insert_hist_klines(req_id, timeframe, ticker_info, &data);
-                    }
-                }
-            }
-            FetchedData::OI { data, req_id } => {
-                log::debug!(
-                    "DATA OI Distribute | pane={} req={} stream={} count={}",
-                    fetcher::short_id(pane_id),
-                    fetcher::format_req_id(req_id),
-                    fetcher::format_stream(&stream_type),
-                    data.len()
-                );
-                if let Some(pane_state) = self.get_mut_pane_state_by_uuid(main_window, pane_id) {
-                    pane_state.status = pane::Status::Ready;
-
-                    if let StreamKind::Kline { .. } = stream_type {
-                        pane_state.insert_hist_oi(req_id, &data);
-                    }
-                }
-            }
-        }
-
+        let effects =
+            self.market_data_runtime
+                .legacy_fetched_data_effects(pane_id, stream_type, data);
+        self.apply_market_data_effects(main_window, effects);
         Task::none()
     }
 
@@ -3148,156 +1684,13 @@ impl Dashboard {
         worker_req: uuid::Uuid,
         empty_covered_tail: Option<(UnixMs, UnixMs)>,
     ) -> bool {
-        let Some(job_id) = self.worker_req_to_job.get(&worker_req).copied() else {
+        let Some(effects) = self
+            .market_data_runtime
+            .finish_worker_job_effects(worker_req, empty_covered_tail)
+        else {
             return false;
         };
-
-        log::info!(
-            target: "marketdata",
-            "MARKETDATA WorkerDone | worker_req={} job={}",
-            fetcher::short_id(worker_req),
-            crate::market_data::job::short_id(job_id)
-        );
-        log::info!(
-            target: "marketdata",
-            "MARKETDATA WorkerReqIgnoredByChartHandler | worker_req={} reason=coordinator_owned",
-            fetcher::short_id(worker_req)
-        );
-
-        let Some(job) = self.market_coordinator.job(job_id).cloned() else {
-            self.worker_req_to_job.remove(&worker_req);
-            self.job_to_worker_req.remove(&job_id);
-            self.job_to_consumers.remove(&job_id);
-            return true;
-        };
-        let consumer_ids = self
-            .job_to_consumers
-            .get(&job_id)
-            .cloned()
-            .unwrap_or_default();
-        let records = job.progress.records_fetched;
-
-        for chart_req in &consumer_ids {
-            let Some(status) = self.mark_consumer_segment_complete(*chart_req, job.range) else {
-                log::info!(
-                    target: "marketdata",
-                    "MARKETDATA ChartReqMissing | chart_req={} feature={} reason=already_removed_or_generation_stale",
-                    fetcher::short_id(*chart_req),
-                    market_kind_label(&job.key.kind)
-                );
-                continue;
-            };
-
-            let Some(consumer) = self
-                .pending_market_consumers
-                .iter()
-                .find(|consumer| consumer.req_id == *chart_req)
-                .cloned()
-            else {
-                log::info!(
-                    target: "marketdata",
-                    "MARKETDATA ChartReqMissing | chart_req={} feature={} reason=already_removed_or_generation_stale",
-                    fetcher::short_id(*chart_req),
-                    market_kind_label(&job.key.kind)
-                );
-                continue;
-            };
-
-            if self.pending_consumer_is_stale(main_window, &consumer) {
-                log::info!(
-                    target: "marketdata",
-                    "MARKETDATA ChartReqMissing | chart_req={} feature={} reason=already_removed_or_generation_stale",
-                    fetcher::short_id(*chart_req),
-                    consumer.feature.short_name()
-                );
-                self.mark_generic_consumer_completed(*chart_req);
-                continue;
-            }
-
-            match consumer.feature {
-                ConsumerFeature::VolumeBubbles => {
-                    log::info!(
-                        target: "marketdata",
-                        "MARKETDATA BubbleSegmentComplete | req={} segment={} completed={}/{} missing={}",
-                        fetcher::short_id(*chart_req),
-                        job.range.format_display(),
-                        status.completed_logical,
-                        status.total_logical,
-                        status.missing.iter().map(MarketDataRange::format_display).collect::<Vec<_>>().join(",")
-                    );
-                    if self.consumer_is_fully_satisfied(*chart_req) {
-                        self.dispatch_final_bubbles_to_consumer(main_window, &consumer);
-                    } else {
-                        let remaining = self.consumer_remaining_segments(*chart_req).join(",");
-                        log::info!(
-                            target: "marketdata",
-                            "MARKETDATA BubbleWaiting | req={} remaining={}",
-                            fetcher::short_id(*chart_req),
-                            remaining
-                        );
-                    }
-                }
-                _ => {
-                    let feature_label = consumer.feature.short_name();
-                    log::info!(
-                        target: "marketdata",
-                        "MARKETDATA ConsumerSegmentComplete | req={} segment={} completed={}/{} source=network feature={} coverage_complete={} missing={}",
-                        fetcher::short_id(*chart_req),
-                        job.range.format_display(),
-                        status.completed_logical,
-                        status.total_logical,
-                        feature_label,
-                        status.coverage_complete,
-                        status.missing.iter().map(MarketDataRange::format_display).collect::<Vec<_>>().join(",")
-                    );
-                    if self.consumer_is_fully_satisfied(*chart_req) {
-                        log::info!(
-                            target: "marketdata",
-                            "MARKETDATA ChartReqComplete | chart_req={} feature={}",
-                            fetcher::short_id(*chart_req),
-                            consumer.feature.short_name()
-                        );
-                        self.complete_pending_consumer(main_window, &consumer, empty_covered_tail);
-                        self.mark_generic_consumer_completed(*chart_req);
-                    } else {
-                        let remaining = self.consumer_remaining_segments(*chart_req).join(",");
-                        log::info!(
-                            target: "marketdata",
-                            "MARKETDATA ConsumerWaiting | req={} remaining={}",
-                            fetcher::short_id(*chart_req),
-                            remaining
-                        );
-                    }
-                }
-            }
-        }
-
-        if empty_covered_tail.is_some() || records == 0 {
-            self.market_coordinator.mark_empty_and_remove_job(job_id);
-        } else {
-            self.market_coordinator
-                .complete_and_remove_job(job_id, records);
-        }
-
-        self.worker_req_to_job.remove(&worker_req);
-        self.job_to_worker_req.remove(&job_id);
-        self.job_to_consumers.remove(&job_id);
-        self.pending_market_consumers
-            .retain(|consumer| !consumer.completed || consumer_has_effective_gaps(consumer));
-
-        if let Err(e) = self
-            .market_cache
-            .save_coverage(&self.market_coordinator.coverage)
-        {
-            log::warn!(
-                target: "marketdata",
-                "MARKETDATA CoverageSaveFailed | error={}",
-                e
-            );
-        }
-
-        self.log_market_data_progress_snapshot();
-
+        self.apply_market_data_effects(main_window, effects);
         true
     }
 
@@ -3311,57 +1704,16 @@ impl Dashboard {
         _main_window: window::Id,
         worker_req: uuid::Uuid,
     ) {
-        let Some(job_id) = self.worker_req_to_job.get(&worker_req).copied() else {
-            return;
-        };
-
-        log::info!(
-            target: "marketdata",
-            "MARKETDATA WorkerDone | worker_req={} job={}",
-            fetcher::short_id(worker_req),
-            crate::market_data::job::short_id(job_id)
-        );
-
-        // Fail and remove the job — do NOT mark coverage Empty or Complete.
-        self.market_coordinator
-            .fail_and_remove_job(job_id, "invalid_out_of_range_response".to_string());
-
-        log::info!(
-            target: "marketdata",
-            "MARKETDATA JobRemoved | job={} reason=invalid_out_of_range_response",
-            crate::market_data::job::short_id(job_id)
-        );
-
-        // Clean up mappings — no dispatch, no cache, no coverage update.
-        self.worker_req_to_job.remove(&worker_req);
-        self.job_to_worker_req.remove(&job_id);
-        self.job_to_consumers.remove(&job_id);
-
-        // Do NOT save coverage — nothing changed.
-        // Do NOT dispatch to consumers — no valid data.
-
-        self.log_market_data_progress_snapshot();
+        if self
+            .market_data_runtime
+            .finish_worker_job_invalid(worker_req)
+        {
+            self.log_market_data_progress_snapshot();
+        }
     }
 
     fn log_market_data_progress_snapshot(&self) {
-        let progress = self.market_coordinator.progress_snapshot();
-        log::info!(
-            target: "marketdata",
-            "MARKETDATA ProgressSnapshot | active={} cached_records={} fetched_records={} jobs=[{}]",
-            progress.active_job_count(),
-            progress.total_cached_records,
-            progress.total_fetched_records,
-            progress
-                .active_jobs
-                .iter()
-                .map(|job| format!(
-                    "{}:{}",
-                    crate::market_data::job::short_id(job.id),
-                    job.range.format_display()
-                ))
-                .collect::<Vec<_>>()
-                .join(",")
-        );
+        self.market_data_runtime.log_progress_snapshot();
     }
 
     fn complete_fetch(
@@ -3372,164 +1724,33 @@ impl Dashboard {
         fetch: Option<fetcher::FetchRange>,
         empty_covered_tail: Option<(UnixMs, UnixMs)>,
     ) {
-        if let Some(worker_req) = req_id
-            && self.finish_coordinator_worker_job(main_window, worker_req, empty_covered_tail)
-        {
-            let _ = pane_id;
-            let _ = fetch;
+        let Some(pane_state) = self.get_pane_state_by_uuid(main_window, pane_id) else {
+            log::warn!(
+                "FETCH Complete | pane={} req={} fetch={} found=false reason=no_pane",
+                fetcher::short_id(pane_id),
+                fetcher::format_req_id(req_id),
+                fetcher::format_fetch_range_compact(fetch)
+            );
             return;
-        }
-
-        // Step 1: Extract data from pane_state without holding borrow
-        let (streams_snapshot, pane_exists) = {
-            if let Some(pane_state) = self.get_mut_pane_state_by_uuid(main_window, pane_id) {
-                let streams = pane_state.streams.find_ready_map(|s| match s {
-                    StreamKind::Kline { ticker_info, .. }
-                    | StreamKind::Trades { ticker_info }
-                    | StreamKind::Depth { ticker_info, .. } => Some(*ticker_info),
-                });
-                (streams, true)
-            } else {
-                log::warn!(
-                    "FETCH Complete | pane={} req={} fetch={} found=false reason=no_pane",
-                    fetcher::short_id(pane_id),
-                    fetcher::format_req_id(req_id),
-                    fetcher::format_fetch_range_compact(fetch)
-                );
-                (None, false)
-            }
         };
 
-        if !pane_exists {
-            return;
-        }
+        let ready_streams = pane_state
+            .streams
+            .ready_iter()
+            .map(|iter| iter.copied().collect::<Vec<_>>())
+            .unwrap_or_default();
 
-        let pending_context = req_id.and_then(|id| {
-            self.pending_market_consumers
-                .iter()
-                .find(|consumer| consumer.req_id == id)
-                .map(|consumer| (consumer.key.clone(), consumer.range))
-        });
-
-        let mut handled_by_market_consumers = false;
-
-        // Step 2: Update coordinator coverage (no borrow on pane_state)
-        if let Some(ref fr) = fetch {
-            let completion_timeframe = pending_context
-                .as_ref()
-                .and_then(|(key, _)| key.kind.timeframe())
-                .or_else(|| {
-                    streams_snapshot.as_ref().and_then(|_| {
-                        self.get_pane_state_by_uuid(main_window, pane_id)
-                            .and_then(|pane| pane.streams.ready_iter())
-                            .and_then(|mut iter| {
-                                iter.find_map(|stream| match stream {
-                                    StreamKind::Kline { timeframe, .. } => Some(*timeframe),
-                                    _ => None,
-                                })
-                            })
-                    })
-                });
-            let key = pending_context
-                .as_ref()
-                .map(|(key, _)| key.clone())
-                .or_else(|| {
-                    crate::market_data::bridge::fetch_range_to_key(
-                        fr,
-                        streams_snapshot.as_ref(),
-                        completion_timeframe,
-                    )
-                });
-
-            if let Some(key) = key
-                && let Some(range) = crate::market_data::bridge::fetch_range_to_range(fr)
-            {
-                if empty_covered_tail.is_some() {
-                    log::info!(
-                        target: "marketdata",
-                        "MARKETDATA LegacyCoverageEmpty | pane={} key={} range={}",
-                        crate::market_data::job::short_id(pane_id),
-                        key.display_key(),
-                        range.format_display()
-                    );
-                    self.market_coordinator
-                        .coverage
-                        .mark_empty(key.clone(), range);
-                } else {
-                    log::info!(
-                        target: "marketdata",
-                        "MARKETDATA CoverageComplete | pane={} key={} range={}",
-                        crate::market_data::job::short_id(pane_id),
-                        key.display_key(),
-                        range.format_display()
-                    );
-                    self.market_coordinator
-                        .coverage
-                        .mark_complete(key.clone(), range, 0);
-                }
-
-                // Complete matching coordinator jobs
-                let job_ids: Vec<uuid::Uuid> = self
-                    .market_coordinator
-                    .active_jobs()
-                    .iter()
-                    .filter(|job| job.key == key && job.range.overlaps(&range))
-                    .map(|job| job.id)
-                    .collect();
-                for job_id in job_ids {
-                    log::info!(
-                        target: "marketdata",
-                        "MARKETDATA BridgeJobComplete | job={}",
-                        crate::market_data::job::short_id(job_id)
-                    );
-                    self.market_coordinator.complete_job(job_id, 0);
-                }
-
-                let consumers = self.matching_pending_consumers(&key, &range);
-                handled_by_market_consumers = !consumers.is_empty();
-                for consumer in &consumers {
-                    if consumer.feature == ConsumerFeature::VolumeBubbles {
-                        self.dispatch_final_bubbles_to_consumer(main_window, consumer);
-                    }
-                    self.complete_pending_consumer(main_window, consumer, empty_covered_tail);
-                }
-                if !consumers.is_empty() {
-                    self.remove_pending_consumers(&key, &range);
-                }
-
-                // Save coverage immediately after fetch completion
-                if let Err(e) = self
-                    .market_cache
-                    .save_coverage(&self.market_coordinator.coverage)
-                {
-                    log::warn!(
-                        target: "marketdata",
-                        "MARKETDATA CoverageSaveFailed | error={}",
-                        e
-                    );
-                }
-            }
-        }
-
-        // Step 3: Update chart (re-borrow pane_state)
-        let mut chart_found = false;
-        if let Some(pane_state) = self.get_mut_pane_state_by_uuid(main_window, pane_id) {
-            if let Some(fetcher::FetchRange::Trades(from, to)) = fetch
-                && !handled_by_market_consumers
-                && let pane::Content::Kline { chart: Some(c), .. } = &mut pane_state.content
-            {
-                chart_found = true;
-                c.complete_trade_fetch(
-                    req_id,
-                    Some(fetcher::FetchRange::Trades(from, to)),
-                    empty_covered_tail,
-                );
-            }
-            pane_state.status = pane::Status::Ready;
-        }
+        let effects = self.market_data_runtime.complete_fetch_effects(
+            pane_id,
+            req_id,
+            fetch,
+            empty_covered_tail,
+            &ready_streams,
+        );
+        self.apply_market_data_effects(main_window, effects);
 
         log::debug!(
-            "FETCH Complete | pane={} req={} fetch={} found=true chart_found={chart_found}",
+            "FETCH Complete | pane={} req={} fetch={} found=true",
             fetcher::short_id(pane_id),
             fetcher::format_req_id(req_id),
             fetcher::format_fetch_range_compact(fetch)
@@ -3833,7 +2054,8 @@ impl Dashboard {
         // Route live klines through the market data layer
         // NOTE: We do NOT mark live klines as Complete coverage for same reason as trades
         if let Some(key) = crate::market_data::bridge::stream_kind_to_key(stream) {
-            self.market_coordinator
+            self.market_data_runtime
+                .coordinator
                 .feed_klines(&key, std::slice::from_ref(kline));
 
             log::trace!(
@@ -3843,14 +2065,9 @@ impl Dashboard {
                 fetcher::format_time_short(kline.time)
             );
 
-            // Persist to cache
-            self.live_adapter.ingest_klines(
-                &key,
-                std::slice::from_ref(kline),
-                &mut self.market_coordinator.store,
-                &mut self.market_coordinator.coverage,
-                Some(&mut self.market_cache),
-            );
+            // Persist to cache.
+            self.market_data_runtime
+                .insert_live_klines(&key, std::slice::from_ref(kline));
         }
 
         let mut found_match = false;
@@ -3973,8 +2190,6 @@ impl Dashboard {
         // NOTE: We do NOT mark live data as Complete coverage because live WS data
         // can have gaps. Coverage should only be marked Complete after REST fetch confirmation.
         if let Some(key) = crate::market_data::bridge::stream_kind_to_key(stream) {
-            self.market_coordinator.feed_trades(&key, buffer);
-
             log::trace!(
                 target: "marketdata",
                 "MARKETDATA LiveObserved | key={} count={} latest={}",
@@ -3983,15 +2198,9 @@ impl Dashboard {
                 buffer.last().map_or("-".to_string(), |t| fetcher::format_time_short(t.time))
             );
 
-            // Persist to cache (batched via live adapter)
-            // Cache stores the data but does NOT update coverage to Complete
-            self.live_adapter.ingest_trades(
-                &key,
-                buffer,
-                &mut self.market_coordinator.store,
-                &mut self.market_coordinator.coverage,
-                Some(&mut self.market_cache),
-            );
+            // Persist to cache (batched via live adapter). Cache stores the
+            // data but does NOT update coverage to Complete.
+            self.market_data_runtime.insert_live_trades(&key, buffer);
         }
 
         let mut found_match = false;
@@ -4106,23 +2315,14 @@ impl Dashboard {
 
         self.fail_stale_market_jobs(main_window);
 
-        // Periodically save coverage to disk (every 30 seconds)
-        if now.duration_since(self.last_coverage_save) > std::time::Duration::from_secs(30) {
-            self.last_coverage_save = now;
-            if let Err(e) = self
-                .market_cache
-                .save_coverage(&self.market_coordinator.coverage)
-            {
-                log::warn!(
-                    target: "marketdata",
-                    "MARKETDATA CoverageSaveFailed | error={}",
-                    e
-                );
-            }
+        // Periodically save coverage to disk.
+        if self.market_data_runtime.should_save_coverage(now) {
+            self.market_data_runtime.save_coverage();
         }
 
         let mut tasks = vec![];
         let mut route_fetches = Vec::new();
+        let mut route_needs = Vec::new();
 
         let mut tick_state = |state: &mut pane::State| match state.tick(now) {
             Some(pane::Action::Chart(action)) => match action {
@@ -4151,6 +2351,27 @@ impl Dashboard {
                         ready_streams,
                         chart_generation,
                         reqs,
+                    });
+                }
+                chart::Action::RequestMarketDataNeeds(needs) => {
+                    let pane_id = state.unique_id();
+                    let ready_streams = state
+                        .streams
+                        .ready_iter()
+                        .map(|iter| iter.copied().collect::<Vec<_>>())
+                        .unwrap_or_default();
+                    let chart_generation =
+                        if let pane::Content::Kline { chart: Some(c), .. } = &state.content {
+                            c.current_generation()
+                        } else {
+                            0
+                        };
+
+                    route_needs.push(DashboardChartNeedRoute {
+                        pane_id,
+                        ready_streams,
+                        chart_generation,
+                        needs,
                     });
                 }
                 chart::Action::RequestPalette => {
@@ -4199,6 +2420,13 @@ impl Dashboard {
                 route,
             ));
         }
+        for route in route_needs {
+            tasks.push(self.route_market_data_needs_through_market_data(
+                handles.clone(),
+                main_window,
+                route,
+            ));
+        }
 
         Task::batch(tasks)
     }
@@ -4206,74 +2434,36 @@ impl Dashboard {
     fn fail_stale_market_jobs(&mut self, main_window: window::Id) {
         let now_ms = chrono::Utc::now().timestamp_millis() as u64;
         let stale_jobs = self
-            .market_coordinator
-            .active_jobs()
-            .into_iter()
-            .filter(|job| {
-                now_ms.saturating_sub(job.created_at) >= MARKET_DATA_JOB_STALE_MS
-                    && job.progress.records_fetched == 0
-            })
-            .map(|job| (job.id, job.range))
-            .collect::<Vec<_>>();
+            .market_data_runtime
+            .stale_worker_jobs(now_ms, MARKET_DATA_JOB_STALE_MS);
 
-        for (job_id, range) in &stale_jobs {
-            let worker_req = self.job_to_worker_req.get(job_id).copied();
-            let age = self
-                .market_coordinator
-                .job(*job_id)
-                .map(|job| now_ms.saturating_sub(job.created_at))
-                .unwrap_or_default();
+        for stale in &stale_jobs {
             log::warn!(
                 target: "marketdata",
                 "MARKETDATA JobStale | job={} worker_req={} age={} action=fail_and_remove",
-                crate::market_data::job::short_id(*job_id),
-                worker_req.map_or("-".to_string(), fetcher::short_id),
-                age
+                crate::market_data::job::short_id(stale.job_id),
+                stale.worker_req.map_or("-".to_string(), fetcher::short_id),
+                stale.age_ms
             );
 
-            for chart_req in self
-                .job_to_consumers
-                .get(job_id)
-                .cloned()
-                .unwrap_or_default()
-            {
-                if let Some(consumer) = self
-                    .pending_market_consumers
-                    .iter_mut()
-                    .find(|consumer| consumer.req_id == chart_req)
-                    && !consumer.failed_segments.contains(range)
+            let satisfied_consumers = self
+                .market_data_runtime
+                .mark_stale_job_consumers_failed(stale.job_id, stale.range);
+            for consumer in satisfied_consumers {
+                if let Some(pane_state) =
+                    self.get_mut_pane_state_by_uuid(main_window, consumer.pane_id)
                 {
-                    consumer.failed_segments.push(*range);
-                }
-
-                if self.consumer_is_fully_satisfied(chart_req)
-                    && let Some(consumer) = self
-                        .pending_market_consumers
-                        .iter()
-                        .find(|consumer| consumer.req_id == chart_req)
-                        .cloned()
-                {
-                    if let Some(pane_state) =
-                        self.get_mut_pane_state_by_uuid(main_window, consumer.pane_id)
-                    {
-                        pane_state.status = pane::Status::Ready;
-                    }
-                    self.mark_generic_consumer_completed(chart_req);
+                    pane_state.status = pane::Status::Ready;
                 }
             }
 
-            self.market_coordinator
-                .fail_and_remove_job(*job_id, "stale market data worker".to_string());
-            if let Some(worker_req) = worker_req {
-                self.worker_req_to_job.remove(&worker_req);
-            }
-            self.job_to_worker_req.remove(job_id);
-            self.job_to_consumers.remove(job_id);
+            self.market_data_runtime
+                .fail_and_remove_worker_job(stale.job_id, "stale market data worker".to_string());
         }
 
         if !stale_jobs.is_empty() {
-            self.pending_market_consumers
-                .retain(|consumer| !consumer.completed || consumer_has_effective_gaps(consumer));
+            self.market_data_runtime
+                .retain_effective_pending_consumers();
             self.log_market_data_progress_snapshot();
         }
     }
@@ -4877,23 +3067,6 @@ fn data_summary_type(data: &FetchedData) -> &'static str {
     }
 }
 
-fn fetched_data_req_id(data: &FetchedData) -> Option<uuid::Uuid> {
-    match data {
-        FetchedData::Trades { req_id, .. }
-        | FetchedData::BubbleSummary { req_id, .. }
-        | FetchedData::Klines { req_id, .. }
-        | FetchedData::OI { req_id, .. } => *req_id,
-    }
-}
-
-fn stream_ticker_info(stream: &StreamKind) -> Option<&TickerInfo> {
-    match stream {
-        StreamKind::Kline { ticker_info, .. }
-        | StreamKind::Trades { ticker_info }
-        | StreamKind::Depth { ticker_info, .. } => Some(ticker_info),
-    }
-}
-
 fn stream_matches_market_key(stream: &StreamKind, key: &MarketDataKey) -> bool {
     let Some(stream_key) = (match (&key.kind, stream) {
         (MarketDataKind::Trades, StreamKind::Trades { .. }) => {
@@ -4923,46 +3096,6 @@ fn stream_matches_market_key(stream: &StreamKind, key: &MarketDataKey) -> bool {
     stream_key == *key
 }
 
-fn key_for_fetched_data(stream: StreamKind, data: &FetchedData) -> Option<MarketDataKey> {
-    match data {
-        FetchedData::Trades { .. } => crate::market_data::bridge::stream_kind_to_key(&stream),
-        FetchedData::Klines { .. } => crate::market_data::bridge::stream_kind_to_key(&stream),
-        FetchedData::OI { .. } => match stream {
-            StreamKind::Kline {
-                ticker_info,
-                timeframe,
-            } => MarketDataKey::from_ticker_info(
-                &ticker_info,
-                MarketDataKind::OpenInterest { timeframe },
-            ),
-            _ => None,
-        },
-        FetchedData::BubbleSummary { .. } => None,
-    }
-}
-
-fn range_from_trades(trades: &[Trade]) -> Option<MarketDataRange> {
-    let from = trades.iter().map(|trade| trade.time).min()?;
-    let to = trades
-        .iter()
-        .map(|trade| trade.time)
-        .max()?
-        .saturating_add(1);
-    MarketDataRange::new(from, to)
-}
-
-fn range_from_klines(klines: &[Kline]) -> Option<MarketDataRange> {
-    let from = klines.first()?.time;
-    let to = klines.last()?.time.saturating_add(1);
-    MarketDataRange::new(from, to)
-}
-
-fn range_from_oi(rows: &[exchange::OpenInterest]) -> Option<MarketDataRange> {
-    let from = rows.first()?.time;
-    let to = rows.last()?.time.saturating_add(1);
-    MarketDataRange::new(from, to)
-}
-
 fn market_kind_label(kind: &MarketDataKind) -> &'static str {
     match kind {
         MarketDataKind::Trades => "Trades",
@@ -4975,8 +3108,11 @@ fn market_kind_label(kind: &MarketDataKind) -> &'static str {
 mod tests {
     use super::*;
     use crate::market_data::{
+        coordinator::MarketDataCoordinator,
+        job::FetchJobId,
         key::{MarketKind, Symbol, Venue},
         requirement::{ConsumerId, DataRequirement, Priority},
+        runtime::{ConsumerSegmentStatus, MarketDataRuntime},
     };
 
     fn kline_key() -> MarketDataKey {
@@ -4994,8 +3130,12 @@ mod tests {
 
     fn test_dashboard() -> Dashboard {
         Dashboard {
-            market_cache: crate::market_data::cache::LocalMarketCache::new(
-                std::env::temp_dir().join(format!("flowsurface-md-test-{}", uuid::Uuid::new_v4())),
+            market_data_runtime: MarketDataRuntime::from_parts(
+                MarketDataCoordinator::new(),
+                crate::market_data::cache::LocalMarketCache::new(
+                    std::env::temp_dir()
+                        .join(format!("flowsurface-md-test-{}", uuid::Uuid::new_v4())),
+                ),
             ),
             ..Dashboard::default()
         }
@@ -5008,17 +3148,20 @@ mod tests {
         key: MarketDataKey,
         feature: ConsumerFeature,
     ) -> FetchJobId {
-        dashboard.market_coordinator.require(DataRequirement::new(
-            ConsumerId::pane(pane_id, feature),
-            key,
-            job_range,
-            Priority::High,
-            "test",
-        ));
-        dashboard.market_coordinator.plan();
-        let jobs = dashboard.market_coordinator.execute_plan();
+        dashboard
+            .market_data_runtime
+            .coordinator
+            .require(DataRequirement::new(
+                ConsumerId::pane(pane_id, feature),
+                key,
+                job_range,
+                Priority::High,
+                "test",
+            ));
+        dashboard.market_data_runtime.coordinator.plan();
+        let jobs = dashboard.market_data_runtime.coordinator.execute_plan();
         assert_eq!(jobs.len(), 1);
-        dashboard.market_coordinator.start_job(jobs[0]);
+        dashboard.market_data_runtime.coordinator.start_job(jobs[0]);
         jobs[0]
     }
 
@@ -5029,8 +3172,8 @@ mod tests {
         consumer_range: MarketDataRange,
     ) {
         dashboard
-            .pending_market_consumers
-            .push(PendingMarketDataConsumer {
+            .market_data_runtime
+            .push_pending_consumer_for_test(PendingMarketDataConsumer {
                 pane_id,
                 req_id,
                 fetch: fetcher::FetchRange::Kline(consumer_range.from, consumer_range.to),
@@ -5038,6 +3181,7 @@ mod tests {
                 key: kline_key(),
                 range: consumer_range,
                 feature: ConsumerFeature::ChartKlines,
+                bubble_config: None,
                 chart_generation: 0,
                 has_partial_updates: false,
                 completed: false,
@@ -5058,8 +3202,8 @@ mod tests {
         fetch: fetcher::FetchRange,
     ) {
         dashboard
-            .pending_market_consumers
-            .push(PendingMarketDataConsumer {
+            .market_data_runtime
+            .push_pending_consumer_for_test(PendingMarketDataConsumer {
                 pane_id,
                 req_id,
                 fetch,
@@ -5067,6 +3211,7 @@ mod tests {
                 key,
                 range: consumer_range,
                 feature,
+                bubble_config: None,
                 chart_generation: 0,
                 has_partial_updates: false,
                 completed: false,
@@ -5118,21 +3263,22 @@ mod tests {
             ConsumerFeature::Footprint,
             fetcher::FetchRange::Trades(job_range.from, job_range.to),
         );
-        dashboard.job_to_consumers.insert(job_id, vec![first_req]);
+        dashboard
+            .market_data_runtime
+            .set_job_consumers_for_test(job_id, vec![first_req]);
 
         let attached = dashboard.attach_pending_consumers_to_active_jobs("dedup_active_job");
 
         assert_eq!(attached, 1);
         assert_eq!(
-            dashboard.job_to_consumers.get(&job_id).unwrap(),
-            &vec![first_req, second_req]
+            dashboard.market_data_runtime.job_consumer_ids(job_id),
+            vec![first_req, second_req]
         );
         // After add_segment_merged, the required_segments may be merged,
         // so check that the segment is fully covered
         let consumer = dashboard
-            .pending_market_consumers
-            .iter()
-            .find(|consumer| consumer.req_id == second_req)
+            .market_data_runtime
+            .pending_consumer_by_req(second_req)
             .unwrap();
         assert!(
             crate::market_data::range::compute_missing(job_range, &consumer.required_segments)
@@ -5174,14 +3320,20 @@ mod tests {
             ConsumerFeature::Footprint,
             fetcher::FetchRange::Trades(job_range.from, job_range.to),
         );
-        dashboard.worker_req_to_job.insert(worker_req, job_id);
-        dashboard.job_to_worker_req.insert(job_id, worker_req);
-        dashboard.job_to_consumers.insert(job_id, vec![first_req]);
+        dashboard
+            .market_data_runtime
+            .set_worker_job_mapping_for_test(worker_req, job_id);
+        dashboard
+            .market_data_runtime
+            .set_job_consumers_for_test(job_id, vec![first_req]);
 
         dashboard.attach_pending_consumers_to_active_jobs("dedup_active_job");
 
-        assert_eq!(dashboard.worker_req_to_job.len(), 1);
-        assert_eq!(dashboard.job_to_consumers.get(&job_id).unwrap().len(), 2);
+        assert_eq!(dashboard.market_data_runtime.worker_mapping_count(), 1);
+        assert_eq!(
+            dashboard.market_data_runtime.job_consumer_ids(job_id).len(),
+            2
+        );
     }
 
     #[test]
@@ -5218,15 +3370,17 @@ mod tests {
             ConsumerFeature::Footprint,
             fetcher::FetchRange::Trades(job_range.from, job_range.to),
         );
-        dashboard.worker_req_to_job.insert(worker_req, job_id);
-        dashboard.job_to_worker_req.insert(job_id, worker_req);
         dashboard
-            .job_to_consumers
-            .insert(job_id, vec![first_req, second_req]);
+            .market_data_runtime
+            .set_worker_job_mapping_for_test(worker_req, job_id);
+        dashboard
+            .market_data_runtime
+            .set_job_consumers_for_test(job_id, vec![first_req, second_req]);
         dashboard.add_required_segment_to_consumer(first_req, job_range);
         dashboard.add_required_segment_to_consumer(second_req, job_range);
         dashboard
-            .market_coordinator
+            .market_data_runtime
+            .coordinator
             .job_mut(job_id)
             .unwrap()
             .progress
@@ -5234,11 +3388,15 @@ mod tests {
 
         assert!(dashboard.finish_coordinator_worker_job(window::Id::unique(), worker_req, None));
 
-        assert!(dashboard.market_coordinator.job(job_id).is_none());
-        assert!(dashboard.worker_req_to_job.is_empty());
-        assert!(dashboard.job_to_worker_req.is_empty());
-        assert!(dashboard.job_to_consumers.is_empty());
-        assert!(dashboard.pending_market_consumers.is_empty());
+        assert!(
+            dashboard
+                .market_data_runtime
+                .coordinator
+                .job(job_id)
+                .is_none()
+        );
+        assert!(dashboard.market_data_runtime.worker_maps_empty());
+        assert!(dashboard.market_data_runtime.pending_consumers_empty());
     }
 
     #[test]
@@ -5265,20 +3423,25 @@ mod tests {
             ConsumerFeature::Footprint,
             fetcher::FetchRange::Trades(UnixMs::new(150), UnixMs::new(250)),
         );
-        dashboard.worker_req_to_job.insert(worker_req, job_id);
-        dashboard.job_to_worker_req.insert(job_id, worker_req);
+        dashboard
+            .market_data_runtime
+            .set_worker_job_mapping_for_test(worker_req, job_id);
 
         dashboard.attach_pending_consumers_to_active_jobs("dedup_active_job");
         dashboard
-            .market_coordinator
+            .market_data_runtime
+            .coordinator
             .job_mut(job_id)
             .unwrap()
             .progress
             .records_fetched = 1;
         dashboard.finish_coordinator_worker_job(window::Id::unique(), worker_req, None);
 
-        assert!(dashboard.pending_market_consumers.is_empty());
-        assert_eq!(dashboard.market_coordinator.active_job_count(), 0);
+        assert!(dashboard.market_data_runtime.pending_consumers_empty());
+        assert_eq!(
+            dashboard.market_data_runtime.coordinator.active_job_count(),
+            0
+        );
     }
 
     #[test]
@@ -5305,12 +3468,16 @@ mod tests {
             ConsumerFeature::Footprint,
             fetcher::FetchRange::Trades(job_range.from, job_range.to),
         );
-        dashboard.worker_req_to_job.insert(worker_req, job_id);
-        dashboard.job_to_worker_req.insert(job_id, worker_req);
-        dashboard.job_to_consumers.insert(job_id, vec![req_id]);
+        dashboard
+            .market_data_runtime
+            .set_worker_job_mapping_for_test(worker_req, job_id);
+        dashboard
+            .market_data_runtime
+            .set_job_consumers_for_test(job_id, vec![req_id]);
         dashboard.add_required_segment_to_consumer(req_id, job_range);
         dashboard
-            .market_coordinator
+            .market_data_runtime
+            .coordinator
             .job_mut(job_id)
             .unwrap()
             .progress
@@ -5318,7 +3485,8 @@ mod tests {
 
         assert_eq!(
             dashboard
-                .market_coordinator
+                .market_data_runtime
+                .coordinator
                 .progress_snapshot()
                 .active_job_count(),
             1
@@ -5327,7 +3495,8 @@ mod tests {
 
         assert_eq!(
             dashboard
-                .market_coordinator
+                .market_data_runtime
+                .coordinator
                 .progress_snapshot()
                 .active_job_count(),
             0
@@ -5506,20 +3675,17 @@ mod tests {
             fetcher::FetchRange::Trades(job_range.from, job_range.to),
         );
         dashboard
-            .pending_market_consumers
-            .iter_mut()
-            .find(|consumer| consumer.req_id == req_id)
-            .unwrap()
-            .completed = true;
+            .market_data_runtime
+            .mark_consumer_completed(req_id);
 
         let attached = dashboard.attach_pending_consumers_to_active_jobs("test");
 
         assert_eq!(attached, 0);
         assert!(
             !dashboard
-                .job_to_consumers
-                .get(&job_id)
-                .is_some_and(|consumers| consumers.contains(&req_id))
+                .market_data_runtime
+                .job_consumer_ids(job_id)
+                .contains(&req_id)
         );
     }
 
@@ -5548,30 +3714,47 @@ mod tests {
             fetcher::FetchRange::Trades(job_range.from, job_range.to),
         );
         dashboard.add_required_segment_to_consumer(req_id, job_range);
-        dashboard.worker_req_to_job.insert(worker_req, job_id);
-        dashboard.job_to_worker_req.insert(job_id, worker_req);
-        dashboard.job_to_consumers.insert(job_id, vec![req_id]);
         dashboard
-            .market_coordinator
+            .market_data_runtime
+            .set_worker_job_mapping_for_test(worker_req, job_id);
+        dashboard
+            .market_data_runtime
+            .set_job_consumers_for_test(job_id, vec![req_id]);
+        dashboard
+            .market_data_runtime
+            .coordinator
             .job_mut(job_id)
             .unwrap()
             .created_at = 0;
 
         dashboard.fail_stale_market_jobs(window::Id::unique());
 
-        assert!(dashboard.market_coordinator.job(job_id).is_none());
-        assert!(dashboard.worker_req_to_job.is_empty());
-        assert!(dashboard.job_to_worker_req.is_empty());
-        assert!(dashboard.job_to_consumers.is_empty());
-        assert_eq!(dashboard.market_coordinator.active_job_count(), 0);
+        assert!(
+            dashboard
+                .market_data_runtime
+                .coordinator
+                .job(job_id)
+                .is_none()
+        );
+        assert!(dashboard.market_data_runtime.worker_maps_empty());
+        assert_eq!(
+            dashboard.market_data_runtime.coordinator.active_job_count(),
+            0
+        );
     }
 
     #[test]
     fn progress_snapshot_includes_cached_records_after_cache_serve_counter() {
         let mut dashboard = test_dashboard();
-        dashboard.market_coordinator.record_cache_served(448);
+        dashboard
+            .market_data_runtime
+            .coordinator
+            .record_cache_served(448);
 
-        let snapshot = dashboard.market_coordinator.progress_snapshot();
+        let snapshot = dashboard
+            .market_data_runtime
+            .coordinator
+            .progress_snapshot();
 
         assert_eq!(snapshot.total_cached_records, 448);
     }
@@ -5591,18 +3774,21 @@ mod tests {
 
         assert_eq!(
             dashboard
-                .market_coordinator
+                .market_data_runtime
+                .coordinator
                 .progress_snapshot()
                 .active_job_count(),
             1
         );
         dashboard
-            .market_coordinator
+            .market_data_runtime
+            .coordinator
             .complete_and_remove_job(job_id, 1);
 
         assert_eq!(
             dashboard
-                .market_coordinator
+                .market_data_runtime
+                .coordinator
                 .progress_snapshot()
                 .active_job_count(),
             0
@@ -5680,9 +3866,8 @@ mod tests {
 
         // Should have 1 logical segment (the broad one), sub-segments skipped
         let consumer = dashboard
-            .pending_market_consumers
-            .iter()
-            .find(|c| c.req_id == req_id)
+            .market_data_runtime
+            .pending_consumer_by_req(req_id)
             .unwrap();
         assert_eq!(consumer.required_segments.len(), 1);
 
@@ -5708,9 +3893,8 @@ mod tests {
         dashboard.add_required_segment_to_consumer(req_id, range(200, 300));
 
         let consumer = dashboard
-            .pending_market_consumers
-            .iter()
-            .find(|c| c.req_id == req_id)
+            .market_data_runtime
+            .pending_consumer_by_req(req_id)
             .unwrap();
         assert_eq!(consumer.required_segments.len(), 2);
 
