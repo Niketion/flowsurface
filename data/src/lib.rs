@@ -430,9 +430,8 @@ fn sanitize_main_window(state: &mut State, warnings: &mut Vec<String>) {
 
     if invalid_size || invalid_position {
         state.main_window = None;
-        warnings.push(
-            "main window position was invalid or off-screen; opening centered".to_string(),
-        );
+        warnings
+            .push("main window position was invalid or off-screen; opening centered".to_string());
     }
 }
 

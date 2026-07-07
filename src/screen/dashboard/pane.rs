@@ -617,6 +617,7 @@ impl State {
         match &self.streams {
             ResolvedStream::Ready(streams) => !streams.is_empty(),
             ResolvedStream::Waiting { streams, .. } => !streams.is_empty(),
+            ResolvedStream::Blocked { streams, .. } => !streams.is_empty(),
         }
     }
 
@@ -734,17 +735,52 @@ impl State {
         };
 
         let uninitialized_base = |kind: ContentKind| -> Element<'a, Message> {
-            if self.has_stream() {
-                center(text("Loading…").size(crate::style::text_size::TITLE)).into()
-            } else {
-                let content = column![
-                    text(kind.to_string()).size(crate::style::text_size::TITLE),
-                    text("No ticker selected").size(crate::style::text_size::SECTION)
-                ]
-                .spacing(8)
-                .align_x(Alignment::Center);
+            match &self.streams {
+                ResolvedStream::Waiting { streams, .. } if !streams.is_empty() => {
+                    center(text("Waiting for metadata…").size(crate::style::text_size::TITLE))
+                        .into()
+                }
+                ResolvedStream::Ready(streams) if !streams.is_empty() => center(
+                    text("Waiting for pane initialization...").size(crate::style::text_size::TITLE),
+                )
+                .into(),
+                ResolvedStream::Blocked {
+                    streams, reason, ..
+                } => {
+                    let blocked_exchanges = streams
+                        .iter()
+                        .map(|s| s.exchange())
+                        .collect::<std::collections::BTreeSet<_>>();
 
-                center(content).into()
+                    center(
+                        column![
+                            text(format!(
+                                "Couldn't resolve streams for {}",
+                                blocked_exchanges
+                                    .iter()
+                                    .map(|v| v.to_string())
+                                    .collect::<Vec<_>>()
+                                    .join(", ")
+                            ))
+                            .size(crate::style::text_size::SECTION),
+                            text((if reason.is_empty() { "" } else { reason }).to_string())
+                                .size(crate::style::text_size::BODY),
+                        ]
+                        .spacing(8)
+                        .align_x(Alignment::Center),
+                    )
+                    .into()
+                }
+                _ => {
+                    let content = column![
+                        text(kind.to_string()).size(crate::style::text_size::TITLE),
+                        text("No ticker selected").size(crate::style::text_size::SECTION)
+                    ]
+                    .spacing(8)
+                    .align_x(Alignment::Center);
+
+                    center(content).into()
+                }
             }
         };
 
@@ -1538,6 +1574,8 @@ impl State {
                                                         },
                                                     ]);
                                                     c.set_basis(new_basis);
+
+                                                    self.status = Status::Ready;
                                                     effect = Some(Effect::RefreshStreams);
                                                 }
                                             }
