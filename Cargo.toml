@@ -53,6 +53,8 @@ chrono.workspace = true
 chrono-tz = "0.10.4"
 serde_json.workspace = true
 serde.workspace = true
+bincode = { version = "2.0.1", features = ["serde"] }
+redb = "4.1.0"
 thiserror.workspace = true
 log.workspace = true
 uuid.workspace = true

@@ -173,7 +173,7 @@ pub enum BubbleHistoricalMode {
     SummaryOnly,
 }
 
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone, Copy, Deserialize, Serialize)]
 pub struct BubbleCandidate {
     pub candle_time: UnixMs,
     pub price: Price,
@@ -187,7 +187,7 @@ pub struct BubbleCandidate {
     pub last_time: Option<UnixMs>,
 }
 
-#[derive(Debug, Clone, Default)]
+#[derive(Debug, Clone, Default, Deserialize, Serialize)]
 pub struct BubbleVolumeSummary {
     pub candle_time: UnixMs,
     pub candidates: Vec<BubbleCandidate>,

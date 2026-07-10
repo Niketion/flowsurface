@@ -1,11 +1,12 @@
 # Market data layer
 
-The market-data pipeline is split into four responsibilities:
+The market-data pipeline is split into five responsibilities:
 
 1. **Consumers** (charts and indicators) declare a `DataRequirement`.
 2. **MarketDataCoordinator** compares the requirement with covered and in-flight ranges.
-3. **Fetch executors** in `connector::fetcher` call the appropriate exchange adapter.
-4. **Consumers** derive presentation data from the shared raw dataset.
+3. **Persistent cache** in `connector::persistent_cache` resolves locally covered ranges.
+4. **Fetch executors** in `connector::fetcher` call the exchange adapter only for remaining gaps.
+5. **Consumers** derive presentation data from the shared raw dataset.
 
 An indicator must never add a fetch variant named after itself. Session/daily/hourly volume
 profiles and trade-accurate VWAP request `DataSet::Trades`; a candle-based VWAP requests
@@ -34,6 +35,22 @@ a new chart configuration.
 The existing REST adapter functions remain the transport boundary during migration. The next
 step is to route the current `FetchRange` calls through this coordinator, then move bubble
 summarisation out of the fetcher and into a derived-data engine consuming shared trades.
+
+## Persistent redb cache
+
+Every bounded historical fetch is cached under a complete dataset identity: exchange/market,
+internal ticker, dataset, timeframe and any derivation settings that affect the result. Klines,
+raw trades, open interest and Bubble summaries all use the same read-before-network policy.
+Coverage is persisted independently from payloads, so a successful empty interval is reusable
+and a later request downloads only uncovered gaps. Trade buckets use one-minute partitions to
+limit write amplification; lower-density datasets use hourly partitions.
+
+Each redb value contains a format magic, schema version, payload length and CRC32 checksum.
+Records are also checked semantically (timestamps, OHLC relationships, finite/non-negative
+values and Bubble quantity invariants) on read. A missing, corrupt or invalid bucket is deleted
+and its dataset coverage is invalidated before the range falls back to REST. A database that
+cannot be opened, has incompatible table definitions or uses an unsupported schema is renamed
+with a `.corrupt-<timestamp>` suffix and recreated. Cache failures never prevent network fetches.
 
 ## Session volume profile consumer
 
