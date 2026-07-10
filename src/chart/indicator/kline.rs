@@ -118,6 +118,9 @@ pub trait KlineIndicatorImpl {
 
     fn on_ticksize_change(&mut self, _source: &PlotData<KlineDataPoint>) {}
 
+    /// Apply persisted indicator-specific visual settings.
+    fn on_config_changed(&mut self, _config: &data::chart::kline::Config) {}
+
     /// Timeframe/tick interval has changed
     fn on_basis_change(&mut self, _source: &PlotData<KlineDataPoint>) {}
 

@@ -4,8 +4,8 @@ use crate::widget::{column_drag, dragger_row, labeled_slider};
 
 use data::chart::indicator::{Indicator, KlineIndicator, UiIndicator};
 use data::chart::kline::{
-    BubbleColorMode, Config as KlineConfig, SessionProfileInterval, SessionProfileMode,
-    SessionProfilePlacement, VolumeBubbleSession,
+    BubbleColorMode, Config as KlineConfig, CvdRenderStyle, SessionProfileInterval,
+    SessionProfileMode, SessionProfilePlacement, VolumeBubbleSession,
 };
 use data::layout::pane::VisualConfig;
 use data::util::format_with_commas;
@@ -57,6 +57,81 @@ pub fn view_kline<'a>(
         column![].into()
     };
     let mut sections = column![list].spacing(12);
+
+    if selected.contains(&KlineIndicator::CumulativeDelta) {
+        let cvd = cfg.cvd;
+        let render_style = pick_list(
+            CvdRenderStyle::ALL,
+            Some(cvd.render_style),
+            move |render_style| {
+                config_message(
+                    pane,
+                    KlineConfig {
+                        cvd: data::chart::kline::CvdConfig {
+                            render_style,
+                            ..cvd
+                        },
+                        ..cfg
+                    },
+                )
+            },
+        );
+        let candle_width = labeled_slider(
+            "Candle width",
+            10.0..=100.0,
+            cvd.candle_width_percent,
+            move |candle_width_percent| {
+                config_message(
+                    pane,
+                    KlineConfig {
+                        cvd: data::chart::kline::CvdConfig {
+                            candle_width_percent,
+                            ..cvd
+                        },
+                        ..cfg
+                    },
+                )
+            },
+            |value| format!("{value:.0}%"),
+            Some(1.0),
+        );
+        let line_width = labeled_slider(
+            "Line width",
+            0.5..=5.0,
+            cvd.line_width,
+            move |line_width| {
+                config_message(
+                    pane,
+                    KlineConfig {
+                        cvd: data::chart::kline::CvdConfig { line_width, ..cvd },
+                        ..cfg
+                    },
+                )
+            },
+            |value| format!("{value:.1}px"),
+            Some(0.1),
+        );
+        let show_wicks =
+            checkbox(cvd.show_wicks)
+                .label("Show wicks")
+                .on_toggle(move |show_wicks| {
+                    config_message(
+                        pane,
+                        KlineConfig {
+                            cvd: data::chart::kline::CvdConfig { show_wicks, ..cvd },
+                            ..cfg
+                        },
+                    )
+                });
+        let style_controls: Element<'a, Message> = match cvd.render_style {
+            CvdRenderStyle::Candlesticks => column![candle_width, show_wicks].spacing(6).into(),
+            CvdRenderStyle::Line => column![line_width].spacing(6).into(),
+        };
+        sections = sections.push(indicator_card(
+            "Cumulative Volume Delta",
+            column![render_style, style_controls].spacing(6),
+        ));
+    }
 
     if selected.contains(&KlineIndicator::SessionVolumeProfile) {
         let svp = cfg.session_volume_profile;

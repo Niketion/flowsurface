@@ -279,6 +279,7 @@ impl KlineChart {
                         continue;
                     }
                     let mut indi = indicator::kline::make_empty(i);
+                    indi.on_config_changed(&visual_config);
                     indi.rebuild_from_source(&data_source);
                     indicators[i] = Some(indi);
                 }
@@ -342,6 +343,7 @@ impl KlineChart {
                         continue;
                     }
                     let mut indi = indicator::kline::make_empty(i);
+                    indi.on_config_changed(&visual_config);
                     indi.rebuild_from_source(&data_source);
                     indicators[i] = Some(indi);
                 }
@@ -1323,11 +1325,15 @@ impl KlineChart {
         }
 
         self.visual_config = visual_config;
+        let config = self.visual_config;
         self.chart.cache.clear_all();
         self.indicators
             .values_mut()
             .filter_map(Option::as_mut)
-            .for_each(|indi| indi.clear_all_caches());
+            .for_each(|indi| {
+                indi.on_config_changed(&config);
+                indi.clear_all_caches();
+            });
 
         if should_refetch_volume_bubbles {
             self.reset_request_handler();
@@ -1931,6 +1937,7 @@ impl KlineChart {
             self.indicators[indicator] = None;
         } else {
             let mut box_indi = indicator::kline::make_empty(indicator);
+            box_indi.on_config_changed(&self.visual_config);
             box_indi.rebuild_from_source(&self.data_source);
             self.indicators[indicator] = Some(box_indi);
         }

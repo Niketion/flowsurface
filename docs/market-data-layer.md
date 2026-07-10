@@ -61,3 +61,11 @@ stream at runtime, including when it is toggled after application startup.
 Overlay configuration is exposed only inside the Indicators modal. General candlestick settings
 no longer present independent SVP or Bubbles sections. The VWAP implementation is trade-weighted,
 resets at its configured anchor, and optionally draws weighted standard-deviation bands.
+
+### CVD rendering
+
+The CVD panel supports `Candlesticks` (default) and `Line` rendering from its indicator settings.
+Each CVD candle opens at the previous cumulative close and closes at `open + buy - sell`. High and
+low use the bucket's directional buy/sell excursion, preserving a readable volume-delta envelope
+even when the exchange feed does not retain the exact intrabar trade ordering. Candle width and
+wicks are configurable; line width remains configurable when Line mode is selected.

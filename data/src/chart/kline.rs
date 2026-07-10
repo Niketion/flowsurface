@@ -475,6 +475,8 @@ pub struct Config {
     pub session_volume_profile: SessionVolumeProfileConfig,
     /// Settings owned by the VWAP overlay indicator.
     pub vwap: VwapConfig,
+    /// Settings owned by the CVD panel indicator.
+    pub cvd: CvdConfig,
 }
 
 impl Default for Config {
@@ -486,7 +488,48 @@ impl Default for Config {
             volume_bubbles: VolumeBubbleConfig::default(),
             session_volume_profile: SessionVolumeProfileConfig::default(),
             vwap: VwapConfig::default(),
+            cvd: CvdConfig::default(),
         }
+    }
+}
+
+#[derive(Debug, Copy, Clone, PartialEq, Deserialize, Serialize)]
+#[serde(default)]
+pub struct CvdConfig {
+    pub render_style: CvdRenderStyle,
+    pub candle_width_percent: f32,
+    pub show_wicks: bool,
+    pub line_width: f32,
+}
+
+impl Default for CvdConfig {
+    fn default() -> Self {
+        Self {
+            render_style: CvdRenderStyle::Candlesticks,
+            candle_width_percent: 70.0,
+            show_wicks: true,
+            line_width: 1.0,
+        }
+    }
+}
+
+#[derive(Debug, Copy, Clone, PartialEq, Eq, Default, Deserialize, Serialize)]
+pub enum CvdRenderStyle {
+    Line,
+    #[default]
+    Candlesticks,
+}
+
+impl CvdRenderStyle {
+    pub const ALL: [Self; 2] = [Self::Candlesticks, Self::Line];
+}
+
+impl std::fmt::Display for CvdRenderStyle {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(match self {
+            Self::Line => "Line",
+            Self::Candlesticks => "Candlesticks",
+        })
     }
 }
 

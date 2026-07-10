@@ -6,13 +6,20 @@ use crate::chart::{
             AvailabilityCause, BasisSeries, BasisSeriesExt, IndicatorAvailability,
             KlineIndicatorImpl,
         },
-        plot::{PlotTooltip, line::LinePlot},
+        plot::{
+            PlotTooltip,
+            candlestick::{CandlestickPlot, CandlestickValue},
+            line::LinePlot,
+        },
     },
 };
 
-use data::chart::{PlotData, kline::KlineDataPoint};
+use data::chart::{
+    PlotData,
+    kline::{CvdConfig, CvdRenderStyle, KlineDataPoint, KlineTrades},
+};
 use data::util::format_with_commas;
-use exchange::{Kline, Trade, unit::Qty};
+use exchange::{Kline, Trade, Volume, unit::Qty};
 
 use iced::widget::{center, text};
 
@@ -23,12 +30,53 @@ use std::ops::RangeInclusive;
 /// before CVD data is considered trustworthy.
 const MIN_DIRECTIONAL_RUN: usize = 2;
 
+fn cvd_tooltip(point: &CumulativeDeltaPoint, _next: Option<&CumulativeDeltaPoint>) -> PlotTooltip {
+    let sign = if point.delta >= Qty::ZERO { "+" } else { "" };
+    PlotTooltip::new(format!(
+        "CVD O: {}  H: {}\nCVD L: {}  C: {}\nDelta: {sign}{}",
+        format_with_commas(point.open.to_f64()),
+        format_with_commas(point.high.to_f64()),
+        format_with_commas(point.low.to_f64()),
+        format_with_commas(point.close.to_f64()),
+        format_with_commas(point.delta.to_f64()),
+    ))
+}
+
+fn directional_volume(volume: Volume, footprint: &KlineTrades) -> DirectionalVolume {
+    if !footprint.trades.is_empty() {
+        let (buy, sell) = footprint
+            .trades
+            .values()
+            .fold((Qty::ZERO, Qty::ZERO), |(buy, sell), trades| {
+                (buy + trades.buy_qty, sell + trades.sell_qty)
+            });
+        DirectionalVolume { buy, sell }
+    } else if let Some((buy, sell)) = volume.buy_sell() {
+        DirectionalVolume { buy, sell }
+    } else {
+        DirectionalVolume::default()
+    }
+}
+
+#[derive(Debug, Clone, Copy, Default)]
+struct DirectionalVolume {
+    buy: Qty,
+    sell: Qty,
+}
+
+impl DirectionalVolume {
+    fn delta(self) -> Qty {
+        self.buy - self.sell
+    }
+}
+
 #[derive(Debug, Clone, Copy, Default)]
 struct CumulativeDeltaPoint {
-    /// Buy volume - sell volume for this candle / tick bucket.
     delta: Qty,
-    /// Running sum of delta from the oldest loaded datapoint to this datapoint.
-    cumulative: Qty,
+    open: Qty,
+    high: Qty,
+    low: Qty,
+    close: Qty,
     /// Whether this point is considered trustworthy.  A point is
     /// reliable only when it has a directional predecessor within a
     /// run of at least `MIN_DIRECTIONAL_RUN` consecutive bars with
@@ -38,13 +86,42 @@ struct CumulativeDeltaPoint {
     reliable: bool,
 }
 
+impl CandlestickValue for CumulativeDeltaPoint {
+    fn open(&self) -> f32 {
+        self.open.to_f64() as f32
+    }
+    fn high(&self) -> f32 {
+        self.high.to_f64() as f32
+    }
+    fn low(&self) -> f32 {
+        self.low.to_f64() as f32
+    }
+    fn close(&self) -> f32 {
+        self.close.to_f64() as f32
+    }
+}
+
+fn cumulative_point(open: Qty, volume: DirectionalVolume, reliable: bool) -> CumulativeDeltaPoint {
+    let delta = volume.delta();
+    let close = open + delta;
+    CumulativeDeltaPoint {
+        delta,
+        open,
+        high: (open + volume.buy).max(open).max(close),
+        low: (open - volume.sell).min(open).min(close),
+        close,
+        reliable,
+    }
+}
+
 pub struct CumulativeDeltaIndicator {
     cache: Caches,
     /// Per-bucket delta. Stored separately so inserting/replacing older klines can
     /// rebuild the cumulative line without needing the full chart source.
-    delta: BasisSeries<Qty>,
+    delta: BasisSeries<DirectionalVolume>,
     data: BasisSeries<CumulativeDeltaPoint>,
     availability: IndicatorAvailability,
+    config: CvdConfig,
 }
 
 impl CumulativeDeltaIndicator {
@@ -54,6 +131,7 @@ impl CumulativeDeltaIndicator {
             delta: BasisSeries::default(),
             data: BasisSeries::default(),
             availability: IndicatorAvailability::Unknown,
+            config: CvdConfig::default(),
         }
     }
 
@@ -67,36 +145,48 @@ impl CumulativeDeltaIndicator {
             return center(text(message)).into();
         }
 
-        let tooltip = |point: &CumulativeDeltaPoint, _next: Option<&CumulativeDeltaPoint>| {
-            let cvd = format!("CVD: {}", format_with_commas(point.cumulative.to_f64()));
-            let sign = if point.delta >= Qty::ZERO { "+" } else { "" };
-            let delta = format!("Delta: {sign}{}", format_with_commas(point.delta.to_f64()));
-            PlotTooltip::new(format!("{cvd}\n{delta}"))
-        };
+        let invalid_message = format!(
+            "CVD requires {MIN_DIRECTIONAL_RUN}+ consecutive bars\nwith directional volume",
+        );
 
-        let value_fn = |point: &CumulativeDeltaPoint| point.cumulative.to_f64() as f32;
-
-        let plot = LinePlot::new(value_fn)
-            .stroke_width(1.0)
-            .show_points(true)
-            .point_radius_factor(0.2)
-            .padding(0.08)
-            // Only treat bars as valid when they belong to a long enough
-            // run of consecutive directional data
-            .valid_when(|point: &CumulativeDeltaPoint| point.reliable)
-            .invalid_point_message(format!(
-                "CVD requires {MIN_DIRECTIONAL_RUN}+ consecutive bars\nwith directional volume",
-            ))
-            .with_tooltip(tooltip);
-
-        indicator_row(
-            main_chart,
-            &self.cache,
-            data_labels_always_visible,
-            plot,
-            self.data.as_plot_series(),
-            visible_range,
-        )
+        match self.config.render_style {
+            CvdRenderStyle::Line => {
+                let plot =
+                    LinePlot::new(|point: &CumulativeDeltaPoint| point.close.to_f64() as f32)
+                        .stroke_width(self.config.line_width.clamp(0.5, 5.0))
+                        .show_points(true)
+                        .point_radius_factor(0.2)
+                        .padding(0.08)
+                        .valid_when(|point: &CumulativeDeltaPoint| point.reliable)
+                        .invalid_point_message(invalid_message)
+                        .with_tooltip(cvd_tooltip);
+                indicator_row(
+                    main_chart,
+                    &self.cache,
+                    data_labels_always_visible,
+                    plot,
+                    self.data.as_plot_series(),
+                    visible_range,
+                )
+            }
+            CvdRenderStyle::Candlesticks => {
+                let plot = CandlestickPlot::new()
+                    .body_width_factor((self.config.candle_width_percent / 100.0).clamp(0.1, 1.0))
+                    .show_wicks(self.config.show_wicks)
+                    .padding(0.08)
+                    .valid_when(|point: &CumulativeDeltaPoint| point.reliable)
+                    .invalid_point_message(invalid_message)
+                    .with_tooltip(cvd_tooltip);
+                indicator_row(
+                    main_chart,
+                    &self.cache,
+                    data_labels_always_visible,
+                    plot,
+                    self.data.as_plot_series(),
+                    visible_range,
+                )
+            }
+        }
     }
 
     fn set_availability(&mut self, has_points: bool, has_directional: bool) {
@@ -119,16 +209,11 @@ impl CumulativeDeltaIndicator {
                 let data: BTreeMap<_, _> = entries
                     .iter()
                     .enumerate()
-                    .map(|(i, &(&time, &delta))| {
-                        cumulative += delta;
-                        (
-                            time,
-                            CumulativeDeltaPoint {
-                                delta,
-                                cumulative,
-                                reliable: reliable[i],
-                            },
-                        )
+                    .map(|(i, &(&time, &volume))| {
+                        let open = cumulative;
+                        let point = cumulative_point(open, volume, reliable[i]);
+                        cumulative = point.close;
+                        (time, point)
                     })
                     .collect();
 
@@ -142,16 +227,11 @@ impl CumulativeDeltaIndicator {
                 let data: BTreeMap<_, _> = entries
                     .iter()
                     .enumerate()
-                    .map(|(i, &(&idx, &delta))| {
-                        cumulative += delta;
-                        (
-                            idx,
-                            CumulativeDeltaPoint {
-                                delta,
-                                cumulative,
-                                reliable: reliable[i],
-                            },
-                        )
+                    .map(|(i, &(&idx, &volume))| {
+                        let open = cumulative;
+                        let point = cumulative_point(open, volume, reliable[i]);
+                        cumulative = point.close;
+                        (idx, point)
                     })
                     .collect();
 
@@ -165,14 +245,14 @@ impl CumulativeDeltaIndicator {
     /// Mark which positions in `entries` belong to a qualifying run
     /// (≥ `min_run` consecutive non-zero deltas, excluding the first
     /// bar of each run).
-    fn reliable_indices<K>(entries: &[(&K, &Qty)], min_run: usize) -> Vec<bool> {
+    fn reliable_indices<K>(entries: &[(&K, &DirectionalVolume)], min_run: usize) -> Vec<bool> {
         let n = entries.len();
         let mut reliable = vec![false; n];
         let mut i = 0;
         while i < n {
-            if *entries[i].1 != Qty::ZERO {
+            if entries[i].1.delta() != Qty::ZERO {
                 let run_start = i;
-                while i < n && *entries[i].1 != Qty::ZERO {
+                while i < n && entries[i].1.delta() != Qty::ZERO {
                     i += 1;
                 }
                 // Skip the first bar of every qualifying run — it lacks
@@ -189,7 +269,7 @@ impl CumulativeDeltaIndicator {
         reliable
     }
 
-    fn rebuild_from_deltas(&mut self, deltas: BasisSeries<Qty>) {
+    fn rebuild_from_deltas(&mut self, deltas: BasisSeries<DirectionalVolume>) {
         self.delta = deltas;
         self.rebuild_cumulative();
     }
@@ -223,7 +303,7 @@ impl KlineIndicatorImpl for CumulativeDeltaIndicator {
                 timeseries
                     .datapoints
                     .iter()
-                    .map(|(&time, dp)| (time, dp.volume_delta()))
+                    .map(|(&time, dp)| (time, directional_volume(dp.kline.volume, &dp.footprint)))
                     .collect()
             },
             |tickseries| {
@@ -231,7 +311,12 @@ impl KlineIndicatorImpl for CumulativeDeltaIndicator {
                     .datapoints
                     .iter()
                     .enumerate()
-                    .map(|(idx, dp)| (idx as u64, dp.volume_delta()))
+                    .map(|(idx, dp)| {
+                        (
+                            idx as u64,
+                            directional_volume(dp.kline.volume, &dp.footprint),
+                        )
+                    })
                     .collect()
             },
         );
@@ -269,14 +354,20 @@ impl KlineIndicatorImpl for CumulativeDeltaIndicator {
             };
 
             for kline in klines {
-                let (delta, directional) = if let Some(dp) = timeseries.datapoints.get(&kline.time)
+                let (volume, directional) = if let Some(dp) = timeseries.datapoints.get(&kline.time)
                 {
-                    (dp.volume_delta(), dp.is_directional())
+                    (
+                        directional_volume(dp.kline.volume, &dp.footprint),
+                        dp.is_directional(),
+                    )
                 } else {
-                    (kline.volume.delta(), kline.volume.is_directional())
+                    (
+                        directional_volume(kline.volume, &KlineTrades::default()),
+                        kline.volume.is_directional(),
+                    )
                 };
 
-                deltas.insert(kline.time, delta);
+                deltas.insert(kline.time, volume);
                 has_directional |= directional;
             }
 
@@ -321,7 +412,7 @@ impl KlineIndicatorImpl for CumulativeDeltaIndicator {
 
                 for time in touched_times {
                     if let Some(dp) = timeseries.datapoints.get(&time) {
-                        deltas.insert(time, dp.volume_delta());
+                        deltas.insert(time, directional_volume(dp.kline.volume, &dp.footprint));
                         touched = true;
                     }
                 }
@@ -334,7 +425,10 @@ impl KlineIndicatorImpl for CumulativeDeltaIndicator {
                 let start_idx = old_dp_len.saturating_sub(1);
 
                 for (idx, dp) in tickseries.datapoints.iter().enumerate().skip(start_idx) {
-                    deltas.insert(idx as u64, dp.volume_delta());
+                    deltas.insert(
+                        idx as u64,
+                        directional_volume(dp.kline.volume, &dp.footprint),
+                    );
                     touched = true;
                 }
             }
@@ -350,7 +444,60 @@ impl KlineIndicatorImpl for CumulativeDeltaIndicator {
         self.rebuild_from_source(source);
     }
 
+    fn on_config_changed(&mut self, config: &data::chart::kline::Config) {
+        if self.config != config.cvd {
+            self.config = config.cvd;
+            self.clear_all_caches();
+        }
+    }
+
     fn on_basis_change(&mut self, source: &PlotData<KlineDataPoint>) {
         self.rebuild_from_source(source);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn cvd_candle_preserves_open_close_and_directional_envelope() {
+        let point = cumulative_point(
+            Qty::from_f64(100.0),
+            DirectionalVolume {
+                buy: Qty::from_f64(30.0),
+                sell: Qty::from_f64(10.0),
+            },
+            true,
+        );
+
+        assert_eq!(point.open, Qty::from_f64(100.0));
+        assert_eq!(point.high, Qty::from_f64(130.0));
+        assert_eq!(point.low, Qty::from_f64(90.0));
+        assert_eq!(point.close, Qty::from_f64(120.0));
+        assert!(point.reliable);
+    }
+
+    #[test]
+    fn next_cvd_candle_opens_at_previous_close() {
+        let first = cumulative_point(
+            Qty::ZERO,
+            DirectionalVolume {
+                buy: Qty::from_f64(8.0),
+                sell: Qty::from_f64(3.0),
+            },
+            true,
+        );
+        let second = cumulative_point(
+            first.close,
+            DirectionalVolume {
+                buy: Qty::from_f64(2.0),
+                sell: Qty::from_f64(7.0),
+            },
+            true,
+        );
+
+        assert_eq!(second.open, first.close);
+        assert_eq!(second.close, Qty::ZERO);
     }
 }
