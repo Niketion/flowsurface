@@ -144,5 +144,27 @@ pub fn make_empty(which: KlineIndicator) -> Box<dyn KlineIndicatorImpl> {
         KlineIndicator::OpenInterest => {
             Box::new(super::kline::open_interest::OpenInterestIndicator::new())
         }
+        KlineIndicator::VolumeBubbles
+        | KlineIndicator::SessionVolumeProfile
+        | KlineIndicator::Vwap => Box::new(OverlayIndicator),
+    }
+}
+
+/// Runtime marker for indicators rendered on the main price canvas. Overlay
+/// drawing is orchestrated by `KlineChart`, but lifecycle, persistence and UI
+/// selection use the same indicator registry as panel indicators.
+struct OverlayIndicator;
+
+impl KlineIndicatorImpl for OverlayIndicator {
+    fn clear_all_caches(&mut self) {}
+    fn clear_crosshair_caches(&mut self) {}
+
+    fn element<'a>(
+        &'a self,
+        _chart: &'a ViewState,
+        _data_labels_always_visible: bool,
+        _visible_range: std::ops::RangeInclusive<u64>,
+    ) -> iced::Element<'a, Message> {
+        unreachable!("overlay indicators render on the main chart canvas")
     }
 }

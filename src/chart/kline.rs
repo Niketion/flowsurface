@@ -13,7 +13,8 @@ use data::chart::indicator::{Indicator, KlineIndicator};
 use data::chart::kline::{
     BubbleCandidate, BubbleColorMode, BubbleVolumeSummary, ClusterKind, ClusterScaling, Config,
     FootprintStudy, FootprintSummary, KlineDataPoint, KlineTrades, NPoc, PointOfControl,
-    VolumeBubbleConfig, VolumeBubbleSession,
+    SessionProfileMode, SessionProfilePlacement, SessionVolumeProfileConfig, VolumeBubbleConfig,
+    VolumeBubbleSession, VwapConfig,
 };
 use data::chart::{Autoscale, KlineChartKind, ViewConfig};
 
@@ -76,6 +77,9 @@ impl Chart for KlineChart {
             if !self.kind.allows_indicator(*selected_indicator)
                 || !KlineIndicator::for_market(market).contains(selected_indicator)
             {
+                continue;
+            }
+            if selected_indicator.is_overlay() {
                 continue;
             }
             if let Some(indi) = self.indicators[*selected_indicator].as_ref() {
@@ -422,7 +426,7 @@ impl KlineChart {
             self.raw_trades.len(),
             self.covered_trade_ranges.len(),
             self.fetching_trades.0,
-            self.visual_config.volume_bubbles.enabled,
+            self.indicator_enabled(KlineIndicator::VolumeBubbles),
             self.visual_config.volume_bubbles.session,
             is_trade_fetch_enabled()
         );
@@ -559,8 +563,60 @@ impl KlineChart {
                     }
                 }
 
+                // Candlestick SVP consumes the same raw trade dataset as
+                // footprint and bubbles. Fetch in bounded chronological chunks
+                // so daily/weekly profiles never create one unbounded request.
+                let svp_enabled = self.indicator_enabled(KlineIndicator::SessionVolumeProfile);
+                let vwap_enabled = self.indicator_enabled(KlineIndicator::Vwap);
                 if matches!(self.kind, KlineChartKind::Candles)
-                    && self.visual_config.volume_bubbles.enabled
+                    && (svp_enabled || vwap_enabled)
+                    && !self.fetching_trades.0
+                {
+                    let svp_cfg = self.visual_config.session_volume_profile;
+                    let vwap_cfg = self.visual_config.vwap;
+                    let mut aligned_from = visible_earliest;
+                    if svp_enabled {
+                        aligned_from = aligned_from.min(align_session_start(
+                            visible_earliest,
+                            svp_cfg.interval.milliseconds(),
+                        ));
+                    }
+                    if vwap_enabled {
+                        aligned_from = aligned_from.min(align_session_start(
+                            visible_earliest,
+                            vwap_cfg.anchor.milliseconds(),
+                        ));
+                    }
+                    let requested_to = visible_latest_ms.max(kline_latest);
+                    let requested_from = UnixMs::new(aligned_from).max(kline_earliest);
+                    if requested_to > requested_from
+                        && let Some((from, to)) =
+                            self.subtract_covered_trade_ranges(requested_from, requested_to)
+                    {
+                        // One hour per worker keeps exchange pagination and the
+                        // UI responsive. Subsequent ticks continue the session.
+                        let chunk_to =
+                            UnixMs::new(to.as_u64().min(from.as_u64().saturating_add(60 * 60_000)));
+                        let range = FetchRange::Trades(from, chunk_to);
+                        log::info!(
+                            "OVERLAY Fetch | svp={} vwap={} range={}",
+                            svp_enabled,
+                            vwap_enabled,
+                            fetcher::format_fetch_range(&range)
+                        );
+                        if let Some(action) = request_fetch(
+                            &mut self.request_handler,
+                            range,
+                            Some(&self.chart.ticker_info),
+                        ) {
+                            self.fetching_trades = (true, None);
+                            return Some(action);
+                        }
+                    }
+                }
+
+                if matches!(self.kind, KlineChartKind::Candles)
+                    && self.indicator_enabled(KlineIndicator::VolumeBubbles)
                 {
                     const BUBBLE_AUTO_BACKFILL_COOLDOWN: std::time::Duration =
                         std::time::Duration::from_secs(60);
@@ -1223,6 +1279,10 @@ impl KlineChart {
         self.visual_config
     }
 
+    pub fn indicator_enabled(&self, indicator: KlineIndicator) -> bool {
+        self.indicators[indicator].is_some()
+    }
+
     pub fn volume_bubble_qty_scale(&self) -> VolumeBubbleQtyScale {
         let session_start = current_volume_bubble_session_start_ms(
             chrono::Utc::now(),
@@ -1239,17 +1299,24 @@ impl KlineChart {
 
     pub fn set_visual_config(&mut self, visual_config: Config) {
         let old_session = self.visual_config.volume_bubbles.session;
-        let old_enabled = self.visual_config.volume_bubbles.enabled;
         let new_session = visual_config.volume_bubbles.session;
-        let new_enabled = visual_config.volume_bubbles.enabled;
+        let old_svp = self.visual_config.session_volume_profile;
+        let new_svp = visual_config.session_volume_profile;
+        let old_vwap = self.visual_config.vwap;
+        let new_vwap = visual_config.vwap;
 
         let should_refetch_volume_bubbles = matches!(self.kind, KlineChartKind::Candles)
-            && new_enabled
-            && (!old_enabled || old_session != new_session);
+            && self.indicator_enabled(KlineIndicator::VolumeBubbles)
+            && old_session != new_session;
+        let should_wake_trade_overlay = matches!(self.kind, KlineChartKind::Candles)
+            && ((self.indicator_enabled(KlineIndicator::SessionVolumeProfile)
+                && old_svp.interval != new_svp.interval)
+                || (self.indicator_enabled(KlineIndicator::Vwap)
+                    && old_vwap.anchor != new_vwap.anchor));
 
         if should_refetch_volume_bubbles {
             log::info!(
-                "CHART Settings | bubbles old={:?}→{:?} enabled={old_enabled}→{new_enabled} reason=session_changed",
+                "CHART Settings | bubbles old={:?}→{:?} reason=session_changed",
                 old_session,
                 new_session
             );
@@ -1264,6 +1331,9 @@ impl KlineChart {
 
         if should_refetch_volume_bubbles {
             self.reset_request_handler();
+            self.last_tick = Instant::now() - std::time::Duration::from_secs(1);
+        } else if should_wake_trade_overlay {
+            // Existing raw trades are reusable across session/row settings.
             self.last_tick = Instant::now() - std::time::Duration::from_secs(1);
         }
     }
@@ -1852,7 +1922,10 @@ impl KlineChart {
             return;
         }
 
-        let prev_indi_count = self.indicators.values().filter(|v| v.is_some()).count();
+        let prev_indi_count = KlineIndicator::for_market(self.chart.ticker_info.market_type())
+            .iter()
+            .filter(|indicator| !indicator.is_overlay() && self.indicators[**indicator].is_some())
+            .count();
 
         if self.indicators[indicator].is_some() {
             self.indicators[indicator] = None;
@@ -1863,13 +1936,21 @@ impl KlineChart {
         }
 
         if let Some(main_split) = self.chart.layout.splits.first() {
-            let current_indi_count = self.indicators.values().filter(|v| v.is_some()).count();
+            let current_indi_count =
+                KlineIndicator::for_market(self.chart.ticker_info.market_type())
+                    .iter()
+                    .filter(|indicator| {
+                        !indicator.is_overlay() && self.indicators[**indicator].is_some()
+                    })
+                    .count();
             self.chart.layout.splits = data::util::calc_panel_splits(
                 *main_split,
                 current_indi_count,
                 Some(prev_indi_count),
             );
         }
+        self.invalidate(None);
+        self.last_tick = Instant::now() - std::time::Duration::from_secs(1);
     }
 }
 
@@ -2108,15 +2189,43 @@ impl canvas::Program<Message> for KlineChart {
                 }
                 KlineChartKind::Candles => {
                     let candle_width = chart.cell_width * 0.8;
+                    let svp = self.visual_config.session_volume_profile;
+                    if self.indicator_enabled(KlineIndicator::SessionVolumeProfile) {
+                        draw_session_volume_profiles(
+                            &self.data_source,
+                            frame,
+                            earliest,
+                            latest,
+                            interval_to_x,
+                            price_to_y,
+                            chart.cell_height,
+                            chart.tick_size,
+                            &svp,
+                            palette,
+                        );
+                    }
+                    if self.indicator_enabled(KlineIndicator::Vwap) {
+                        draw_vwap_overlay(
+                            &self.data_source,
+                            frame,
+                            earliest,
+                            latest,
+                            interval_to_x,
+                            price_to_y,
+                            &self.visual_config.vwap,
+                            palette,
+                        );
+                    }
                     let volume_bubbles = self.visual_config.volume_bubbles;
-                    let volume_bubble_session_start = volume_bubbles.enabled.then(|| {
+                    let bubbles_enabled = self.indicator_enabled(KlineIndicator::VolumeBubbles);
+                    let volume_bubble_session_start = bubbles_enabled.then(|| {
                         current_volume_bubble_session_start_ms(
                             chrono::Utc::now(),
                             volume_bubbles.session,
                         )
                         .as_u64()
                     });
-                    let visible_max_bubble_qty = if volume_bubbles.enabled {
+                    let visible_max_bubble_qty = if bubbles_enabled {
                         visible_max_bubble_qty(
                             &self.data_source,
                             volume_bubble_session_start
@@ -2144,7 +2253,7 @@ impl canvas::Program<Message> for KlineChart {
                                 kline,
                             );
 
-                            if volume_bubbles.enabled {
+                            if bubbles_enabled {
                                 draw_volume_bubbles(
                                     frame,
                                     price_to_y,
@@ -2214,6 +2323,398 @@ impl canvas::Program<Message> for KlineChart {
                     mouse::Interaction::default()
                 }
             }
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy)]
+struct VwapPoint {
+    time: u64,
+    value: Price,
+    upper: Price,
+    lower: Price,
+}
+
+fn build_vwap_sessions(
+    data_source: &PlotData<KlineDataPoint>,
+    earliest: u64,
+    latest: u64,
+    config: &VwapConfig,
+) -> Vec<Vec<VwapPoint>> {
+    let PlotData::TimeBased(timeseries) = data_source else {
+        return Vec::new();
+    };
+    let anchor_ms = config.anchor.milliseconds();
+    let from = align_session_start(earliest, anchor_ms);
+    let mut sessions = Vec::<Vec<VwapPoint>>::new();
+    let mut active_session = None;
+    let mut sum_volume = 0.0;
+    let mut sum_price_volume = 0.0;
+    let mut sum_price_squared_volume = 0.0;
+
+    for (_, dp) in timeseries
+        .datapoints
+        .range(UnixMs::new(from)..=UnixMs::new(latest))
+    {
+        let session = align_session_start(dp.kline.time.as_u64(), anchor_ms);
+        if active_session != Some(session) {
+            active_session = Some(session);
+            sum_volume = 0.0;
+            sum_price_volume = 0.0;
+            sum_price_squared_volume = 0.0;
+            sessions.push(Vec::new());
+        }
+        for (price, trades) in &dp.footprint.trades {
+            let volume = trades.total_qty().to_f64();
+            let price = price.to_f64();
+            sum_volume += volume;
+            sum_price_volume += price * volume;
+            sum_price_squared_volume += price * price * volume;
+        }
+        if sum_volume <= 0.0 {
+            continue;
+        }
+        let vwap = sum_price_volume / sum_volume;
+        let variance = (sum_price_squared_volume / sum_volume - vwap * vwap).max(0.0);
+        let band = variance.sqrt() * f64::from(config.band_multiplier.max(0.0));
+        if let Some(points) = sessions.last_mut() {
+            points.push(VwapPoint {
+                time: dp.kline.time.as_u64(),
+                value: Price::from_f64(vwap),
+                upper: Price::from_f64(vwap + band),
+                lower: Price::from_f64(vwap - band),
+            });
+        }
+    }
+    sessions.retain(|points| !points.is_empty());
+    sessions
+}
+
+fn draw_vwap_overlay(
+    data_source: &PlotData<KlineDataPoint>,
+    frame: &mut canvas::Frame,
+    earliest: u64,
+    latest: u64,
+    interval_to_x: impl Fn(u64) -> f32,
+    price_to_y: impl Fn(Price) -> f32,
+    config: &VwapConfig,
+    palette: &Extended,
+) {
+    let sessions = build_vwap_sessions(data_source, earliest, latest, config);
+    let vwap_color = palette.warning.strong.color.scale_alpha(0.96);
+    let band_color = palette.secondary.strong.color.scale_alpha(0.62);
+    for points in sessions {
+        let draw_series = |frame: &mut canvas::Frame,
+                           select: fn(&VwapPoint) -> Price,
+                           color: Color,
+                           width: f32| {
+            let mut builder = canvas::path::Builder::new();
+            if let Some(first) = points.first() {
+                builder.move_to(Point::new(
+                    interval_to_x(first.time),
+                    price_to_y(select(first)),
+                ));
+                for point in points.iter().skip(1) {
+                    builder.line_to(Point::new(
+                        interval_to_x(point.time),
+                        price_to_y(select(point)),
+                    ));
+                }
+                frame.stroke(
+                    &builder.build(),
+                    Stroke::default().with_color(color).with_width(width),
+                );
+            }
+        };
+        draw_series(
+            frame,
+            |point| point.value,
+            vwap_color,
+            config.line_width.clamp(0.5, 5.0),
+        );
+        if config.show_bands {
+            draw_series(frame, |point| point.upper, band_color, 0.8);
+            draw_series(frame, |point| point.lower, band_color, 0.8);
+        }
+        if config.show_labels
+            && let Some(last) = points.last()
+        {
+            let x = interval_to_x(last.time) + 2.0;
+            draw_cluster_text(
+                frame,
+                "VWAP",
+                Point::new(x, price_to_y(last.value)),
+                7.0,
+                vwap_color,
+                Alignment::Start,
+                Alignment::Center,
+            );
+            if config.show_bands {
+                draw_cluster_text(
+                    frame,
+                    "+σ",
+                    Point::new(x, price_to_y(last.upper)),
+                    7.0,
+                    band_color,
+                    Alignment::Start,
+                    Alignment::Center,
+                );
+                draw_cluster_text(
+                    frame,
+                    "-σ",
+                    Point::new(x, price_to_y(last.lower)),
+                    7.0,
+                    band_color,
+                    Alignment::Start,
+                    Alignment::Center,
+                );
+            }
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, Default)]
+struct ProfileBin {
+    buy: f64,
+    sell: f64,
+}
+
+impl ProfileBin {
+    fn volume(self) -> f64 {
+        self.buy + self.sell
+    }
+    fn delta(self) -> f64 {
+        self.buy - self.sell
+    }
+}
+
+#[derive(Debug)]
+struct SessionProfile {
+    start: u64,
+    end: u64,
+    rows: Vec<(Price, ProfileBin)>,
+    poc: Price,
+    vah: Price,
+    val: Price,
+    vwap: Price,
+    high: Price,
+    low: Price,
+}
+
+fn align_session_start(timestamp: u64, interval_ms: u64) -> u64 {
+    if interval_ms == 7 * 24 * 60 * 60_000 {
+        // Unix epoch was a Thursday; shift by three days so weekly profiles
+        // open on Monday 00:00 UTC.
+        const MONDAY_SHIFT: u64 = 3 * 24 * 60 * 60_000;
+        return (timestamp.saturating_add(MONDAY_SHIFT) / interval_ms * interval_ms)
+            .saturating_sub(MONDAY_SHIFT);
+    }
+    timestamp / interval_ms * interval_ms
+}
+
+fn build_session_profiles(
+    data_source: &PlotData<KlineDataPoint>,
+    earliest: u64,
+    latest: u64,
+    tick_size: PriceStep,
+    config: &SessionVolumeProfileConfig,
+) -> Vec<SessionProfile> {
+    let PlotData::TimeBased(timeseries) = data_source else {
+        return Vec::new();
+    };
+    let session_ms = config.interval.milliseconds();
+    let row_units = tick_size
+        .units
+        .saturating_mul(i64::from(config.row_size_ticks.max(1)))
+        .max(1);
+    let from = align_session_start(earliest, session_ms);
+    let mut grouped: FxHashMap<u64, (FxHashMap<i64, ProfileBin>, Price, Price)> =
+        FxHashMap::default();
+
+    for (_, dp) in timeseries
+        .datapoints
+        .range(UnixMs::new(from)..=UnixMs::new(latest))
+    {
+        if dp.footprint.trades.is_empty() {
+            continue;
+        }
+        let session_start = align_session_start(dp.kline.time.as_u64(), session_ms);
+        let entry = grouped
+            .entry(session_start)
+            .or_insert_with(|| (FxHashMap::default(), dp.kline.high, dp.kline.low));
+        entry.1 = entry.1.max(dp.kline.high);
+        entry.2 = entry.2.min(dp.kline.low);
+        for (price, trades) in &dp.footprint.trades {
+            let bin_units = price.units.div_euclid(row_units).saturating_mul(row_units);
+            let bin = entry.0.entry(bin_units).or_default();
+            bin.buy += trades.buy_qty.to_f64();
+            bin.sell += trades.sell_qty.to_f64();
+        }
+    }
+
+    let mut result = grouped
+        .into_iter()
+        .filter_map(|(start, (bins, high, low))| {
+            let mut rows: Vec<_> = bins
+                .into_iter()
+                .map(|(units, bin)| (Price::from_units(units.saturating_add(row_units / 2)), bin))
+                .filter(|(_, bin)| bin.volume() > 0.0)
+                .collect();
+            rows.sort_by_key(|(price, _)| *price);
+            if rows.is_empty() {
+                return None;
+            }
+
+            let poc_index = rows
+                .iter()
+                .enumerate()
+                .max_by(|(_, a), (_, b)| a.1.volume().total_cmp(&b.1.volume()))
+                .map(|(index, _)| index)?;
+            let total: f64 = rows.iter().map(|(_, bin)| bin.volume()).sum();
+            let target = total * (f64::from(config.value_area_percent.clamp(1.0, 100.0)) / 100.0);
+            let mut included = rows[poc_index].1.volume();
+            let mut low_index = poc_index;
+            let mut high_index = poc_index;
+            while included < target && (low_index > 0 || high_index + 1 < rows.len()) {
+                let below = if low_index > 0 {
+                    rows[low_index - 1].1.volume()
+                } else {
+                    -1.0
+                };
+                let above = if high_index + 1 < rows.len() {
+                    rows[high_index + 1].1.volume()
+                } else {
+                    -1.0
+                };
+                if above >= below {
+                    high_index += 1;
+                    included += rows[high_index].1.volume();
+                } else {
+                    low_index -= 1;
+                    included += rows[low_index].1.volume();
+                }
+            }
+            let weighted: f64 = rows
+                .iter()
+                .map(|(price, bin)| price.to_f64() * bin.volume())
+                .sum();
+            Some(SessionProfile {
+                start,
+                end: start.saturating_add(session_ms),
+                poc: rows[poc_index].0,
+                vah: rows[high_index].0,
+                val: rows[low_index].0,
+                vwap: Price::from_f64(weighted / total.max(f64::EPSILON)),
+                high,
+                low,
+                rows,
+            })
+        })
+        .collect::<Vec<_>>();
+    result.sort_by_key(|profile| profile.start);
+    result
+}
+
+#[allow(clippy::too_many_arguments)]
+fn draw_session_volume_profiles(
+    data_source: &PlotData<KlineDataPoint>,
+    frame: &mut canvas::Frame,
+    earliest: u64,
+    latest: u64,
+    interval_to_x: impl Fn(u64) -> f32,
+    price_to_y: impl Fn(Price) -> f32,
+    cell_height: f32,
+    tick_size: PriceStep,
+    config: &SessionVolumeProfileConfig,
+    palette: &Extended,
+) {
+    let profiles = build_session_profiles(data_source, earliest, latest, tick_size, config);
+    let row_height = cell_height * f32::from(config.row_size_ticks.max(1)) * 0.86;
+    for profile in profiles {
+        let session_left = interval_to_x(profile.start);
+        let session_right = interval_to_x(profile.end);
+        let full_width = (session_right - session_left).abs();
+        let max_width = full_width * (config.width_percent.clamp(1.0, 100.0) / 100.0);
+        let max_value = profile
+            .rows
+            .iter()
+            .map(|(_, bin)| match config.mode {
+                SessionProfileMode::Volume => bin.volume(),
+                SessionProfileMode::Delta => bin.delta().abs(),
+            })
+            .fold(0.0f64, f64::max);
+        if max_value <= 0.0 {
+            continue;
+        }
+
+        for (price, bin) in &profile.rows {
+            let value = match config.mode {
+                SessionProfileMode::Volume => bin.volume(),
+                SessionProfileMode::Delta => bin.delta().abs(),
+            };
+            let width = max_width * (value / max_value) as f32;
+            let x = match config.placement {
+                SessionProfilePlacement::Left => session_left,
+                SessionProfilePlacement::Right => session_right - width,
+            };
+            let in_value_area = *price >= profile.val && *price <= profile.vah;
+            let base = match config.mode {
+                SessionProfileMode::Volume => palette.primary.strong.color,
+                SessionProfileMode::Delta if bin.delta() >= 0.0 => palette.success.strong.color,
+                SessionProfileMode::Delta => palette.danger.strong.color,
+            };
+            frame.fill_rectangle(
+                Point::new(x, price_to_y(*price) - row_height / 2.0),
+                Size::new(width.max(0.1), row_height.max(0.1)),
+                base.scale_alpha(if in_value_area { 0.38 } else { 0.18 }),
+            );
+        }
+
+        let draw_level = |frame: &mut canvas::Frame, price: Price, color: Color, width: f32| {
+            frame.stroke(
+                &Path::line(
+                    Point::new(session_left, price_to_y(price)),
+                    Point::new(session_right, price_to_y(price)),
+                ),
+                Stroke::default().with_color(color).with_width(width),
+            );
+        };
+        let draw_label = |frame: &mut canvas::Frame, text: &str, price: Price, color: Color| {
+            let (x, alignment) = match config.placement {
+                SessionProfilePlacement::Left => (session_left + 2.0, Alignment::Start),
+                SessionProfilePlacement::Right => (session_right - 2.0, Alignment::End),
+            };
+            draw_cluster_text(
+                frame,
+                text,
+                Point::new(x, price_to_y(price) - 1.0),
+                7.0,
+                color,
+                alignment,
+                Alignment::End,
+            );
+        };
+        if config.show_poc {
+            let color = palette.warning.strong.color.scale_alpha(0.95);
+            draw_level(frame, profile.poc, color, 1.6);
+            draw_label(frame, "POC", profile.poc, color);
+        }
+        if config.show_value_area {
+            let color = palette.primary.strong.color.scale_alpha(0.82);
+            draw_level(frame, profile.vah, color, 1.0);
+            draw_level(frame, profile.val, color, 1.0);
+            draw_label(frame, "VAH", profile.vah, color);
+            draw_label(frame, "VAL", profile.val, color);
+        }
+        if config.show_vwap {
+            let color = palette.success.base.color.scale_alpha(0.85);
+            draw_level(frame, profile.vwap, color, 1.0);
+            draw_label(frame, "VWAP", profile.vwap, color);
+        }
+        if config.show_session_high_low {
+            let color = palette.background.strong.text.scale_alpha(0.42);
+            draw_level(frame, profile.high, color, 0.7);
+            draw_level(frame, profile.low, color, 0.7);
         }
     }
 }

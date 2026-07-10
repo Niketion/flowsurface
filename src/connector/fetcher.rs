@@ -1,3 +1,4 @@
+use super::market_data::{DataRequirement, DataSet, RefreshPolicy, RequestKey, TimeRange};
 use data::chart::kline::{BubbleCandidate, BubbleVolumeSummary};
 use exchange::adapter::{AdapterError, AdapterHandles, Exchange, StreamKind};
 use exchange::unit::{Price, PriceStep, Qty};
@@ -944,6 +945,42 @@ impl FetchRange {
             | FetchRange::Trades(from, to) => from < to,
             FetchRange::BubbleSummary { from, to, .. } => from < to,
         }
+    }
+
+    /// Compatibility bridge used while legacy chart callers are migrated to
+    /// declaring `DataRequirement` directly. Bubble summaries deliberately map
+    /// to raw trades: aggregation is a derivation concern, not a transport.
+    pub fn requirement(self, stream: StreamKind) -> Option<(RequestKey, DataRequirement)> {
+        let (dataset, from, to) = match (self, stream) {
+            (FetchRange::Kline(from, to), StreamKind::Kline { timeframe, .. }) => (
+                DataSet::Klines {
+                    timeframe_ms: timeframe.to_milliseconds(),
+                },
+                from,
+                to,
+            ),
+            (FetchRange::OpenInterest(from, to), StreamKind::Kline { .. }) => {
+                (DataSet::OpenInterest, from, to)
+            }
+            (FetchRange::Trades(from, to), StreamKind::Trades { .. }) => {
+                (DataSet::Trades, from, to)
+            }
+            (FetchRange::BubbleSummary { from, to, .. }, StreamKind::Kline { ticker_info, .. }) => {
+                return DataRequirement::trades(TimeRange::new(from, to)?)
+                    .with_stream(StreamKind::Trades { ticker_info });
+            }
+            _ => return None,
+        };
+        let range = TimeRange::new(from, to)?;
+        let key = RequestKey::new(stream, dataset)?;
+        Some((
+            key,
+            DataRequirement {
+                dataset,
+                range,
+                refresh: RefreshPolicy::Historical,
+            },
+        ))
     }
 }
 

@@ -366,6 +366,7 @@ impl Dashboard {
                                         state.settings.visual_config = Some(cfg.clone());
                                         refresh_streams |=
                                             state.content.change_visual_config(cfg.clone());
+                                        state.reconcile_candlestick_trade_stream();
 
                                         if let Some(studies) = &studies_cfg {
                                             state.content.update_studies(studies.clone());
@@ -384,6 +385,7 @@ impl Dashboard {
                     } else if let Some(state) = self.get_mut_pane(main_window.id, window, pane) {
                         state.settings.visual_config = Some(cfg.clone());
                         refresh_streams = state.content.change_visual_config(cfg);
+                        state.reconcile_candlestick_trade_stream();
                     }
 
                     if refresh_streams {

@@ -367,10 +367,10 @@ pub enum KlineChartKind {
 
 impl KlineChartKind {
     pub fn allows_indicator(&self, indicator: KlineIndicator) -> bool {
-        !matches!(
-            (self, indicator),
-            (KlineChartKind::Candles, KlineIndicator::BarAnalysis)
-        )
+        match self {
+            KlineChartKind::Candles => !matches!(indicator, KlineIndicator::BarAnalysis),
+            KlineChartKind::Footprint { .. } => !indicator.is_overlay(),
+        }
     }
 
     pub fn min_scaling(&self) -> f32 {
@@ -471,6 +471,10 @@ pub struct Config {
     pub show_footprint_table_candle: bool,
     // Optional main-chart order-flow bubbles for regular candlesticks.
     pub volume_bubbles: VolumeBubbleConfig,
+    /// Session volume profile overlay for regular candlesticks.
+    pub session_volume_profile: SessionVolumeProfileConfig,
+    /// Settings owned by the VWAP overlay indicator.
+    pub vwap: VwapConfig,
 }
 
 impl Default for Config {
@@ -480,7 +484,150 @@ impl Default for Config {
             show_footprint_summary: true,
             show_footprint_table_candle: true,
             volume_bubbles: VolumeBubbleConfig::default(),
+            session_volume_profile: SessionVolumeProfileConfig::default(),
+            vwap: VwapConfig::default(),
         }
+    }
+}
+
+#[derive(Debug, Copy, Clone, PartialEq, Deserialize, Serialize)]
+#[serde(default)]
+pub struct VwapConfig {
+    pub anchor: SessionProfileInterval,
+    pub line_width: f32,
+    pub show_bands: bool,
+    pub band_multiplier: f32,
+    pub show_labels: bool,
+}
+
+impl Default for VwapConfig {
+    fn default() -> Self {
+        Self {
+            anchor: SessionProfileInterval::Daily,
+            line_width: 1.6,
+            show_bands: true,
+            band_multiplier: 1.0,
+            show_labels: true,
+        }
+    }
+}
+
+#[derive(Debug, Copy, Clone, PartialEq, Deserialize, Serialize)]
+#[serde(default)]
+pub struct SessionVolumeProfileConfig {
+    pub enabled: bool,
+    pub interval: SessionProfileInterval,
+    pub placement: SessionProfilePlacement,
+    pub mode: SessionProfileMode,
+    /// Percentage of session volume enclosed by VAH/VAL.
+    pub value_area_percent: f32,
+    /// Maximum profile width as percentage of the session width.
+    pub width_percent: f32,
+    /// Number of chart ticks aggregated into one profile row.
+    pub row_size_ticks: u16,
+    pub show_poc: bool,
+    pub show_value_area: bool,
+    pub show_vwap: bool,
+    pub show_session_high_low: bool,
+}
+
+impl Default for SessionVolumeProfileConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            interval: SessionProfileInterval::Hourly,
+            placement: SessionProfilePlacement::Left,
+            mode: SessionProfileMode::Volume,
+            value_area_percent: 70.0,
+            width_percent: 35.0,
+            row_size_ticks: 1,
+            show_poc: true,
+            show_value_area: true,
+            show_vwap: true,
+            show_session_high_low: true,
+        }
+    }
+}
+
+#[derive(Debug, Copy, Clone, PartialEq, Eq, Default, Deserialize, Serialize)]
+pub enum SessionProfileInterval {
+    Minutes30,
+    #[default]
+    Hourly,
+    Hours4,
+    Daily,
+    Weekly,
+}
+
+impl SessionProfileInterval {
+    pub const ALL: [Self; 5] = [
+        Self::Minutes30,
+        Self::Hourly,
+        Self::Hours4,
+        Self::Daily,
+        Self::Weekly,
+    ];
+
+    pub fn milliseconds(self) -> u64 {
+        match self {
+            Self::Minutes30 => 30 * 60_000,
+            Self::Hourly => 60 * 60_000,
+            Self::Hours4 => 4 * 60 * 60_000,
+            Self::Daily => 24 * 60 * 60_000,
+            Self::Weekly => 7 * 24 * 60 * 60_000,
+        }
+    }
+}
+
+impl std::fmt::Display for SessionProfileInterval {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(match self {
+            Self::Minutes30 => "30 minutes",
+            Self::Hourly => "Hourly",
+            Self::Hours4 => "4 hours",
+            Self::Daily => "Daily",
+            Self::Weekly => "Weekly",
+        })
+    }
+}
+
+#[derive(Debug, Copy, Clone, PartialEq, Eq, Default, Deserialize, Serialize)]
+pub enum SessionProfilePlacement {
+    #[default]
+    Left,
+    Right,
+}
+
+impl SessionProfilePlacement {
+    pub const ALL: [Self; 2] = [Self::Left, Self::Right];
+}
+
+impl std::fmt::Display for SessionProfilePlacement {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(match self {
+            Self::Left => "Left / session open",
+            Self::Right => "Right / session close",
+        })
+    }
+}
+
+#[derive(Debug, Copy, Clone, PartialEq, Eq, Default, Deserialize, Serialize)]
+pub enum SessionProfileMode {
+    #[default]
+    Volume,
+    Delta,
+}
+
+impl SessionProfileMode {
+    pub const ALL: [Self; 2] = [Self::Volume, Self::Delta];
+}
+
+impl std::fmt::Display for SessionProfileMode {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(match self {
+            Self::Volume => "Volume",
+            Self::Delta => "Delta",
+        })
     }
 }
 
