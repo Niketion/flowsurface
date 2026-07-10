@@ -290,6 +290,7 @@ impl WsAdapter for TradeAdapter {
                     self.buffer.push(
                         ticker,
                         Trade {
+                            id: None,
                             time: trade.time.into(),
                             is_sell: trade.direction == 2,
                             price,

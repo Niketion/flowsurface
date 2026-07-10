@@ -1,5 +1,5 @@
 use super::market_data::{DataRequirement, DataSet, RefreshPolicy, RequestKey, TimeRange};
-use super::persistent_cache::{market_cache, merge_bubble_summaries};
+use super::persistent_cache::{MarketDataCache, market_cache, merge_bubble_summaries};
 use data::chart::kline::{BubbleCandidate, BubbleVolumeSummary};
 use exchange::adapter::{AdapterError, AdapterHandles, Exchange, StreamKind};
 use exchange::unit::{Price, PriceStep, Qty};
@@ -176,6 +176,34 @@ const NO_PROGRESS_REMAINING_EPSILON_MS: u64 = 1000;
 
 /// How long to remember that a trade range returned empty.
 const EMPTY_TRADE_FETCH_TTL: Duration = Duration::from_secs(60);
+
+/// Keep only records inside the requested slice and remove REST pagination
+/// overlap by stable exchange id. Id-less records are deliberately preserved:
+/// equal price/qty/time values can still represent distinct real executions.
+fn filter_new_fetched_trades(
+    mut batch: Vec<Trade>,
+    from: UnixMs,
+    to_exclusive: UnixMs,
+    last_trade_id: &mut Option<u64>,
+) -> (Vec<Trade>, usize) {
+    let raw_count = batch.len();
+    batch.sort_by_key(|trade| (trade.time, trade.id));
+    batch.retain(|trade| {
+        if trade.time < from || trade.time >= to_exclusive {
+            return false;
+        }
+        let Some(id) = trade.id else {
+            return true;
+        };
+        if last_trade_id.is_some_and(|last| id <= last) {
+            return false;
+        }
+        *last_trade_id = Some((*last_trade_id).map_or(id, |last| last.max(id)));
+        true
+    });
+    let discarded = raw_count.saturating_sub(batch.len());
+    (batch, discarded)
+}
 
 #[derive(Debug, Clone)]
 pub enum FetchedData {
@@ -1578,10 +1606,19 @@ async fn fetch_klines_cached(
     let mut combined = cached.records;
     for (gap_from, gap_to_exclusive) in cached.gaps {
         let gap_to = gap_to_exclusive.saturating_sub(1);
-        let fetched = handles
+        let mut fetched = handles
             .fetch_klines(ticker_info, timeframe, Some((gap_from, gap_to)))
             .await?;
-        cache.store_klines(ticker_info, timeframe, gap_from, gap_to_exclusive, &fetched);
+        fetched.sort_by_key(|kline| kline.time);
+        fetched.dedup_by_key(|kline| kline.time);
+        store_contiguous_klines(
+            cache,
+            ticker_info,
+            timeframe,
+            gap_from,
+            gap_to_exclusive,
+            &fetched,
+        );
         combined.extend(fetched);
     }
     combined.sort_by_key(|kline| kline.time);
@@ -1595,6 +1632,57 @@ async fn fetch_klines_cached(
         );
     }
     Ok(combined)
+}
+
+/// Persist only ranges proven by contiguous candles. Storing the complete REST
+/// request around a partial response makes a missing candle look permanently
+/// covered and prevents both the integrity repair and reconnect backfill.
+fn store_contiguous_klines(
+    cache: &MarketDataCache,
+    ticker_info: TickerInfo,
+    timeframe: Timeframe,
+    requested_from: UnixMs,
+    requested_to_exclusive: UnixMs,
+    klines: &[Kline],
+) {
+    let interval = timeframe.to_milliseconds();
+    if interval == 0 || klines.is_empty() {
+        return;
+    }
+
+    let mut run_start = 0usize;
+    for index in 1..=klines.len() {
+        let run_ended = index == klines.len()
+            || klines[index].time > klines[index - 1].time.saturating_add(interval);
+        if !run_ended {
+            continue;
+        }
+
+        let run = &klines[run_start..index];
+        let first = run[0].time;
+        let last = run[run.len() - 1].time;
+        let coverage_from = if first <= requested_from
+            && first.saturating_add(interval) > requested_from
+        {
+            requested_from
+        } else {
+            first.max(requested_from)
+        };
+        let coverage_to = last
+            .saturating_add(interval)
+            .min(requested_to_exclusive);
+
+        if coverage_from < coverage_to {
+            cache.store_klines(
+                ticker_info,
+                timeframe,
+                coverage_from,
+                coverage_to,
+                run,
+            );
+        }
+        run_start = index;
+    }
 }
 
 async fn fetch_open_interest_cached(
@@ -1906,6 +1994,7 @@ pub fn fetch_trades_batched(
             let mut consecutive_no_progress = 0usize;
             let mut prev_request_from = None;
             let mut prev_request_to = None;
+            let mut last_trade_id = None;
 
             loop {
                 if latest_trade_t > target_to {
@@ -1985,14 +2074,6 @@ pub fn fetch_trades_batched(
                         );
 
                         if raw_batch.is_empty() {
-                            if let Some(cache) = market_cache() {
-                                cache.store_trades(
-                                    ticker_info,
-                                    request_from,
-                                    gap_to_exclusive,
-                                    &[],
-                                );
-                            }
                             empty_covered_tail = Some((request_from, target_to));
                             log::warn!(
                                 "TRADE Stop | venue={venue} symbol={symbol} reason=empty_batch_before_target latest={} target_to={} remaining_ms={} requests={request_count} trades={total_trades} total_duration={}",
@@ -2008,12 +2089,18 @@ pub fn fetch_trades_batched(
                             raw_batch.last().map_or(latest_trade_t, |trade| trade.time);
                         final_latest = final_latest.max(latest_trade_t.min(target_to));
                         let covered_to_exclusive = latest_trade_t.min(target_to).saturating_add(1);
-                        let batch = raw_batch
-                            .into_iter()
-                            .filter(|trade| {
-                                trade.time >= request_from && trade.time < gap_to_exclusive
-                            })
-                            .collect::<Vec<_>>();
+                        let (batch, discarded) = filter_new_fetched_trades(
+                            raw_batch,
+                            request_from,
+                            gap_to_exclusive,
+                            &mut last_trade_id,
+                        );
+                        if discarded > 0 {
+                            log::debug!(
+                                "TRADE Dedup | venue={venue} symbol={symbol} request_idx={request_count} discarded={discarded} retained={}",
+                                batch.len()
+                            );
+                        }
                         if let Some(cache) = market_cache()
                             && request_from < covered_to_exclusive
                         {
@@ -2039,16 +2126,6 @@ pub fn fetch_trades_batched(
                                 || consecutive_no_progress >= TRADE_NO_PROGRESS_MAX_CONSECUTIVE
                             {
                                 let tail_from = latest_trade_t.saturating_add(1);
-                                if let Some(cache) = market_cache()
-                                    && tail_from < gap_to_exclusive
-                                {
-                                    cache.store_trades(
-                                        ticker_info,
-                                        tail_from,
-                                        gap_to_exclusive,
-                                        &[],
-                                    );
-                                }
                                 if !batch.is_empty() {
                                     let () = progress.send(batch).await;
                                 }
@@ -2160,7 +2237,7 @@ async fn fetch_bubble_summaries_cached(
 ) -> Result<(Vec<BubbleVolumeSummary>, usize, usize), AdapterError> {
     let to_exclusive = to_time.saturating_add(1);
     let Some(cache) = market_cache() else {
-        return fetch_bubble_summaries(
+        let (summaries, trades_seen, raw_discarded, _) = fetch_bubble_summaries(
             handles,
             ticker_info,
             from_time,
@@ -2170,7 +2247,8 @@ async fn fetch_bubble_summaries_cached(
             max_candidates_per_candle,
             data_path,
         )
-        .await;
+        .await?;
+        return Ok((summaries, trades_seen, raw_discarded));
     };
 
     let cached = cache.read_bubble_summaries(
@@ -2189,10 +2267,12 @@ async fn fetch_bubble_summaries_cached(
         .map(|candidate| candidate.trade_count)
         .sum::<usize>();
     let mut raw_discarded = 0usize;
+    let mut verified_ranges = Vec::new();
 
     for (gap_from, gap_to_exclusive) in cached.gaps {
         let gap_to = gap_to_exclusive.saturating_sub(1);
-        let (fetched, gap_trades_seen, gap_raw_discarded) = fetch_bubble_summaries(
+        let (fetched, gap_trades_seen, gap_raw_discarded, verified_to_exclusive) =
+            fetch_bubble_summaries(
             handles.clone(),
             ticker_info,
             gap_from,
@@ -2203,21 +2283,34 @@ async fn fetch_bubble_summaries_cached(
             data_path.clone(),
         )
         .await?;
+        if gap_from < verified_to_exclusive {
+            verified_ranges.push((gap_from, verified_to_exclusive.min(gap_to_exclusive)));
+        }
         trades_seen = trades_seen.saturating_add(gap_trades_seen);
         raw_discarded = raw_discarded.saturating_add(gap_raw_discarded);
         summaries.extend(fetched);
     }
 
     let summaries = merge_bubble_summaries(summaries, max_candidates_per_candle);
-    cache.store_bubble_summaries(
-        ticker_info,
-        timeframe_ms,
-        price_step.units,
-        max_candidates_per_candle,
-        from_time,
-        to_exclusive,
-        &summaries,
-    );
+    for (verified_from, verified_to_exclusive) in verified_ranges {
+        let verified_summaries = summaries
+            .iter()
+            .filter(|summary| {
+                summary.candle_time < verified_to_exclusive
+                    && summary.candle_time.saturating_add(timeframe_ms) > verified_from
+            })
+            .cloned()
+            .collect::<Vec<_>>();
+        cache.store_bubble_summaries(
+            ticker_info,
+            timeframe_ms,
+            price_step.units,
+            max_candidates_per_candle,
+            verified_from,
+            verified_to_exclusive,
+            &verified_summaries,
+        );
+    }
     if cache_complete {
         log::debug!(
             "BUBBLE Network Skipped | venue={} symbol={} range={} timeframe_ms={timeframe_ms}",
@@ -2238,13 +2331,15 @@ async fn fetch_bubble_summaries(
     price_step: PriceStep,
     max_candidates_per_candle: usize,
     data_path: PathBuf,
-) -> Result<(Vec<BubbleVolumeSummary>, usize, usize), AdapterError> {
+) -> Result<(Vec<BubbleVolumeSummary>, usize, usize, UnixMs), AdapterError> {
     let venue = format_venue(&ticker_info);
     let symbol = format_symbol(&ticker_info);
     let started = Instant::now();
     let mut latest_trade_t = from_time;
     let mut request_count = 0usize;
     let mut trades_seen = 0usize;
+    let mut raw_discarded = 0usize;
+    let mut last_trade_id = None;
     let mut buckets: FxHashMap<(UnixMs, Price), BubbleBucketAccum> = FxHashMap::default();
 
     log::info!(
@@ -2257,14 +2352,11 @@ async fn fetch_bubble_summaries(
         request_count += 1;
         let batch_started = Instant::now();
         let request_from = latest_trade_t;
-        let batch = handles
+        let raw_batch = handles
             .fetch_trades(ticker_info, latest_trade_t, Some(data_path.clone()))
             .await?;
 
-        if batch.is_empty() {
-            if let Some(cache) = market_cache() {
-                cache.store_trades(ticker_info, request_from, to_time.saturating_add(1), &[]);
-            }
+        if raw_batch.is_empty() {
             log::warn!(
                 "BUBBLE Summary Batch | trades_seen={trades_seen} buckets={} retained_candidates={} reason=empty_batch",
                 buckets.len(),
@@ -2274,11 +2366,17 @@ async fn fetch_bubble_summaries(
         }
 
         let prev_latest_trade_t = latest_trade_t;
+        latest_trade_t = raw_batch
+            .last()
+            .map_or(latest_trade_t, |trade| trade.time);
+        let (batch, discarded) = filter_new_fetched_trades(
+            raw_batch,
+            request_from,
+            to_time.saturating_add(1),
+            &mut last_trade_id,
+        );
+        raw_discarded = raw_discarded.saturating_add(discarded);
         for trade in &batch {
-            if trade.time < from_time || trade.time > to_time {
-                continue;
-            }
-
             let candle_time =
                 UnixMs::new(trade.time.as_u64() - (trade.time.as_u64() % timeframe_ms));
             let price = trade.price.round_to_step(price_step);
@@ -2289,7 +2387,6 @@ async fn fetch_bubble_summaries(
         }
 
         trades_seen += batch.len();
-        latest_trade_t = batch.last().map_or(latest_trade_t, |trade| trade.time);
         if let Some(cache) = market_cache() {
             let cache_to_exclusive = latest_trade_t.min(to_time).saturating_add(1);
             let cache_batch = batch
@@ -2331,12 +2428,23 @@ async fn fetch_bubble_summaries(
         format_time_range(from_time, to_time),
         summaries.len(),
         candidate_count,
-        trades_seen,
+        raw_discarded,
         trades_seen,
         format_duration_ms(started.elapsed().as_millis() as u64)
     );
 
-    Ok((summaries, trades_seen, trades_seen))
+    let verified_to_exclusive = if latest_trade_t > from_time {
+        latest_trade_t.min(to_time).saturating_add(1)
+    } else {
+        from_time
+    };
+
+    Ok((
+        summaries,
+        trades_seen,
+        raw_discarded,
+        verified_to_exclusive,
+    ))
 }
 
 fn retained_bubble_candidate_count(
@@ -2423,6 +2531,44 @@ fn bubble_summaries_from_buckets(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn trade(id: Option<u64>, time: u64) -> Trade {
+        Trade {
+            id,
+            time: UnixMs::new(time),
+            is_sell: false,
+            price: Price::from_f64(100.0),
+            qty: Qty::from_f64(1.0),
+        }
+    }
+
+    #[test]
+    fn fetched_trade_dedup_uses_exchange_id_not_trade_values() {
+        let mut last_id = None;
+        let (first, discarded) = filter_new_fetched_trades(
+            vec![
+                trade(Some(10), 1_000),
+                trade(Some(10), 1_000),
+                trade(Some(11), 1_000),
+                trade(None, 1_000),
+                trade(None, 1_000),
+            ],
+            UnixMs::new(1_000),
+            UnixMs::new(2_000),
+            &mut last_id,
+        );
+        assert_eq!(discarded, 1);
+        assert_eq!(first.len(), 4);
+
+        let (second, discarded) = filter_new_fetched_trades(
+            vec![trade(Some(11), 1_000), trade(Some(12), 1_001)],
+            UnixMs::new(1_000),
+            UnixMs::new(2_000),
+            &mut last_id,
+        );
+        assert_eq!(discarded, 1);
+        assert_eq!(second.iter().filter_map(|trade| trade.id).collect::<Vec<_>>(), vec![12]);
+    }
 
     #[test]
     fn test_generation_id_increments_on_supersede() {

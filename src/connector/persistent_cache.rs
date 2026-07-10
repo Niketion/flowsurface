@@ -13,7 +13,10 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
 use std::sync::OnceLock;
 
-const CACHE_SCHEMA: u64 = 1;
+// v3 invalidates v2 coverage records that could mark future/empty trade ranges
+// and discontinuous kline ranges as complete. Those records can suppress the
+// footprint and reconnect backfill even though the underlying data is missing.
+const CACHE_SCHEMA: u64 = 3;
 const CACHE_MAGIC: &[u8; 8] = b"FSCACHE1";
 const HEADER_LEN: usize = 8 + 8 + 8 + 4;
 const HOURLY_BUCKET_MS: u64 = 60 * 60 * 1_000;
@@ -155,23 +158,12 @@ impl CacheRecord for Trade {
     }
 
     fn normalize(mut records: Vec<Self>) -> Vec<Self> {
-        records.sort_by_key(|trade| {
-            (
-                trade.time,
-                trade.is_sell,
-                trade.price.units,
-                trade.qty.units,
-            )
-        });
-        // Trade ids are not exposed by the adapters. This exact tuple is the
-        // strongest stable identity available and prevents overlap double-counts.
-        records.dedup_by_key(|trade| {
-            (
-                trade.time,
-                trade.is_sell,
-                trade.price.units,
-                trade.qty.units,
-            )
+        records.sort_by_key(|trade| (trade.time, trade.id));
+        let mut seen_ids = BTreeSet::new();
+        records.retain(|trade| {
+            // Never collapse id-less trades by value: two real executions can
+            // legitimately have identical millisecond/side/price/quantity.
+            trade.id.is_none_or(|id| seen_ids.insert(id))
         });
         records
     }
@@ -293,8 +285,50 @@ impl MarketDataCache {
             ticker_info,
             &format!("kline|timeframe_ms={}", timeframe.to_milliseconds()),
         );
-        let record_from = from.saturating_sub(timeframe.to_milliseconds().saturating_sub(1));
-        self.read_records(CacheKind::Kline, &key, from, to_exclusive, record_from)
+        let timeframe_ms = timeframe.to_milliseconds();
+        let record_from = from.saturating_sub(timeframe_ms.saturating_sub(1));
+        let mut slice: CacheSlice<Kline> =
+            self.read_records(CacheKind::Kline, &key, from, to_exclusive, record_from);
+
+        // Coverage is not sufficient proof of a continuous candle series. A
+        // partial/truncated response may have persisted coverage around a
+        // missing candle. Turn every internal discontinuity back into a network
+        // gap so the fetcher can repair it.
+        let mut gaps = slice
+            .gaps
+            .iter()
+            .map(|(gap_from, gap_to)| (gap_from.as_u64(), gap_to.as_u64()))
+            .collect::<Vec<_>>();
+        let gaps_before = gaps.len();
+        if timeframe_ms > 0 {
+            for pair in slice.records.windows(2) {
+                let expected = pair[0].time.saturating_add(timeframe_ms);
+                let next = pair[1].time;
+                if next > expected {
+                    let gap_from = expected.max(from);
+                    let gap_to = next.min(to_exclusive);
+                    if gap_from < gap_to {
+                        gaps.push((gap_from.as_u64(), gap_to.as_u64()));
+                    }
+                }
+            }
+        }
+        gaps = merge_intervals(gaps);
+        if gaps.len() > gaps_before {
+            log::warn!(
+                "CACHE KlineIntegrityGap | key={} records={} detected_gaps={} range={}..{}",
+                key,
+                slice.records.len(),
+                gaps.len().saturating_sub(gaps_before),
+                from.as_u64(),
+                to_exclusive.as_u64()
+            );
+        }
+        slice.gaps = gaps
+            .into_iter()
+            .map(|(gap_from, gap_to)| (UnixMs::new(gap_from), UnixMs::new(gap_to)))
+            .collect();
+        slice
     }
 
     pub fn store_klines(
@@ -556,6 +590,20 @@ impl MarketDataCache {
         records: &[T],
     ) {
         if from >= to_exclusive {
+            return;
+        }
+        // An empty response is not durable evidence that a range is genuinely
+        // empty: it can mean a future request, a reconnect race, exchange lag or
+        // a partial API failure. Keep negative coverage short-lived in memory
+        // instead of poisoning the persistent cache across restarts.
+        if records.is_empty() {
+            log::debug!(
+                "CACHE Write Skipped | dataset={} key={} range={}..{} reason=empty_unverified",
+                kind.label(),
+                dataset_key,
+                from.as_u64(),
+                to_exclusive.as_u64()
+            );
             return;
         }
         if records.iter().any(|record| !record.is_semantically_valid()) {
@@ -1042,6 +1090,29 @@ pub fn merge_bubble_summaries(
                 .or_default()
                 .entry(candidate.price.units)
                 .and_modify(|existing| {
+                    let intervals_are_disjoint = match (
+                        existing.first_time,
+                        existing.last_time,
+                        candidate.first_time,
+                        candidate.last_time,
+                    ) {
+                        (Some(existing_first), Some(existing_last), Some(new_first), Some(new_last)) => {
+                            existing_last < new_first || new_last < existing_first
+                        }
+                        _ => false,
+                    };
+
+                    // Overlapping summaries may contain the same executions
+                    // but no longer carry their individual trade ids. Adding
+                    // them would inflate bubbles. Keep the more complete
+                    // candidate; only truly disjoint time slices are additive.
+                    if !intervals_are_disjoint {
+                        if candidate.trade_count > existing.trade_count {
+                            *existing = candidate;
+                        }
+                        return;
+                    }
+
                     existing.buy_qty += candidate.buy_qty;
                     existing.sell_qty += candidate.sell_qty;
                     existing.total_qty = existing.buy_qty + existing.sell_qty;

@@ -44,6 +44,8 @@ struct DeOpenInterest {
 
 #[derive(Deserialize, Debug)]
 struct DeTrade {
+    #[serde(rename = "a")]
+    id: u64,
     #[serde(rename = "T")]
     time: u64,
     #[serde(rename = "p", deserialize_with = "de_string_to_number")]
@@ -574,6 +576,7 @@ async fn fetch_intraday_trades(
     let trades = de_trades
         .into_iter()
         .map(|de_trade| Trade {
+            id: Some(de_trade.id),
             time: de_trade.time.into(),
             is_sell: de_trade.is_sell,
             price: Price::from_f64(de_trade.price).round_to_min_tick(ticker_info.min_ticksize),
@@ -661,6 +664,7 @@ async fn get_hist_trades_with_client(
 
         trades.extend(csv_reader.records().filter_map(|record| {
             record.ok().and_then(|record| {
+                let id = record[0].parse::<u64>().ok()?;
                 let time = record[5].parse::<u64>().ok()?;
                 let is_sell = record[6].parse::<bool>().ok()?;
                 let price_f64 = record[1].parse::<f64>().ok()?;
@@ -669,6 +673,7 @@ async fn get_hist_trades_with_client(
                 let qty = qty_norm.normalize_qty(record[2].parse::<f64>().ok()?, price_f64);
 
                 Some(Trade {
+                    id: Some(id),
                     time: time.into(),
                     is_sell,
                     price,

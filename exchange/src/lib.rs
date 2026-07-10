@@ -551,6 +551,10 @@ impl TickerInfo {
 
 #[derive(Debug, Clone, Copy, Deserialize, Serialize)]
 pub struct Trade {
+    /// Stable exchange trade identifier when the venue exposes one.
+    /// Binance REST/archives use the aggregate-trade id (`a`).
+    #[serde(default)]
+    pub id: Option<u64>,
     pub time: UnixMs,
     pub is_sell: bool,
     pub price: Price,

@@ -52,6 +52,11 @@ and its dataset coverage is invalidated before the range falls back to REST. A d
 cannot be opened, has incompatible table definitions or uses an unsupported schema is renamed
 with a `.corrupt-<timestamp>` suffix and recreated. Cache failures never prevent network fetches.
 
+Cache schema v2 persists Binance aggregate-trade ids. Pagination overlap is removed exclusively
+by this stable id; id-less executions are never collapsed merely because time, side, price and
+quantity happen to match. Bubble summaries and footprint rows therefore consume the same unique
+execution set. Completing a Bubble summary does not mark raw footprint trades as checked.
+
 ## Session volume profile consumer
 
 The candlestick SVP is the first consumer following this contract. It uses the same raw `Trades`

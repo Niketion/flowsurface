@@ -35,7 +35,7 @@ use widget::{
 };
 
 use iced::{
-    Alignment, Element, Length, Subscription, Task, keyboard, padding,
+    Alignment, Element, Length, Subscription, Task, Theme, keyboard, padding,
     widget::{
         button, column, container, pane_grid, pick_list, row, rule, scrollable, text, text_input,
         tooltip::Position as TooltipPosition,
@@ -113,6 +113,7 @@ struct Flowsurface {
     windowing_mode: WindowingMode,
     market_store: Arc<market_service::MarketStore>,
     market_diagnostics: market_service::MarketDiagnostics,
+    market_connectivity: market_service::MarketConnectivity,
     dirty_flag: render_scheduler::DirtyFlag,
     debug_terminal_enabled: bool,
     debug_terminal_window: Option<window::Id>,
@@ -182,6 +183,7 @@ enum Message {
     StartupContinueWithDefault,
     StartupExitWithoutOverwrite,
     StartupWarningNoop,
+    ConnectionOverlayNoop,
     ToggleDialogModal(Option<screen::ConfirmDialog<Message>>),
     ThemeEditor(modal::theme_editor::Message),
     NetworkManager(modal::network_manager::Message),
@@ -614,6 +616,7 @@ impl Flowsurface {
             windowing_mode,
             market_store,
             market_diagnostics,
+            market_connectivity: market_service::MarketConnectivity::new(),
             dirty_flag: render_scheduler::DirtyFlag::new(),
             debug_terminal_enabled: saved_state.debug_terminal_enabled,
             debug_terminal_window: None,
@@ -699,6 +702,46 @@ impl Flowsurface {
         )
     }
 
+    fn apply_connectivity_transition(
+        &mut self,
+        transition: market_service::ConnectivityTransition,
+    ) -> Task<Message> {
+        self.market_store
+            .set_streams_connected(self.market_connectivity.is_online());
+
+        match transition {
+            market_service::ConnectivityTransition::None => Task::none(),
+            market_service::ConnectivityTransition::WentOffline => {
+                log::warn!(
+                    "MARKET Offline | connected_streams={} expected_streams={} reason={:?}",
+                    self.market_connectivity.connected_count(),
+                    self.market_connectivity.expected_count(),
+                    self.market_connectivity.last_reason()
+                );
+                self.dirty_flag.mark_dirty();
+                Task::none()
+            }
+            market_service::ConnectivityTransition::Restored => {
+                log::info!(
+                    "MARKET Restored | connected_streams={} expected_streams={} action=resume_and_backfill",
+                    self.market_connectivity.connected_count(),
+                    self.market_connectivity.expected_count()
+                );
+                self.dirty_flag.mark_dirty();
+
+                let handles = self.handles.clone();
+                let main_window_id = self.main_window.id;
+                let reconnect_time = exchange::UnixMs::now();
+                self.active_dashboard_mut()
+                    .execute_reconnect_backfill(&handles, main_window_id, reconnect_time)
+                    .map(move |msg| Message::Dashboard {
+                        layout_id: None,
+                        event: msg,
+                    })
+            }
+        }
+    }
+
     fn update(&mut self, message: Message) -> Task<Message> {
         match message {
             Message::MarketWsEvent(event) => {
@@ -711,53 +754,55 @@ impl Flowsurface {
                 self.dirty_flag.mark_dirty();
 
                 let main_window_id = self.main_window.id;
+
+                if let exchange::Event::Connected(streams) = &event {
+                    log::info!("WS Connected | streams={}", streams.len());
+                    for (idx, stream) in streams.iter().enumerate() {
+                        log::debug!(
+                            "WS ConnectedStream | idx={idx} stream={}",
+                            crate::connector::fetcher::format_stream(stream)
+                        );
+                    }
+
+                    let transition = self.market_connectivity.record_connected(
+                        streams,
+                        std::time::Instant::now(),
+                    );
+                    return self.apply_connectivity_transition(transition);
+                }
+
+                if let exchange::Event::Disconnected(streams, reason) = &event {
+                    let now = exchange::UnixMs::now();
+                    log::info!(
+                        "WS Disconnected | reason={reason:?} streams={} now={}",
+                        streams.len(),
+                        crate::connector::fetcher::format_time_short(now)
+                    );
+                    for (idx, stream) in streams.iter().enumerate() {
+                        log::debug!(
+                            "WS DisconnectedStream | idx={idx} stream={}",
+                            crate::connector::fetcher::format_stream(stream)
+                        );
+                    }
+
+                    // Accumulate every independently disconnected WS group.
+                    // Backfill starts only when the aggregate connection state
+                    // reports that all required streams have recovered.
+                    self.active_dashboard_mut()
+                        .record_pending_disconnect_gaps(streams, now);
+                    let transition = self.market_connectivity.record_disconnected(
+                        streams,
+                        reason.clone(),
+                        std::time::Instant::now(),
+                    );
+                    return self.apply_connectivity_transition(transition);
+                }
+
                 let dashboard = self.active_dashboard_mut();
 
                 match event {
-                    exchange::Event::Connected(streams) => {
-                        self.market_store.set_streams_connected(true);
-                        log::info!("WS Connected | streams={}", streams.len());
-                        for (idx, stream) in streams.iter().enumerate() {
-                            log::debug!(
-                                "WS ConnectedStream | idx={idx} stream={}",
-                                crate::connector::fetcher::format_stream(stream)
-                            );
-                        }
-                        // Compute real offline gap and enqueue backfill if needed.
-                        // At disconnect time the gap was tiny; now we have the
-                        // full offline duration (last_seen → reconnect_time).
-                        let main_window_id = self.main_window.id;
-                        let handles = self.handles.clone();
-                        let dashboard = self.active_dashboard_mut();
-                        let reconnect_time = exchange::UnixMs::now();
-                        return dashboard
-                            .execute_reconnect_backfill(&handles, main_window_id, reconnect_time)
-                            .map(move |msg| Message::Dashboard {
-                                layout_id: None,
-                                event: msg,
-                            });
-                    }
-                    exchange::Event::Disconnected(streams, reason) => {
-                        self.market_store.set_streams_connected(false);
-                        let now = exchange::UnixMs::now();
-                        log::info!(
-                            "WS Disconnected | reason={reason:?} streams={} now={}",
-                            streams.len(),
-                            crate::connector::fetcher::format_time_short(now)
-                        );
-                        for (idx, stream) in streams.iter().enumerate() {
-                            log::debug!(
-                                "WS DisconnectedStream | idx={idx} stream={}",
-                                crate::connector::fetcher::format_stream(stream)
-                            );
-                        }
-
-                        // Defer backfill until reconnect — the gap at disconnect
-                        // time is tiny (last_seen → disconnect ≈ 87ms), but the
-                        // real offline gap is last_seen → reconnect_time.
-                        let dashboard = self.active_dashboard_mut();
-                        dashboard.record_pending_disconnect_gaps(&streams, now);
-                        return Task::none();
+                    exchange::Event::Connected(..) | exchange::Event::Disconnected(..) => {
+                        unreachable!("connection events are handled before dashboard routing")
                     }
                     exchange::Event::DepthReceived(stream, update_t, depth) => {
                         log::trace!(
@@ -848,16 +893,38 @@ impl Flowsurface {
                 }
                 self.market_diagnostics.maybe_log();
 
+                let expected_streams = self.active_dashboard().configured_market_streams();
+                let sync_transition = self
+                    .market_connectivity
+                    .sync_expected(&expected_streams, now);
+                let transition = if sync_transition
+                    != market_service::ConnectivityTransition::None
+                {
+                    sync_transition
+                } else {
+                    self.market_connectivity.tick(now)
+                };
+                let connectivity_task = self.apply_connectivity_transition(transition);
+
+                // Keep WS subscriptions alive so their reconnect loop can run,
+                // but freeze chart timers/fetch scheduling while offline. The
+                // reconnect transition performs the missing-range backfill.
+                if self.market_connectivity.overlay_visible() {
+                    return connectivity_task;
+                }
+
                 let main_window_id = self.main_window.id;
                 let handles = self.handles.clone();
 
-                return self
+                let chart_tick = self
                     .active_dashboard_mut()
                     .tick(&handles, now, main_window_id)
                     .map(move |msg| Message::Dashboard {
                         layout_id: None,
                         event: msg,
                     });
+
+                return Task::batch([connectivity_task, chart_tick]);
             }
             Message::WindowEvent(event) => match event {
                 window::Event::CloseRequested(window) => {
@@ -1099,6 +1166,7 @@ impl Flowsurface {
                 return iced::exit();
             }
             Message::StartupWarningNoop => {}
+            Message::ConnectionOverlayNoop => {}
             Message::SetTimezone(tz) => {
                 self.timezone = tz;
             }
@@ -1395,7 +1463,8 @@ impl Flowsurface {
 
     fn view(&self, id: window::Id) -> Element<'_, Message> {
         if self.debug_terminal_window == Some(id) {
-            return self.debug_terminal_view();
+            let content = self.debug_terminal_view();
+            return self.with_connection_overlay(content);
         }
 
         let dashboard = self.active_dashboard();
@@ -1506,7 +1575,7 @@ impl Flowsurface {
             content
         };
 
-        toast::Manager::new(
+        let content = toast::Manager::new(
             content,
             self.notifications.toasts(),
             match sidebar_pos {
@@ -1515,6 +1584,63 @@ impl Flowsurface {
             },
             Message::RemoveNotification,
         )
+        .into();
+
+        self.with_connection_overlay(content)
+    }
+
+    fn with_connection_overlay<'a>(&'a self, content: Element<'a, Message>) -> Element<'a, Message> {
+        if self.market_connectivity.overlay_visible() {
+            main_dialog_modal(
+                content,
+                self.connection_lost_modal(),
+                Message::ConnectionOverlayNoop,
+            )
+        } else {
+            content
+        }
+    }
+
+    fn connection_lost_modal(&self) -> Element<'_, Message> {
+        let connected = self.market_connectivity.connected_count();
+        let expected = self.market_connectivity.expected_count();
+
+        let status_icon = container(text("!").size(36))
+            .width(Length::Fixed(64.0))
+            .height(Length::Fixed(64.0))
+            .align_x(Alignment::Center)
+            .align_y(Alignment::Center)
+            .style(|theme: &Theme| {
+                let palette = theme.extended_palette();
+                container::Style {
+                    text_color: Some(palette.danger.base.color),
+                    background: Some(palette.danger.weak.color.into()),
+                    ..container::Style::default()
+                }
+            });
+
+        container(
+            column![
+                status_icon,
+                text("No connection").size(crate::style::text_size::TITLE),
+                text("Market data is temporarily unavailable. Charts are paused to prevent incomplete or misleading updates.")
+                    .wrapping(iced::widget::text::Wrapping::Word)
+                    .width(Length::Fill),
+                text(format!(
+                    "Reconnecting automatically… ({connected}/{expected} streams restored)"
+                ))
+                .size(crate::style::text_size::BODY),
+                text("As soon as the connection is restored, missing trades and candles will be fetched and the charts will resume.")
+                    .wrapping(iced::widget::text::Wrapping::Word)
+                    .width(Length::Fill),
+            ]
+            .spacing(14)
+            .align_x(Alignment::Center)
+            .width(Length::Fill),
+        )
+        .width(Length::Fixed(480.0))
+        .padding(28)
+        .style(style::dashboard_modal)
         .into()
     }
 

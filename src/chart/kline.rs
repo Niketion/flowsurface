@@ -29,13 +29,25 @@ use iced::{Alignment, Color, Element, Point, Rectangle, Renderer, Size, Theme, V
 
 use chrono::{Datelike, TimeZone, Timelike};
 use enum_map::EnumMap;
-use rustc_hash::FxHashMap;
+use rustc_hash::{FxHashMap, FxHashSet};
 use std::time::Instant;
 
 /// Maximum number of raw trades to retain in memory.
 /// Older trades are pruned FIFO when this cap is exceeded.
 /// 50k trades ≈ 1.5-3 MB depending on Trade size.
 const MAX_RAW_TRADES: usize = 50_000;
+
+fn deduplicate_incoming_trades(existing: &[Trade], incoming: &[Trade]) -> Vec<Trade> {
+    let mut seen_ids = existing
+        .iter()
+        .filter_map(|trade| trade.id)
+        .collect::<FxHashSet<_>>();
+    incoming
+        .iter()
+        .copied()
+        .filter(|trade| trade.id.is_none_or(|id| seen_ids.insert(id)))
+        .collect()
+}
 
 impl Chart for KlineChart {
     type IndicatorKind = KlineIndicator;
@@ -210,6 +222,7 @@ impl KlineChart {
     ) -> Self {
         let visual_config = visual_config.unwrap_or_default();
         let kind = Self::sanitized_kind(kind.clone());
+        let raw_trades = deduplicate_incoming_trades(&[], &raw_trades);
 
         match basis {
             Basis::Time(interval) => {
@@ -371,7 +384,17 @@ impl KlineChart {
         match self.data_source {
             PlotData::TimeBased(ref mut timeseries) => {
                 let previous_latest_x = self.chart.latest_x;
+                let is_new_bucket = !timeseries.datapoints.contains_key(&kline.time);
                 timeseries.insert_klines(&[*kline]);
+                if is_new_bucket {
+                    let bucket_trades = self
+                        .raw_trades
+                        .iter()
+                        .filter(|trade| trade.time.floor_to(timeseries.interval) == kline.time)
+                        .copied()
+                        .collect::<Vec<_>>();
+                    timeseries.insert_trades_existing_buckets(&bucket_trades);
+                }
 
                 self.indicators
                     .values_mut()
@@ -519,11 +542,20 @@ impl KlineChart {
                         if let Some((fetch_from, fetch_to)) = timeseries
                             .suggest_trade_fetch_range(visible_earliest_ms, visible_latest_ms)
                         {
+                            // The chart intentionally renders whitespace after
+                            // the latest candle. It must never turn that visual
+                            // future into a historical market-data request.
+                            let fetch_to = fetch_to.min(UnixMs::now());
                             log::debug!(
                                 "CHART Footprint | action=suggest_missing range={}",
                                 fetcher::format_time_range(fetch_from, fetch_to)
                             );
-                            if let Some((fetch_from, fetch_to)) =
+                            if fetch_to <= fetch_from {
+                                log::debug!(
+                                    "CHART Footprint | action=skip reason=range_after_now range={}",
+                                    fetcher::format_time_range(fetch_from, fetch_to)
+                                );
+                            } else if let Some((fetch_from, fetch_to)) =
                                 self.subtract_covered_trade_ranges(fetch_from, fetch_to)
                             {
                                 log::info!(
@@ -589,7 +621,9 @@ impl KlineChart {
                             vwap_cfg.anchor.milliseconds(),
                         ));
                     }
-                    let requested_to = visible_latest_ms.max(kline_latest);
+                    let requested_to = visible_latest_ms
+                        .max(kline_latest)
+                        .min(UnixMs::now());
                     let requested_from = UnixMs::new(aligned_from).max(kline_earliest);
                     if requested_to > requested_from
                         && let Some((from, to)) =
@@ -650,6 +684,7 @@ impl KlineChart {
                         } else if let Some((fetch_from, fetch_to)) = timeseries
                             .suggest_trade_fetch_range(request_earliest, visible_latest_ms)
                         {
+                            let fetch_to = fetch_to.min(UnixMs::now());
                             let fetch_from = fetch_from.max(session_start);
                             if fetch_to > fetch_from {
                                 if let Some((fetch_from, fetch_to)) = self
@@ -1127,8 +1162,6 @@ impl KlineChart {
         }
 
         if let Some(FetchRange::Trades(from, to)) = fetch {
-            // Mark the unfilled tail as empty-covered so the chart does not
-            // immediately retry the same tiny gap.
             if let Some((tail_from, tail_to)) = empty_covered_tail {
                 log::info!(
                     "FETCH EmptyCovered | req={} range={}→{} reason=no_progress_near_target",
@@ -1142,8 +1175,7 @@ impl KlineChart {
                     tail_to,
                 );
             }
-            self.mark_trade_range_covered(from, to);
-            self.mark_trade_buckets_checked(from, to);
+            self.mark_verified_trade_fetch_prefix(from, to, empty_covered_tail);
         }
 
         self.fetching_trades = (false, None);
@@ -1176,8 +1208,33 @@ impl KlineChart {
                     tail_to,
                 );
             }
-            self.mark_trade_range_covered(from, to);
-            self.mark_trade_buckets_checked(from, to);
+            self.mark_verified_trade_fetch_prefix(from, to, empty_covered_tail);
+        }
+    }
+
+    /// Marks only the portion a trade worker actually traversed. An empty or
+    /// no-progress tail is a retryable gap, not completed order-flow history.
+    fn mark_verified_trade_fetch_prefix(
+        &mut self,
+        from: UnixMs,
+        to: UnixMs,
+        unfilled_tail: Option<(UnixMs, UnixMs)>,
+    ) {
+        let verified_to = unfilled_tail
+            .map(|(tail_from, _)| tail_from.saturating_sub(1).min(to))
+            .unwrap_or(to);
+
+        if verified_to > from {
+            self.mark_trade_range_covered(from, verified_to);
+            self.mark_trade_buckets_checked(from, verified_to);
+        } else {
+            log::warn!(
+                "DATA Trades CoverageSkipped | requested={} unfilled_tail={} reason=no_verified_prefix",
+                fetcher::format_time_range(from, to),
+                unfilled_tail
+                    .map(|(tail_from, tail_to)| fetcher::format_time_range(tail_from, tail_to))
+                    .unwrap_or_else(|| "-".to_string())
+            );
         }
     }
 
@@ -1196,7 +1253,9 @@ impl KlineChart {
             self.mark_trade_request_completed(id);
         }
         self.mark_bubble_summary_range_covered(from, to);
-        self.mark_trade_buckets_checked(from, to);
+        // A BubbleSummary contains derived price/volume candidates, not the
+        // raw executions needed by the footprint. Marking these candles as
+        // `trades_checked` would suppress the footprint's historical fetch.
     }
 
     fn mark_trade_buckets_checked(&mut self, from: UnixMs, to: UnixMs) {
@@ -1296,6 +1355,9 @@ impl KlineChart {
             &self.data_source,
             session_start,
             u64::MAX,
+            self.visual_config
+                .volume_bubbles
+                .use_raw_trades_when_available,
         ))
     }
 
@@ -1459,8 +1521,9 @@ impl KlineChart {
     }
 
     pub fn insert_trades(&mut self, buffer: &[Trade]) {
+        let buffer = deduplicate_incoming_trades(&self.raw_trades, buffer);
         let raw_before = self.raw_trades.len();
-        self.raw_trades.extend_from_slice(buffer);
+        self.raw_trades.extend_from_slice(&buffer);
 
         // Prune oldest trades if we exceed the retention cap.
         if self.raw_trades.len() > MAX_RAW_TRADES {
@@ -1489,7 +1552,7 @@ impl KlineChart {
         match self.data_source {
             PlotData::TickBased(ref mut tick_aggr) => {
                 let old_dp_len = tick_aggr.datapoints.len();
-                tick_aggr.insert_trades(buffer);
+                tick_aggr.insert_trades(&buffer);
 
                 if let Some(last_dp) = tick_aggr.datapoints.last() {
                     self.chart.last_price =
@@ -1501,17 +1564,19 @@ impl KlineChart {
                 self.indicators
                     .values_mut()
                     .filter_map(Option::as_mut)
-                    .for_each(|indi| indi.on_insert_trades(buffer, old_dp_len, &self.data_source));
+                    .for_each(|indi| {
+                        indi.on_insert_trades(&buffer, old_dp_len, &self.data_source)
+                    });
 
                 self.invalidate(None);
             }
             PlotData::TimeBased(ref mut timeseries) => {
-                timeseries.insert_trades_existing_buckets(buffer);
+                timeseries.insert_trades_existing_buckets(&buffer);
 
                 self.indicators
                     .values_mut()
                     .filter_map(Option::as_mut)
-                    .for_each(|indi| indi.on_insert_trades(buffer, 0, &self.data_source));
+                    .for_each(|indi| indi.on_insert_trades(&buffer, 0, &self.data_source));
 
                 self.invalidate(None);
             }
@@ -1519,13 +1584,16 @@ impl KlineChart {
     }
 
     pub fn insert_raw_trades(&mut self, raw_trades: Vec<Trade>, is_batches_done: bool) {
+        let received_size = raw_trades.len();
+        let raw_trades = deduplicate_incoming_trades(&self.raw_trades, &raw_trades);
         let batch_size = raw_trades.len();
+        let duplicate_count = received_size.saturating_sub(batch_size);
         let raw_before = self.raw_trades.len();
         let earliest = raw_trades.first().map(|t| t.time);
         let latest = raw_trades.last().map(|t| t.time);
 
         log::debug!(
-            "DATA Trades | fetched_batch={batch_size} raw_before={raw_before} raw_after={} first={} last={} is_batches_done={is_batches_done}",
+            "DATA Trades | received={received_size} deduplicated={duplicate_count} fetched_batch={batch_size} raw_before={raw_before} raw_after={} first={} last={} is_batches_done={is_batches_done}",
             raw_before + batch_size,
             fetcher::format_optional_time(earliest),
             fetcher::format_optional_time(latest)
@@ -1702,8 +1770,28 @@ impl KlineChart {
 
         match self.data_source {
             PlotData::TimeBased(ref mut timeseries) => {
+                let new_buckets = klines_raw
+                    .iter()
+                    .filter(|kline| !timeseries.datapoints.contains_key(&kline.time))
+                    .map(|kline| kline.time)
+                    .collect::<FxHashSet<_>>();
                 timeseries.insert_klines(klines_raw);
-                timeseries.insert_trades_existing_buckets(&self.raw_trades);
+                if !new_buckets.is_empty() {
+                    let trades_for_new_buckets = self
+                        .raw_trades
+                        .iter()
+                        .filter(|trade| {
+                            new_buckets.contains(&trade.time.floor_to(timeseries.interval))
+                        })
+                        .copied()
+                        .collect::<Vec<_>>();
+                    timeseries.insert_trades_existing_buckets(&trades_for_new_buckets);
+                    log::debug!(
+                        "DATA Klines TradeBackfill | new_buckets={} trades={} reason=new_kline_buckets_only",
+                        new_buckets.len(),
+                        trades_for_new_buckets.len()
+                    );
+                }
 
                 self.indicators
                     .values_mut()
@@ -2239,6 +2327,7 @@ impl canvas::Program<Message> for KlineChart {
                                 .map_or(earliest, |session_start| earliest.max(session_start)),
                             latest,
                             volume_bubbles.min_qty,
+                            volume_bubbles.use_raw_trades_when_available,
                         )
                     } else {
                         0.0
@@ -2863,7 +2952,11 @@ fn collect_volume_bubble_points(
     summary: &BubbleVolumeSummary,
     config: &VolumeBubbleConfig,
 ) -> Vec<VolumeBubblePoint> {
-    let mut points: Vec<_> = if !summary.is_empty() {
+    // When raw trades exist they are the same source used by the footprint.
+    // Prefer them over a cached/derived summary so a bubble can never reflect a
+    // stale or previously over-merged quantity for that candle.
+    let prefer_raw = config.use_raw_trades_when_available && !trades.trades.is_empty();
+    let mut points: Vec<_> = if !prefer_raw && !summary.is_empty() {
         summary
             .candidates
             .iter()
@@ -2999,8 +3092,9 @@ fn visible_max_bubble_qty(
     earliest: u64,
     latest: u64,
     min_qty: f64,
+    prefer_raw_trades: bool,
 ) -> f64 {
-    max_bubble_qty_in_range(data_source, earliest, latest)
+    max_bubble_qty_in_range(data_source, earliest, latest, prefer_raw_trades)
         .filter(|qty| *qty >= min_qty)
         .unwrap_or_default()
 }
@@ -3009,13 +3103,14 @@ fn max_bubble_qty_in_range(
     data_source: &PlotData<KlineDataPoint>,
     earliest: u64,
     latest: u64,
+    prefer_raw_trades: bool,
 ) -> Option<f64> {
     if latest < earliest {
         return None;
     }
 
     let max_from_sources = |trades: &KlineTrades, summary: &BubbleVolumeSummary| {
-        if !summary.is_empty() {
+        if !prefer_raw_trades && !summary.is_empty() {
             return summary
                 .candidates
                 .iter()
@@ -3024,12 +3119,22 @@ fn max_bubble_qty_in_range(
                 .max_by(f64::total_cmp);
         }
 
-        trades
+        let raw_max = trades
             .trades
             .values()
             .map(|group| group.total_qty().to_f64())
             .filter(|qty| *qty > 0.0)
-            .max_by(f64::total_cmp)
+            .max_by(f64::total_cmp);
+        if raw_max.is_some() || summary.is_empty() {
+            raw_max
+        } else {
+            summary
+                .candidates
+                .iter()
+                .map(|candidate| candidate.total_qty.to_f64())
+                .filter(|qty| *qty > 0.0)
+                .max_by(f64::total_cmp)
+        }
     };
 
     match data_source {

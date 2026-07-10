@@ -277,6 +277,7 @@ impl WsAdapter for TradeAdapter {
                     self.buffer.push(
                         ticker,
                         Trade {
+                            id: None,
                             time: de_trade.time.into(),
                             is_sell: de_trade.is_sell == "Sell",
                             price,
