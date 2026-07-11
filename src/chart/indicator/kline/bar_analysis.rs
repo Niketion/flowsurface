@@ -112,17 +112,89 @@ impl KlineIndicatorImpl for BarAnalysisIndicator {
         self.rebuild(source);
     }
 
-    fn on_insert_klines(&mut self, _klines: &[Kline], source: &PlotData<KlineDataPoint>) {
-        self.rebuild(source);
+    fn on_insert_klines(&mut self, klines: &[Kline], source: &PlotData<KlineDataPoint>) {
+        match source {
+            PlotData::TimeBased(timeseries) => {
+                if let Some(data) = self.data.time_mut() {
+                    for kline in klines {
+                        match timeseries.datapoints.get(&kline.time) {
+                            Some(dp) => match FootprintSummary::from_trades(&dp.footprint) {
+                                Some(summary) => {
+                                    data.insert(kline.time, summary);
+                                }
+                                None => {
+                                    data.remove(&kline.time);
+                                }
+                            },
+                            None => {
+                                data.remove(&kline.time);
+                            }
+                        }
+                    }
+                }
+            }
+            PlotData::TickBased(_) => {}
+        }
+        self.clear_all_caches();
     }
 
     fn on_insert_trades(
         &mut self,
-        _trades: &[Trade],
-        _old_dp_len: usize,
+        trades: &[Trade],
+        old_dp_len: usize,
         source: &PlotData<KlineDataPoint>,
     ) {
-        self.rebuild(source);
+        match source {
+            PlotData::TimeBased(timeseries) => {
+                let mut affected = Vec::new();
+                for trade in trades {
+                    let rounded = trade.time.floor_to(timeseries.interval);
+                    if !affected.contains(&rounded) {
+                        affected.push(rounded);
+                    }
+                }
+                if let Some(data) = self.data.time_mut() {
+                    for ts in affected {
+                        match timeseries.datapoints.get(&ts) {
+                            Some(dp) => match FootprintSummary::from_trades(&dp.footprint) {
+                                Some(summary) => {
+                                    data.insert(ts, summary);
+                                }
+                                None => {
+                                    data.remove(&ts);
+                                }
+                            },
+                            None => {
+                                data.remove(&ts);
+                            }
+                        }
+                    }
+                }
+            }
+            PlotData::TickBased(tick_aggr) => {
+                let new_len = tick_aggr.datapoints.len();
+                let start = old_dp_len.saturating_sub(1);
+                if let Some(data) = self.data.tick_mut() {
+                    // Remove entries for any indices that no longer exist
+                    // (safety measure - bars are only appended, never removed)
+                    data.retain(|&idx, _| idx < new_len as u64);
+                    // Recompute the last old bar (may have been modified) and any new bars
+                    for idx in start..new_len {
+                        if let Some(dp) = tick_aggr.datapoints.get(idx) {
+                            match FootprintSummary::from_trades(&dp.footprint) {
+                                Some(summary) => {
+                                    data.insert(idx as u64, summary);
+                                }
+                                None => {
+                                    data.remove(&(idx as u64));
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        self.clear_all_caches();
     }
 
     fn on_ticksize_change(&mut self, source: &PlotData<KlineDataPoint>) {
