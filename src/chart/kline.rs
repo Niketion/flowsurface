@@ -14,6 +14,7 @@ use data::chart::kline::{
 };
 use data::chart::{Autoscale, KlineChartKind, ViewConfig};
 
+use data::config::theme::{composite_color, contrast_ratio, mix_color};
 use data::util::abbr_large_numbers;
 use exchange::unit::{Price, PriceStep, Qty};
 use exchange::{Kline, OpenInterest as OIData, TickerInfo, Trade, UnixMs};
@@ -2087,37 +2088,6 @@ fn draw_table_imbalance_marker(
     frame.fill_rectangle(Point::new(x, cell.y), Size::new(bar_w, cell.height), color);
 }
 
-fn composite_color(foreground: Color, background: Color) -> Color {
-    let alpha = foreground.a.clamp(0.0, 1.0);
-    Color {
-        r: foreground.r.mul_add(alpha, background.r * (1.0 - alpha)),
-        g: foreground.g.mul_add(alpha, background.g * (1.0 - alpha)),
-        b: foreground.b.mul_add(alpha, background.b * (1.0 - alpha)),
-        a: 1.0,
-    }
-}
-
-fn contrast_ratio(a: Color, b: Color) -> f32 {
-    let l1 = relative_luminance(a);
-    let l2 = relative_luminance(b);
-    let lighter = l1.max(l2);
-    let darker = l1.min(l2);
-
-    (lighter + 0.05) / (darker + 0.05)
-}
-
-fn relative_luminance(color: Color) -> f32 {
-    let channel = |value: f32| {
-        if value <= 0.03928 {
-            value / 12.92
-        } else {
-            ((value + 0.055) / 1.055).powf(2.4)
-        }
-    };
-
-    (0.2126 * channel(color.r)) + (0.7152 * channel(color.g)) + (0.0722 * channel(color.b))
-}
-
 fn imbalance_background(palette: &Extended, side: ImbalanceSide, alpha: f32) -> Color {
     let accent = match side {
         ImbalanceSide::Buy => palette.success.strong.color,
@@ -2131,26 +2101,6 @@ fn imbalance_background(palette: &Extended, side: ImbalanceSide, alpha: f32) -> 
     } else {
         let tint = 0.18 + (alpha * 0.24);
         mix_color(accent, palette.background.weak.color, tint)
-    }
-}
-
-fn mix_color(foreground: Color, background: Color, foreground_weight: f32) -> Color {
-    let foreground_weight = foreground_weight.clamp(0.0, 1.0);
-    let background_weight = 1.0 - foreground_weight;
-
-    Color {
-        r: foreground
-            .r
-            .mul_add(foreground_weight, background.r * background_weight),
-        g: foreground
-            .g
-            .mul_add(foreground_weight, background.g * background_weight),
-        b: foreground
-            .b
-            .mul_add(foreground_weight, background.b * background_weight),
-        a: foreground
-            .a
-            .mul_add(foreground_weight, background.a * background_weight),
     }
 }
 
