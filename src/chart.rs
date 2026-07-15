@@ -283,17 +283,19 @@ pub fn update<T: Chart>(chart: &mut T, message: &Message) {
     match message {
         Message::DoubleClick(scale) => {
             let default_chart_width = T::default_cell_width(chart);
-            let autoscaled_coords = chart.autoscaled_coords();
             let supports_fit_autoscaling = chart.supports_fit_autoscaling();
-
-            let state = chart.mut_state();
 
             match scale {
                 AxisScaleClicked::X => {
-                    state.cell_width = default_chart_width;
-                    state.translation = autoscaled_coords;
+                    {
+                        let state = chart.mut_state();
+                        state.cell_width = default_chart_width;
+                    }
+                    let autoscaled_coords = chart.autoscaled_coords();
+                    chart.mut_state().translation = autoscaled_coords;
                 }
                 AxisScaleClicked::Y => {
+                    let state = chart.mut_state();
                     if supports_fit_autoscaling {
                         state.layout.autoscale = Some(Autoscale::FitToVisible);
                         state.scaling = 1.0;

@@ -18,6 +18,7 @@ use data::chart::kline::{
 };
 use data::chart::{Autoscale, KlineChartKind, ViewConfig};
 
+use data::config::theme::{composite_color, contrast_ratio, mix_color};
 use data::util::abbr_large_numbers;
 use exchange::unit::{Price, PriceStep, Qty};
 use exchange::{Kline, OpenInterest as OIData, TickerInfo, Trade, UnixMs};
@@ -2226,7 +2227,6 @@ impl canvas::Program<Message> for KlineChart {
                         cell_width_unscaled,
                         footprint_cluster_min_width(*clusters),
                     );
-
                     let cell_layout = FootprintCellLayout {
                         cell_w: chart.cell_width,
                         cell_h: chart.cell_height,
@@ -3615,12 +3615,6 @@ fn draw_clusters(
             let half_width = table_width / 2.0;
             let cell_border = 1.0;
             let grid_color = layout.pal.background.weakest.text.scale_alpha(0.32);
-            let max_table_qty = footprint.trades.values().fold(0.0_f64, |max_qty, group| {
-                max_qty
-                    .max(group.buy_qty.to_f64())
-                    .max(group.sell_qty.to_f64())
-            });
-
             for (price, group) in &footprint.trades {
                 let buy_qty = group.buy_qty.to_f64();
                 let sell_qty = group.sell_qty.to_f64();
@@ -3634,26 +3628,31 @@ fn draw_clusters(
                         layout.pal,
                         ImbalanceSide::Sell,
                         sell_qty,
-                        max_table_qty,
+                        max_cluster_qty,
                     ),
                 );
                 frame.fill_rectangle(
                     Point::new(area.table_left + half_width, row_top),
                     Size::new(half_width, layout.cell_h),
-                    volume_cell_background(layout.pal, ImbalanceSide::Buy, buy_qty, max_table_qty),
+                    volume_cell_background(
+                        layout.pal,
+                        ImbalanceSide::Buy,
+                        buy_qty,
+                        max_cluster_qty,
+                    ),
                 );
                 let sell_text_color = volume_cell_text_color(
                     layout.pal,
                     ImbalanceSide::Sell,
                     sell_qty,
-                    max_table_qty,
+                    max_cluster_qty,
                     text_color,
                 );
                 let buy_text_color = volume_cell_text_color(
                     layout.pal,
                     ImbalanceSide::Buy,
                     buy_qty,
-                    max_table_qty,
+                    max_cluster_qty,
                     text_color,
                 );
 
@@ -3673,7 +3672,7 @@ fn draw_clusters(
                             ImbalanceSide::Sell,
                             alpha,
                             sell_qty,
-                            max_table_qty,
+                            max_cluster_qty,
                             Rectangle::new(
                                 Point::new(area.table_left, row_top),
                                 Size::new(half_width, layout.cell_h),
@@ -3696,7 +3695,7 @@ fn draw_clusters(
                             ImbalanceSide::Buy,
                             alpha,
                             buy_qty,
-                            max_table_qty,
+                            max_cluster_qty,
                             Rectangle::new(
                                 Point::new(area.table_left + half_width, row_top),
                                 Size::new(half_width, layout.cell_h),
@@ -3993,15 +3992,14 @@ fn volume_cell_background(
     qty: f64,
     max_qty: f64,
 ) -> Color {
-    const MIN_ALPHA: f32 = 0.10;
-    const MAX_ALPHA: f32 = 0.64;
+    const MIN_ALPHA: f32 = 0.04;
 
     let intensity = if max_qty > 0.0 {
         (qty / max_qty).clamp(0.0, 1.0) as f32
     } else {
         0.0
     };
-    let alpha = MIN_ALPHA + intensity * (MAX_ALPHA - MIN_ALPHA);
+    let alpha = MIN_ALPHA + intensity * (1.0 - MIN_ALPHA);
 
     match side {
         ImbalanceSide::Buy => palette.success.base.color.scale_alpha(alpha),
@@ -4085,37 +4083,6 @@ fn draw_table_imbalance_marker(
     frame.fill(&builder.build(), color);
 }
 
-fn composite_color(foreground: Color, background: Color) -> Color {
-    let alpha = foreground.a.clamp(0.0, 1.0);
-    Color {
-        r: foreground.r.mul_add(alpha, background.r * (1.0 - alpha)),
-        g: foreground.g.mul_add(alpha, background.g * (1.0 - alpha)),
-        b: foreground.b.mul_add(alpha, background.b * (1.0 - alpha)),
-        a: 1.0,
-    }
-}
-
-fn contrast_ratio(a: Color, b: Color) -> f32 {
-    let l1 = relative_luminance(a);
-    let l2 = relative_luminance(b);
-    let lighter = l1.max(l2);
-    let darker = l1.min(l2);
-
-    (lighter + 0.05) / (darker + 0.05)
-}
-
-fn relative_luminance(color: Color) -> f32 {
-    let channel = |value: f32| {
-        if value <= 0.03928 {
-            value / 12.92
-        } else {
-            ((value + 0.055) / 1.055).powf(2.4)
-        }
-    };
-
-    (0.2126 * channel(color.r)) + (0.7152 * channel(color.g)) + (0.0722 * channel(color.b))
-}
-
 fn imbalance_background(palette: &Extended, side: ImbalanceSide, alpha: f32) -> Color {
     let accent = match side {
         ImbalanceSide::Buy => palette.success.strong.color,
@@ -4129,26 +4096,6 @@ fn imbalance_background(palette: &Extended, side: ImbalanceSide, alpha: f32) -> 
     } else {
         let tint = 0.18 + (alpha * 0.24);
         mix_color(accent, palette.background.weak.color, tint)
-    }
-}
-
-fn mix_color(foreground: Color, background: Color, foreground_weight: f32) -> Color {
-    let foreground_weight = foreground_weight.clamp(0.0, 1.0);
-    let background_weight = 1.0 - foreground_weight;
-
-    Color {
-        r: foreground
-            .r
-            .mul_add(foreground_weight, background.r * background_weight),
-        g: foreground
-            .g
-            .mul_add(foreground_weight, background.g * background_weight),
-        b: foreground
-            .b
-            .mul_add(foreground_weight, background.b * background_weight),
-        a: foreground
-            .a
-            .mul_add(foreground_weight, background.a * background_weight),
     }
 }
 
