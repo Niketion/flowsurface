@@ -442,6 +442,31 @@ impl MarketDataCache {
         self.store_records(CacheKind::BubbleSummary, &key, from, to_exclusive, records);
     }
 
+    /// Removes every persisted market-data record while keeping the database
+    /// open and its schema metadata intact.
+    pub fn clear_all(&self) -> Result<(), String> {
+        let write = self.db.begin_write().map_err(|error| error.to_string())?;
+
+        for definition in [
+            COVERAGE_TABLE,
+            KLINE_TABLE,
+            TRADE_TABLE,
+            OI_TABLE,
+            BUBBLE_TABLE,
+        ] {
+            let mut table = write
+                .open_table(definition)
+                .map_err(|error| error.to_string())?;
+            table
+                .retain(|_, _| false)
+                .map_err(|error| error.to_string())?;
+        }
+
+        write.commit().map_err(|error| error.to_string())?;
+        log::warn!("CACHE Cleared | path={}", self.path.display());
+        Ok(())
+    }
+
     fn read_records<T: CacheRecord>(
         &self,
         kind: CacheKind,
@@ -1174,5 +1199,42 @@ mod tests {
         let last = encoded.len() - 1;
         encoded[last] ^= 0xff;
         assert!(decode_checked::<StoredCoverage>(&encoded).is_err());
+    }
+
+    #[test]
+    fn clear_all_removes_data_and_coverage_but_keeps_database_usable() {
+        let path = std::env::temp_dir().join(format!(
+            "flowsurface-cache-clear-{}-{}.redb",
+            std::process::id(),
+            uuid::Uuid::new_v4()
+        ));
+        let db = open_initialized_database(&path).unwrap();
+        let cache = MarketDataCache {
+            db,
+            path: path.clone(),
+        };
+
+        let write = cache.db.begin_write().unwrap();
+        {
+            let mut data = write.open_table(KLINE_TABLE).unwrap();
+            data.insert("test-bucket", b"cached".as_slice()).unwrap();
+            let mut coverage = write.open_table(COVERAGE_TABLE).unwrap();
+            coverage
+                .insert("test-dataset", b"covered".as_slice())
+                .unwrap();
+        }
+        write.commit().unwrap();
+
+        cache.clear_all().unwrap();
+        assert!(cache.read_value(KLINE_TABLE, "test-bucket").unwrap().is_none());
+        assert!(
+            cache
+                .read_value(COVERAGE_TABLE, "test-dataset")
+                .unwrap()
+                .is_none()
+        );
+
+        drop(cache);
+        std::fs::remove_file(path).unwrap();
     }
 }

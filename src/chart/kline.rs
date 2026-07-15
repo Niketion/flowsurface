@@ -628,13 +628,14 @@ impl KlineChart {
                     let requested_from = UnixMs::new(aligned_from).max(kline_earliest);
                     if requested_to > requested_from
                         && let Some((from, to)) =
-                            self.subtract_covered_trade_ranges(requested_from, requested_to)
+                            self.latest_uncovered_trade_range(requested_from, requested_to)
                     {
                         // One hour per worker keeps exchange pagination and the
-                        // UI responsive. Subsequent ticks continue the session.
-                        let chunk_to =
-                            UnixMs::new(to.as_u64().min(from.as_u64().saturating_add(60 * 60_000)));
-                        let range = FetchRange::Trades(from, chunk_to);
+                        // UI responsive. Start from the newest data and move
+                        // backwards toward the session boundary.
+                        let chunk_from =
+                            UnixMs::new(from.as_u64().max(to.as_u64().saturating_sub(60 * 60_000)));
+                        let range = FetchRange::Trades(chunk_from, to);
                         log::info!(
                             "OVERLAY Fetch | svp={} vwap={} range={}",
                             svp_enabled,
@@ -688,8 +689,8 @@ impl KlineChart {
                             let fetch_to = fetch_to.min(UnixMs::now());
                             let fetch_from = fetch_from.max(session_start);
                             if fetch_to > fetch_from {
-                                if let Some((fetch_from, fetch_to)) = self
-                                    .subtract_covered_bubble_summary_ranges(fetch_from, fetch_to)
+                                if let Some((fetch_from, fetch_to)) =
+                                    self.latest_uncovered_bubble_summary_range(fetch_from, fetch_to)
                                 {
                                     if self
                                         .visual_config
@@ -952,6 +953,33 @@ impl KlineChart {
         self.bubble_auto_fetch_at = None;
     }
 
+    /// Drops all derived historical market data so it is rebuilt from a fresh
+    /// persistent-cache/network pass on the next chart tick.
+    pub fn invalidate_market_data_cache(&mut self) {
+        self.request_handler = RequestHandler::default();
+        log::warn!("CHART Reset | reason=cache_invalidated request_history=discarded");
+        self.raw_trades.clear();
+
+        match &mut self.data_source {
+            PlotData::TimeBased(timeseries) => {
+                for data_point in timeseries.datapoints.values_mut() {
+                    data_point.clear_trades();
+                    data_point.bubble_summary = BubbleVolumeSummary::default();
+                    data_point.trades_checked = false;
+                }
+                timeseries.update_poc_status();
+            }
+            PlotData::TickBased(_) => {}
+        }
+
+        for indicator in self.indicators.values_mut().filter_map(Option::as_mut) {
+            indicator.rebuild_from_source(&self.data_source);
+            indicator.clear_all_caches();
+        }
+        self.chart.cache.clear_all();
+        self.last_tick = Instant::now() - std::time::Duration::from_secs(1);
+    }
+
     /// Check if a fetch result should be applied or discarded as stale.
     pub fn is_fetch_stale(&self, req_id: uuid::Uuid) -> bool {
         self.request_handler.is_stale_generation(req_id)
@@ -1136,6 +1164,23 @@ impl KlineChart {
             from,
             to,
             "BUBBLE Summary",
+        )
+    }
+
+    fn latest_uncovered_trade_range(&self, from: UnixMs, to: UnixMs) -> Option<(UnixMs, UnixMs)> {
+        subtract_covered_ranges_latest(&self.covered_trade_ranges, from, to, "DATA Trades Latest")
+    }
+
+    fn latest_uncovered_bubble_summary_range(
+        &self,
+        from: UnixMs,
+        to: UnixMs,
+    ) -> Option<(UnixMs, UnixMs)> {
+        subtract_covered_ranges_latest(
+            &self.covered_bubble_summary_ranges,
+            from,
+            to,
+            "BUBBLE Summary Latest",
         )
     }
 
@@ -2125,6 +2170,57 @@ fn subtract_covered_ranges(
         fetcher::format_time_range(result.0, result.1)
     );
     Some(result)
+}
+
+/// Returns the newest uncovered sub-range inside `[from, to)`. Covered ranges
+/// are expected to be sorted and merged, as maintained by `KlineChart`.
+fn subtract_covered_ranges_latest(
+    covered_ranges: &[(UnixMs, UnixMs)],
+    from: UnixMs,
+    to: UnixMs,
+    log_prefix: &str,
+) -> Option<(UnixMs, UnixMs)> {
+    if to <= from {
+        log::debug!(
+            "{log_prefix} SubtractCovered | input_range={} covered={} returned=- reason=invalid_range",
+            fetcher::format_time_range(from, to),
+            format_trade_ranges(covered_ranges)
+        );
+        return None;
+    }
+
+    let mut cursor = to;
+    for (covered_from, covered_to) in covered_ranges.iter().rev() {
+        if *covered_from >= cursor {
+            continue;
+        }
+
+        if *covered_to < cursor {
+            let result = ((*covered_to).max(from), cursor);
+            if result.0 < result.1 {
+                log::debug!(
+                    "{log_prefix} SubtractCovered | input_range={} covered={} returned={} reason=latest_gap",
+                    fetcher::format_time_range(from, to),
+                    format_trade_ranges(covered_ranges),
+                    fetcher::format_time_range(result.0, result.1)
+                );
+                return Some(result);
+            }
+        }
+
+        cursor = cursor.min(*covered_from);
+        if cursor <= from {
+            log::debug!(
+                "{log_prefix} SubtractCovered | input_range={} covered={} returned=- reason=fully_covered",
+                fetcher::format_time_range(from, to),
+                format_trade_ranges(covered_ranges)
+            );
+            return None;
+        }
+    }
+
+    let result = (from, cursor);
+    (result.0 < result.1).then_some(result)
 }
 
 impl KlineChart {
@@ -4548,4 +4644,48 @@ fn footprint_summary_padding(
 #[inline]
 fn should_show_text(cell_height_unscaled: f32, cell_width_unscaled: f32, min_w: f32) -> bool {
     cell_height_unscaled > 8.0 && cell_width_unscaled > min_w
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn latest_uncovered_range_starts_from_the_newest_gap() {
+        let covered = [
+            (UnixMs::new(120), UnixMs::new(140)),
+            (UnixMs::new(160), UnixMs::new(180)),
+        ];
+
+        assert_eq!(
+            subtract_covered_ranges_latest(&covered, UnixMs::new(100), UnixMs::new(200), "TEST",),
+            Some((UnixMs::new(180), UnixMs::new(200)))
+        );
+    }
+
+    #[test]
+    fn latest_uncovered_range_moves_back_after_the_tail_is_covered() {
+        let covered = [
+            (UnixMs::new(120), UnixMs::new(140)),
+            (UnixMs::new(160), UnixMs::new(200)),
+        ];
+
+        assert_eq!(
+            subtract_covered_ranges_latest(&covered, UnixMs::new(100), UnixMs::new(200), "TEST",),
+            Some((UnixMs::new(140), UnixMs::new(160)))
+        );
+    }
+
+    #[test]
+    fn latest_uncovered_range_returns_none_when_fully_covered() {
+        assert_eq!(
+            subtract_covered_ranges_latest(
+                &[(UnixMs::new(90), UnixMs::new(210))],
+                UnixMs::new(100),
+                UnixMs::new(200),
+                "TEST",
+            ),
+            None
+        );
+    }
 }

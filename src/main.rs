@@ -166,6 +166,7 @@ enum Message {
     ScaleFactorChanged(data::ScaleFactor),
     SetTimezone(data::UserTimezone),
     ToggleTradeFetch(bool),
+    InvalidateMarketDataCache,
     ToggleDebugTerminal(bool),
     DebugTerminalOpened(window::Id),
     DebugTerminalRefresh,
@@ -1182,6 +1183,33 @@ impl Flowsurface {
 
                 if checked {
                     self.confirm_dialog = None;
+                }
+            }
+            Message::InvalidateMarketDataCache => {
+                self.confirm_dialog = None;
+
+                let result = connector::persistent_cache::market_cache()
+                    .ok_or_else(|| "Market-data cache is unavailable".to_string())
+                    .and_then(|cache| cache.clear_all());
+
+                match result {
+                    Ok(()) => {
+                        self.layout_manager
+                            .iter_dashboards_mut()
+                            .for_each(|dashboard| {
+                                dashboard.invalidate_market_data_cache(&self.main_window);
+                            });
+                        self.notifications.push(Toast::info(
+                            "Market-data cache cleared. Charts are rebuilding from newest to oldest."
+                                .to_string(),
+                        ));
+                    }
+                    Err(error) => {
+                        log::error!("CACHE Clear Error | error={error}");
+                        self.notifications.push(Toast::error(format!(
+                            "Could not clear market-data cache: {error}"
+                        )));
+                    }
                 }
             }
             Message::ToggleDebugTerminal(enabled) => {
@@ -2208,6 +2236,27 @@ impl Flowsurface {
                         )
                     };
 
+                    let invalidate_market_data_cache = {
+                        let clear_button = button(text("Invalidate market-data cache")).on_press(
+                            Message::ToggleDialogModal(Some(
+                                screen::ConfirmDialog::new(
+                                    "This deletes all cached market data and restarts indicator analysis. Continue?"
+                                        .to_string(),
+                                    Box::new(Message::InvalidateMarketDataCache),
+                                )
+                                .with_confirm_btn_text("Invalidate cache".to_string()),
+                            )),
+                        );
+
+                        tooltip(
+                            clear_button,
+                            Some(
+                                "Delete cached klines, trades, open interest and bubble summaries, then fetch them again",
+                            ),
+                            TooltipPosition::Top,
+                        )
+                    };
+
                     let version_info = {
                         let (version_label, commit_label) = version::app_build_version_parts();
 
@@ -2264,7 +2313,11 @@ impl Flowsurface {
                         column![open_data_folder,].spacing(8),
                         column![text("Sidebar position").size(crate::style::text_size::SECTION), sidebar_pos_picklist,].spacing(12),
                         column![text("Time zone").size(crate::style::text_size::SECTION), timezone_picklist,].spacing(12),
-                        column![text("Market data").size(crate::style::text_size::SECTION), size_in_quote_currency_checkbox,].spacing(12),
+                        column![
+                            text("Market data").size(crate::style::text_size::SECTION),
+                            size_in_quote_currency_checkbox,
+                            invalidate_market_data_cache,
+                        ].spacing(12),
                         column![text("Theme").size(crate::style::text_size::SECTION), theme_picklist,].spacing(12),
                         column![text("Interface scale").size(crate::style::text_size::SECTION), scale_factor,].spacing(12),
                         column![

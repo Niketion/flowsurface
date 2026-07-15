@@ -1037,6 +1037,24 @@ impl Dashboard {
             });
     }
 
+    pub fn invalidate_market_data_cache(&mut self, main_window: &Window) {
+        // Dropping the handles aborts old backfill workers so they cannot
+        // repopulate the cache immediately after it has been cleared.
+        self.backfill_handles.clear();
+        self.pending_backfills.clear();
+
+        self.iter_all_panes_mut(main_window.id)
+            .for_each(|(_, _, state)| {
+                if let pane::Content::Kline {
+                    chart: Some(chart), ..
+                } = &mut state.content
+                {
+                    chart.invalidate_market_data_cache();
+                    state.status = pane::Status::Ready;
+                }
+            });
+    }
+
     pub fn distribute_fetched_data(
         &mut self,
         main_window: window::Id,
