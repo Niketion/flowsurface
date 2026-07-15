@@ -910,15 +910,13 @@ pub fn kline_cfg_view<'a>(
                 ; spacing = 12, align_x = Alignment::Start
             ];
 
-            if *clusters != data::chart::kline::ClusterKind::Table {
-                content = content.push(
-                    column![
-                        text("Cluster scaling").size(crate::style::text_size::SECTION),
-                        scaling
-                    ]
-                    .spacing(8),
-                );
-            }
+            content = content.push(
+                column![
+                    text("Cluster scaling").size(crate::style::text_size::SECTION),
+                    scaling
+                ]
+                .spacing(8),
+            );
 
             content = content
                 .push(

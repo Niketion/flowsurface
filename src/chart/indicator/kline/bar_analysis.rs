@@ -112,17 +112,89 @@ impl KlineIndicatorImpl for BarAnalysisIndicator {
         self.rebuild(source);
     }
 
-    fn on_insert_klines(&mut self, _klines: &[Kline], source: &PlotData<KlineDataPoint>) {
-        self.rebuild(source);
+    fn on_insert_klines(&mut self, klines: &[Kline], source: &PlotData<KlineDataPoint>) {
+        match source {
+            PlotData::TimeBased(timeseries) => {
+                if let Some(data) = self.data.time_mut() {
+                    for kline in klines {
+                        match timeseries.datapoints.get(&kline.time) {
+                            Some(dp) => match FootprintSummary::from_trades(&dp.footprint) {
+                                Some(summary) => {
+                                    data.insert(kline.time, summary);
+                                }
+                                None => {
+                                    data.remove(&kline.time);
+                                }
+                            },
+                            None => {
+                                data.remove(&kline.time);
+                            }
+                        }
+                    }
+                }
+            }
+            PlotData::TickBased(_) => {}
+        }
+        self.clear_all_caches();
     }
 
     fn on_insert_trades(
         &mut self,
-        _trades: &[Trade],
-        _old_dp_len: usize,
+        trades: &[Trade],
+        old_dp_len: usize,
         source: &PlotData<KlineDataPoint>,
     ) {
-        self.rebuild(source);
+        match source {
+            PlotData::TimeBased(timeseries) => {
+                let mut affected = Vec::new();
+                for trade in trades {
+                    let rounded = trade.time.floor_to(timeseries.interval);
+                    if !affected.contains(&rounded) {
+                        affected.push(rounded);
+                    }
+                }
+                if let Some(data) = self.data.time_mut() {
+                    for ts in affected {
+                        match timeseries.datapoints.get(&ts) {
+                            Some(dp) => match FootprintSummary::from_trades(&dp.footprint) {
+                                Some(summary) => {
+                                    data.insert(ts, summary);
+                                }
+                                None => {
+                                    data.remove(&ts);
+                                }
+                            },
+                            None => {
+                                data.remove(&ts);
+                            }
+                        }
+                    }
+                }
+            }
+            PlotData::TickBased(tick_aggr) => {
+                let new_len = tick_aggr.datapoints.len();
+                let start = old_dp_len.saturating_sub(1);
+                if let Some(data) = self.data.tick_mut() {
+                    // Remove entries for any indices that no longer exist
+                    // (safety measure - bars are only appended, never removed)
+                    data.retain(|&idx, _| idx < new_len as u64);
+                    // Recompute the last old bar (may have been modified) and any new bars
+                    for idx in start..new_len {
+                        if let Some(dp) = tick_aggr.datapoints.get(idx) {
+                            match FootprintSummary::from_trades(&dp.footprint) {
+                                Some(summary) => {
+                                    data.insert(idx as u64, summary);
+                                }
+                                None => {
+                                    data.remove(&(idx as u64));
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        self.clear_all_caches();
     }
 
     fn on_ticksize_change(&mut self, source: &PlotData<KlineDataPoint>) {
@@ -190,17 +262,9 @@ impl canvas::Program<Message> for BarAnalysisCanvas<'_> {
                 return;
             }
 
-            let center = Vector::new(bounds.width / 2.0, bounds.height / 2.0);
-            frame.translate(center);
-            frame.scale(ctx.scaling);
-            frame.translate(Vector::new(
-                ctx.translation.x,
-                (-bounds.height / ctx.scaling) / 2.0,
-            ));
-
-            let pane_height = frame.height() / ctx.scaling;
-            let table_top = 3.0;
-            let table_height = (pane_height - 6.0).max(24.0);
+            let pane_height = bounds.height / ctx.scaling;
+            let table_top = 0.0;
+            let table_height = pane_height.max(24.0);
             let rows_count = {
                 let mut count: f32 = 0.0;
                 if self.settings.show_buy_sell {
@@ -219,90 +283,159 @@ impl canvas::Program<Message> for BarAnalysisCanvas<'_> {
             };
             let row_height = table_height / rows_count;
             let column_width = ctx.cell_width;
-            let text_size = (row_height * 0.42).clamp(5.0, TEXT_SIZE * 0.75);
-            let border_color = palette.background.weakest.text.scale_alpha(0.25);
+            let text_size = (row_height * 0.5).clamp(5.0, TEXT_SIZE);
+            let border_color = palette.background.strong.color;
+
+            let mut header_labels: Vec<&str> = Vec::with_capacity(5);
+            if self.settings.show_buy_sell {
+                header_labels.push("Buy");
+                header_labels.push("Sell");
+            }
+            if self.settings.show_volume {
+                header_labels.push("Total");
+            }
+            if self.settings.show_delta {
+                header_labels.push("Δ");
+            }
+            if self.settings.show_delta_pct {
+                header_labels.push("Δ%");
+            }
+
+            let max_label_chars = header_labels
+                .iter()
+                .map(|s| s.chars().count())
+                .max()
+                .unwrap_or(3);
+            let header_width = text_size * max_label_chars as f32 * 0.72 + 12.0;
+            let screen_text_size = text_size * ctx.scaling;
+            let screen_row_height = row_height * ctx.scaling;
+            let screen_table_top = table_top * ctx.scaling;
+            let screen_header_width = header_width * ctx.scaling;
+            let header_x = bounds.width - screen_header_width;
+
+            // Header row labels and separators
+            for (idx, label) in header_labels.iter().enumerate() {
+                let row_y = screen_table_top + screen_row_height * idx as f32;
+                if idx > 0 {
+                    frame.fill_rectangle(
+                        Point::new(header_x, row_y),
+                        Size::new(screen_header_width, 1.0),
+                        border_color,
+                    );
+                }
+                draw_text(
+                    frame,
+                    label,
+                    Point::new(
+                        header_x + screen_header_width / 2.0,
+                        row_y + screen_row_height / 2.0,
+                    ),
+                    screen_text_size,
+                    palette.background.weakest.text,
+                );
+            }
+
+            // Header vertical border
+            frame.fill_rectangle(
+                Point::new(header_x, screen_table_top),
+                Size::new(1.0, screen_row_height * rows_count),
+                border_color,
+            );
+
+            let header_left_chart =
+                (header_x - bounds.width / 2.0) / ctx.scaling - ctx.translation.x;
             let view_left = -ctx.translation.x - bounds.width / ctx.scaling;
-            let view_right = -ctx.translation.x + bounds.width / ctx.scaling;
+            let view_right =
+                (-ctx.translation.x + bounds.width / ctx.scaling).min(header_left_chart);
 
-            self.series
-                .for_each_in(self.visible_range.clone(), |x, row| {
-                    let column_left = ctx.interval_to_x(x) - column_width / 2.0;
+            let clip_region = Rectangle::new(
+                Point::new(0.0, screen_table_top),
+                Size::new(
+                    bounds.width - screen_header_width,
+                    screen_row_height * rows_count,
+                ),
+            );
+            frame.with_clip(clip_region, |frame| {
+                let center = Vector::new(bounds.width / 2.0, bounds.height / 2.0);
+                frame.translate(center);
+                frame.scale(ctx.scaling);
+                frame.translate(Vector::new(
+                    ctx.translation.x,
+                    (-bounds.height / ctx.scaling) / 2.0,
+                ));
 
-                    if column_left > view_right || column_left + column_width < view_left {
-                        return;
-                    }
+                self.series
+                    .for_each_in(self.visible_range.clone(), |x, row| {
+                        let column_left = ctx.interval_to_x(x) - column_width / 2.0;
 
-                    frame.fill_rectangle(
-                        Point::new(column_left, table_top),
-                        Size::new(column_width, table_height),
-                        palette.background.weakest.color.scale_alpha(0.22),
-                    );
+                        if column_left > view_right || column_left + column_width < view_left {
+                            return;
+                        }
 
-                    let delta_color = if row.delta.to_f64() >= 0.0 {
-                        palette.success.base.color
-                    } else {
-                        palette.danger.base.color
-                    };
-
-                    let mut rows = Vec::with_capacity(5);
-                    if self.settings.show_buy_sell {
-                        rows.push((
-                            format!("Ask {}", abbr_large_numbers(row.sell.to_f64())),
-                            palette.danger.base.color,
-                        ));
-                        rows.push((
-                            format!("Bid {}", abbr_large_numbers(row.buy.to_f64())),
-                            palette.success.base.color,
-                        ));
-                    }
-                    if self.settings.show_volume {
-                        rows.push((
-                            format!("Vol {}", abbr_large_numbers(row.total.to_f64())),
-                            palette.background.weakest.text,
-                        ));
-                    }
-                    if self.settings.show_delta {
-                        rows.push((
-                            format!("Δ {}", abbr_large_numbers(row.delta.to_f64())),
-                            delta_color,
-                        ));
-                    }
-                    if self.settings.show_delta_pct {
-                        rows.push((format!("Δ% {:+.1}%", row.delta_pct), delta_color));
-                    }
-
-                    for (idx, (label, color)) in rows.iter().enumerate() {
-                        let row_y = table_top + row_height * idx as f32;
                         frame.fill_rectangle(
-                            Point::new(column_left, row_y),
-                            Size::new(column_width, 1.0),
-                            border_color,
+                            Point::new(column_left, table_top),
+                            Size::new(column_width, table_height),
+                            palette.background.weakest.color.scale_alpha(0.22),
                         );
-                        draw_text(
-                            frame,
-                            label,
-                            Point::new(column_left + column_width / 2.0, row_y + row_height / 2.0),
-                            text_size,
-                            *color,
-                        );
-                    }
 
-                    frame.fill_rectangle(
-                        Point::new(column_left, table_top + table_height - 1.0),
-                        Size::new(column_width, 1.0),
-                        border_color,
-                    );
-                    frame.fill_rectangle(
-                        Point::new(column_left, table_top),
-                        Size::new(1.0, table_height),
-                        border_color,
-                    );
-                    frame.fill_rectangle(
-                        Point::new(column_left + column_width - 1.0, table_top),
-                        Size::new(1.0, table_height),
-                        border_color,
-                    );
-                });
+                        let delta_color = if row.delta.to_f64() >= 0.0 {
+                            palette.success.base.color
+                        } else {
+                            palette.danger.base.color
+                        };
+
+                        let mut rows: Vec<(String, Color)> = Vec::with_capacity(5);
+                        if self.settings.show_buy_sell {
+                            rows.push((
+                                abbr_large_numbers(row.buy.to_f64()),
+                                palette.success.base.color,
+                            ));
+                            rows.push((
+                                abbr_large_numbers(row.sell.to_f64()),
+                                palette.danger.base.color,
+                            ));
+                        }
+                        if self.settings.show_volume {
+                            rows.push((
+                                abbr_large_numbers(row.total.to_f64()),
+                                palette.background.weakest.text,
+                            ));
+                        }
+                        if self.settings.show_delta {
+                            rows.push((abbr_large_numbers(row.delta.to_f64()), delta_color));
+                        }
+                        if self.settings.show_delta_pct {
+                            rows.push((format!("{:+.1}%", row.delta_pct), delta_color));
+                        }
+
+                        for (idx, (label, color)) in rows.iter().enumerate() {
+                            let row_y = table_top + row_height * idx as f32;
+                            if idx > 0 {
+                                frame.fill_rectangle(
+                                    Point::new(column_left, row_y),
+                                    Size::new(column_width, 1.0),
+                                    border_color,
+                                );
+                            }
+                            draw_text(
+                                frame,
+                                label,
+                                Point::new(
+                                    column_left + column_width / 2.0,
+                                    row_y + row_height / 2.0,
+                                ),
+                                text_size,
+                                *color,
+                            );
+                        }
+
+                        frame.fill_rectangle(
+                            Point::new(column_left, table_top),
+                            Size::new(1.0, table_height),
+                            border_color.scale_alpha(0.4),
+                        );
+                    });
+            });
         });
 
         vec![geometry]
