@@ -1,7 +1,7 @@
 use std::fmt::{self, Debug, Display};
 
 use enum_map::Enum;
-use exchange::adapter::MarketKind;
+use exchange::adapter::{Exchange, MarketKind};
 use serde::{Deserialize, Serialize};
 
 pub trait Indicator: PartialEq + Display + 'static {
@@ -74,11 +74,15 @@ impl KlineIndicator {
         self.placement() == IndicatorPlacement::Overlay
     }
 
-    pub fn requires_trades(self) -> bool {
+    pub fn requires_trades(self, exchange: Exchange) -> bool {
         matches!(
             self,
             Self::VolumeBubbles | Self::SessionVolumeProfile | Self::Vwap
-        )
+        ) || (self == Self::CumulativeDelta
+            && !matches!(
+                exchange,
+                Exchange::BinanceLinear | Exchange::BinanceInverse | Exchange::BinanceSpot
+            ))
     }
 }
 

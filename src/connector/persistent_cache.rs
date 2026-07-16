@@ -374,10 +374,7 @@ impl MarketDataCache {
         from: UnixMs,
         to_exclusive: UnixMs,
     ) -> CacheSlice<OpenInterest> {
-        let key = dataset_key(
-            ticker_info,
-            &format!("open_interest|timeframe_ms={}", timeframe.to_milliseconds()),
-        );
+        let key = open_interest_dataset_key(ticker_info, timeframe);
         self.read_records(CacheKind::OpenInterest, &key, from, to_exclusive, from)
     }
 
@@ -389,10 +386,7 @@ impl MarketDataCache {
         to_exclusive: UnixMs,
         records: &[OpenInterest],
     ) {
-        let key = dataset_key(
-            ticker_info,
-            &format!("open_interest|timeframe_ms={}", timeframe.to_milliseconds()),
-        );
+        let key = open_interest_dataset_key(ticker_info, timeframe);
         self.store_records(CacheKind::OpenInterest, &key, from, to_exclusive, records);
     }
 
@@ -919,6 +913,13 @@ fn dataset_key(ticker_info: TickerInfo, suffix: &str) -> String {
     )
 }
 
+fn open_interest_dataset_key(ticker_info: TickerInfo, timeframe: Timeframe) -> String {
+    dataset_key(
+        ticker_info,
+        &format!("open_interest|timeframe_ms={}", timeframe.to_milliseconds()),
+    )
+}
+
 fn bubble_dataset_key(
     ticker_info: TickerInfo,
     timeframe_ms: u64,
@@ -1121,9 +1122,12 @@ pub fn merge_bubble_summaries(
                         candidate.first_time,
                         candidate.last_time,
                     ) {
-                        (Some(existing_first), Some(existing_last), Some(new_first), Some(new_last)) => {
-                            existing_last < new_first || new_last < existing_first
-                        }
+                        (
+                            Some(existing_first),
+                            Some(existing_last),
+                            Some(new_first),
+                            Some(new_last),
+                        ) => existing_last < new_first || new_last < existing_first,
                         _ => false,
                     };
 
@@ -1178,6 +1182,44 @@ pub fn merge_bubble_summaries(
 mod tests {
     use super::*;
 
+    fn bubble_candidate(
+        qty: f64,
+        first_time: u64,
+        last_time: u64,
+        trade_count: usize,
+    ) -> BubbleCandidate {
+        let qty = exchange::unit::Qty::from_f64(qty);
+        BubbleCandidate {
+            candle_time: UnixMs::new(60_000),
+            price: exchange::unit::Price::from_f64(100.0),
+            total_qty: qty,
+            buy_qty: qty,
+            sell_qty: exchange::unit::Qty::ZERO,
+            delta_qty: qty,
+            trade_count,
+            score: qty.to_f64(),
+            first_time: Some(UnixMs::new(first_time)),
+            last_time: Some(UnixMs::new(last_time)),
+        }
+    }
+
+    fn ticker_info() -> TickerInfo {
+        TickerInfo::new(
+            exchange::Ticker::new("BTCUSDT", exchange::adapter::Exchange::BinanceLinear),
+            0.1,
+            0.001,
+            None,
+        )
+    }
+
+    #[test]
+    fn open_interest_cache_is_separated_by_source_timeframe() {
+        assert_ne!(
+            open_interest_dataset_key(ticker_info(), Timeframe::M1),
+            open_interest_dataset_key(ticker_info(), Timeframe::M5)
+        );
+    }
+
     #[test]
     fn merges_coverage_and_finds_only_real_gaps() {
         let coverage = merge_intervals(vec![(100, 200), (150, 250), (300, 400)]);
@@ -1199,6 +1241,45 @@ mod tests {
         let last = encoded.len() - 1;
         encoded[last] ^= 0xff;
         assert!(decode_checked::<StoredCoverage>(&encoded).is_err());
+    }
+
+    #[test]
+    fn overlapping_bubble_summaries_are_not_added_twice() {
+        let candle_time = UnixMs::new(60_000);
+        let duplicate = bubble_candidate(10.0, 61_000, 62_000, 4);
+        let merged = merge_bubble_summaries(
+            [
+                BubbleVolumeSummary::new(candle_time, vec![duplicate]),
+                BubbleVolumeSummary::new(candle_time, vec![duplicate]),
+            ],
+            3,
+        );
+
+        assert_eq!(merged.len(), 1);
+        assert_eq!(merged[0].candidates.len(), 1);
+        assert_eq!(merged[0].candidates[0].total_qty.to_f64(), 10.0);
+        assert_eq!(merged[0].candidates[0].trade_count, 4);
+    }
+
+    #[test]
+    fn disjoint_bubble_summary_slices_are_added_once() {
+        let candle_time = UnixMs::new(60_000);
+        let merged = merge_bubble_summaries(
+            [
+                BubbleVolumeSummary::new(
+                    candle_time,
+                    vec![bubble_candidate(10.0, 61_000, 62_000, 4)],
+                ),
+                BubbleVolumeSummary::new(
+                    candle_time,
+                    vec![bubble_candidate(5.0, 62_001, 63_000, 2)],
+                ),
+            ],
+            3,
+        );
+
+        assert_eq!(merged[0].candidates[0].total_qty.to_f64(), 15.0);
+        assert_eq!(merged[0].candidates[0].trade_count, 6);
     }
 
     #[test]
@@ -1226,7 +1307,12 @@ mod tests {
         write.commit().unwrap();
 
         cache.clear_all().unwrap();
-        assert!(cache.read_value(KLINE_TABLE, "test-bucket").unwrap().is_none());
+        assert!(
+            cache
+                .read_value(KLINE_TABLE, "test-bucket")
+                .unwrap()
+                .is_none()
+        );
         assert!(
             cache
                 .read_value(COVERAGE_TABLE, "test-dataset")

@@ -4,7 +4,7 @@ use crate::widget::{column_drag, dragger_row, labeled_slider};
 
 use data::chart::indicator::{Indicator, KlineIndicator, UiIndicator};
 use data::chart::kline::{
-    BubbleColorMode, Config as KlineConfig, CvdRenderStyle, SessionProfileInterval,
+    BubbleColorMode, Config as KlineConfig, CvdRenderStyle, CvdReset, SessionProfileInterval,
     SessionProfileMode, SessionProfilePlacement, VolumeBubbleSession,
 };
 use data::layout::pane::VisualConfig;
@@ -123,13 +123,22 @@ pub fn view_kline<'a>(
                         },
                     )
                 });
+        let reset = pick_list(CvdReset::ALL, Some(cvd.reset), move |reset| {
+            config_message(
+                pane,
+                KlineConfig {
+                    cvd: data::chart::kline::CvdConfig { reset, ..cvd },
+                    ..cfg
+                },
+            )
+        });
         let style_controls: Element<'a, Message> = match cvd.render_style {
             CvdRenderStyle::Candlesticks => column![candle_width, show_wicks].spacing(6).into(),
             CvdRenderStyle::Line => column![line_width].spacing(6).into(),
         };
         sections = sections.push(indicator_card(
             "Cumulative Volume Delta",
-            column![render_style, style_controls].spacing(6),
+            column![render_style, reset, style_controls].spacing(6),
         ));
     }
 
@@ -380,15 +389,15 @@ pub fn view_kline<'a>(
             Some(1.0),
         );
         let history = labeled_slider(
-            "History / request",
+            "History window",
             1.0..=120.0,
-            bubbles.max_history_minutes_per_request as f32,
+            bubbles.history_window_minutes as f32,
             move |v| {
                 config_message(
                     pane,
                     KlineConfig {
                         volume_bubbles: data::chart::kline::VolumeBubbleConfig {
-                            max_history_minutes_per_request: v as u64,
+                            history_window_minutes: v as u64,
                             ..bubbles
                         },
                         ..cfg

@@ -765,10 +765,9 @@ impl Flowsurface {
                         );
                     }
 
-                    let transition = self.market_connectivity.record_connected(
-                        streams,
-                        std::time::Instant::now(),
-                    );
+                    let transition = self
+                        .market_connectivity
+                        .record_connected(streams, std::time::Instant::now());
                     return self.apply_connectivity_transition(transition);
                 }
 
@@ -898,8 +897,7 @@ impl Flowsurface {
                 let sync_transition = self
                     .market_connectivity
                     .sync_expected(&expected_streams, now);
-                let transition = if sync_transition
-                    != market_service::ConnectivityTransition::None
+                let transition = if sync_transition != market_service::ConnectivityTransition::None
                 {
                     sync_transition
                 } else {
@@ -1617,7 +1615,10 @@ impl Flowsurface {
         self.with_connection_overlay(content)
     }
 
-    fn with_connection_overlay<'a>(&'a self, content: Element<'a, Message>) -> Element<'a, Message> {
+    fn with_connection_overlay<'a>(
+        &'a self,
+        content: Element<'a, Message>,
+    ) -> Element<'a, Message> {
         if self.market_connectivity.overlay_visible() {
             main_dialog_modal(
                 content,

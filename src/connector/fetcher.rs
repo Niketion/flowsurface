@@ -115,8 +115,12 @@ pub fn format_fetch_range(fetch: &FetchRange) -> String {
         FetchRange::Kline(from, to) => {
             format!("Kline {}", format_time_range(*from, *to))
         }
-        FetchRange::OpenInterest(from, to) => {
-            format!("OI {}", format_time_range(*from, *to))
+        FetchRange::OpenInterest {
+            from,
+            to,
+            timeframe,
+        } => {
+            format!("OI {} source={timeframe}", format_time_range(*from, *to))
         }
         FetchRange::Trades(from, to) => {
             format!("Trades {}", format_time_range(*from, *to))
@@ -173,6 +177,33 @@ const TRADE_NO_PROGRESS_MAX_CONSECUTIVE: usize = 3;
 /// have already been collected, treat the fetch as complete rather than
 /// retrying the same tiny tail indefinitely.
 const NO_PROGRESS_REMAINING_EPSILON_MS: u64 = 1000;
+const TRADE_GAP_COALESCE_BRIDGE_MS: u64 = 60_000;
+
+/// Merge nearby uncovered cache slices before REST pagination. The original
+/// gaps are still used to decide which records are new to the caller.
+fn coalesce_trade_fetch_gaps(
+    gaps: &[(UnixMs, UnixMs)],
+    max_bridge_ms: u64,
+) -> Vec<(UnixMs, UnixMs)> {
+    let mut coalesced: Vec<(UnixMs, UnixMs)> = Vec::with_capacity(gaps.len());
+    for &(from, to) in gaps {
+        if from >= to {
+            continue;
+        }
+        if let Some((_, previous_to)) = coalesced.last_mut()
+            && from.saturating_diff(*previous_to) <= max_bridge_ms
+        {
+            *previous_to = (*previous_to).max(to);
+        } else {
+            coalesced.push((from, to));
+        }
+    }
+    coalesced
+}
+
+fn trade_time_is_in_gaps(time: UnixMs, gaps: &[(UnixMs, UnixMs)]) -> bool {
+    gaps.iter().any(|(from, to)| time >= *from && time < *to)
+}
 
 /// How long to remember that a trade range returned empty.
 const EMPTY_TRADE_FETCH_TTL: Duration = Duration::from_secs(60);
@@ -356,6 +387,12 @@ impl RequestHandler {
             matches!(request.fetch_type, FetchRange::Trades(_, _))
                 && matches!(request.status, RequestStatus::Pending)
         })
+    }
+
+    pub fn is_trade_request(&self, id: Uuid) -> bool {
+        self.requests
+            .get(&id)
+            .is_some_and(|request| matches!(request.fetch_type, FetchRange::Trades(_, _)))
     }
 
     fn cleanup_empty_trade_fetches(&mut self) {
@@ -955,7 +992,11 @@ impl RequestHandler {
 #[derive(PartialEq, Debug, Clone, Copy)]
 pub enum FetchRange {
     Kline(UnixMs, UnixMs),
-    OpenInterest(UnixMs, UnixMs),
+    OpenInterest {
+        from: UnixMs,
+        to: UnixMs,
+        timeframe: Timeframe,
+    },
     Trades(UnixMs, UnixMs),
     BubbleSummary {
         from: UnixMs,
@@ -969,9 +1010,8 @@ pub enum FetchRange {
 impl FetchRange {
     fn is_valid(&self) -> bool {
         match *self {
-            FetchRange::Kline(from, to)
-            | FetchRange::OpenInterest(from, to)
-            | FetchRange::Trades(from, to) => from < to,
+            FetchRange::Kline(from, to) | FetchRange::Trades(from, to) => from < to,
+            FetchRange::OpenInterest { from, to, .. } => from < to,
             FetchRange::BubbleSummary { from, to, .. } => from < to,
         }
     }
@@ -988,8 +1028,29 @@ impl FetchRange {
                 from,
                 to,
             ),
-            (FetchRange::OpenInterest(from, to), StreamKind::Kline { .. }) => {
-                (DataSet::OpenInterest, from, to)
+            (
+                FetchRange::OpenInterest {
+                    from,
+                    to,
+                    timeframe,
+                },
+                StreamKind::Kline { ticker_info, .. },
+            ) => {
+                let source_stream = StreamKind::Kline {
+                    ticker_info,
+                    timeframe,
+                };
+                let range = TimeRange::new(from, to)?;
+                let dataset = DataSet::OpenInterest;
+                let key = RequestKey::new(source_stream, dataset)?;
+                return Some((
+                    key,
+                    DataRequirement {
+                        dataset,
+                        range,
+                        refresh: RefreshPolicy::Historical,
+                    },
+                ));
             }
             (FetchRange::Trades(from, to), StreamKind::Trades { .. }) => {
                 (DataSet::Trades, from, to)
@@ -1038,9 +1099,18 @@ impl FetchRequest {
     fn same_with(&self, other: &FetchRequest) -> bool {
         match (&self.fetch_type, &other.fetch_type) {
             (FetchRange::Kline(s1, e1), FetchRange::Kline(s2, e2)) => e1 == e2 && s1 == s2,
-            (FetchRange::OpenInterest(s1, e1), FetchRange::OpenInterest(s2, e2)) => {
-                e1 == e2 && s1 == s2
-            }
+            (
+                FetchRange::OpenInterest {
+                    from: s1,
+                    to: e1,
+                    timeframe: t1,
+                },
+                FetchRange::OpenInterest {
+                    from: s2,
+                    to: e2,
+                    timeframe: t2,
+                },
+            ) => e1 == e2 && s1 == s2 && t1 == t2,
             (FetchRange::Trades(s1, e1), FetchRange::Trades(s2, e2)) => e1 == e2 && s1 == s2,
             (
                 FetchRange::BubbleSummary {
@@ -1113,11 +1183,49 @@ pub enum FetchTaskStatus {
     Completed {
         req_id: Option<Uuid>,
         fetch: Option<FetchRange>,
-        /// When the worker stopped early due to no-progress near target,
-        /// this carries the unfilled tail range that should be marked
-        /// empty-covered in the negative cache.
-        empty_covered_tail: Option<(UnixMs, UnixMs)>,
+        trade_outcome: Option<TradeFetchOutcome>,
     },
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct TradeFetchOutcome {
+    /// The worker verified every timestamp before this tail. The tail itself
+    /// still needs another pass.
+    pub unfilled_tail: Option<(UnixMs, UnixMs)>,
+    /// A short-lived negative-cache hint. A retryable timeout tail must never
+    /// be treated as an empty market-data interval.
+    pub empty_tail: Option<(UnixMs, UnixMs)>,
+}
+
+impl TradeFetchOutcome {
+    fn retryable(from: UnixMs, to: UnixMs) -> Self {
+        Self {
+            unfilled_tail: Some((from, to)),
+            empty_tail: None,
+        }
+    }
+
+    fn empty(from: UnixMs, to: UnixMs) -> Self {
+        Self {
+            unfilled_tail: Some((from, to)),
+            empty_tail: Some((from, to)),
+        }
+    }
+}
+
+fn interrupted_trade_fetch(
+    requested_from: UnixMs,
+    requested_to: UnixMs,
+    retry_from: UnixMs,
+    reason: String,
+) -> Result<TradeFetchOutcome, AdapterError> {
+    if retry_from > requested_from {
+        Ok(TradeFetchOutcome::retryable(retry_from, requested_to))
+    } else {
+        Err(AdapterError::InvalidRequest(format!(
+            "TimedOut: {reason} without progress"
+        )))
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -1208,13 +1316,32 @@ pub fn request_fetch(
                 format_streams(ready_streams)
             );
         }
-        FetchRange::OpenInterest(from, to) => {
+        FetchRange::OpenInterest {
+            from,
+            to,
+            timeframe,
+        } => {
             let kline_stream = if let Some(s) = stream {
-                Some((s, pane_id))
+                match s {
+                    StreamKind::Kline { ticker_info, .. } => Some((
+                        StreamKind::Kline {
+                            ticker_info,
+                            timeframe,
+                        },
+                        pane_id,
+                    )),
+                    _ => None,
+                }
             } else {
                 ready_streams.iter().find_map(|stream| {
-                    if let StreamKind::Kline { .. } = stream {
-                        Some((*stream, pane_id))
+                    if let StreamKind::Kline { ticker_info, .. } = stream {
+                        Some((
+                            StreamKind::Kline {
+                                ticker_info: *ticker_info,
+                                timeframe,
+                            },
+                            pane_id,
+                        ))
                     } else {
                         None
                     }
@@ -1305,14 +1432,14 @@ pub fn request_fetch(
                             }
                         },
                         move |result| match result {
-                            Ok(empty_covered_tail) => {
+                            Ok(trade_outcome) => {
                                 log::info!(
                                     "TRADE Done | venue={} symbol={} req={} range={} tail={}",
                                     format_venue(&ticker_info),
                                     format_symbol(&ticker_info),
                                     short_id(req_id),
                                     format_time_range(from_time, to_time),
-                                    empty_covered_tail
+                                    trade_outcome.unfilled_tail
                                         .map(|(f, t)| format_time_range(f, t))
                                         .unwrap_or_else(|| "-".to_string())
                                 );
@@ -1321,7 +1448,7 @@ pub fn request_fetch(
                                     status: FetchTaskStatus::Completed {
                                         req_id: Some(req_id),
                                         fetch: Some(FetchRange::Trades(from_time, to_time)),
-                                        empty_covered_tail,
+                                        trade_outcome: Some(trade_outcome),
                                     },
                                 }
                             }
@@ -1661,25 +1788,16 @@ fn store_contiguous_klines(
         let run = &klines[run_start..index];
         let first = run[0].time;
         let last = run[run.len() - 1].time;
-        let coverage_from = if first <= requested_from
-            && first.saturating_add(interval) > requested_from
-        {
-            requested_from
-        } else {
-            first.max(requested_from)
-        };
-        let coverage_to = last
-            .saturating_add(interval)
-            .min(requested_to_exclusive);
+        let coverage_from =
+            if first <= requested_from && first.saturating_add(interval) > requested_from {
+                requested_from
+            } else {
+                first.max(requested_from)
+            };
+        let coverage_to = last.saturating_add(interval).min(requested_to_exclusive);
 
         if coverage_from < coverage_to {
-            cache.store_klines(
-                ticker_info,
-                timeframe,
-                coverage_from,
-                coverage_to,
-                run,
-            );
+            cache.store_klines(ticker_info, timeframe, coverage_from, coverage_to, run);
         }
         run_start = index;
     }
@@ -1811,7 +1929,11 @@ pub fn oi_fetch_task(
                         pane_id,
                         error: err,
                         req_id,
-                        fetch: range.map(|(from, to)| FetchRange::OpenInterest(from, to)),
+                        fetch: range.map(|(from, to)| FetchRange::OpenInterest {
+                            from,
+                            to,
+                            timeframe,
+                        }),
                     },
                 },
             )
@@ -1949,7 +2071,7 @@ pub fn fetch_trades_batched(
     to_time: UnixMs,
     data_path: PathBuf,
     req_id: Uuid,
-) -> impl Straw<Option<(UnixMs, UnixMs)>, Vec<Trade>, AdapterError> {
+) -> impl Straw<TradeFetchOutcome, Vec<Trade>, AdapterError> {
     let venue = format_venue(&ticker_info);
     let symbol = format_symbol(&ticker_info);
 
@@ -1984,8 +2106,16 @@ pub fn fetch_trades_batched(
         }
 
         let network_started = Instant::now();
-        let mut empty_covered_tail = None;
-        for (gap_from, gap_to_exclusive) in gaps {
+        let network_gaps = coalesce_trade_fetch_gaps(&gaps, TRADE_GAP_COALESCE_BRIDGE_MS);
+        if network_gaps.len() < gaps.len() {
+            log::info!(
+                "TRADE GapCoalesce | venue={venue} symbol={symbol} req={} original={} coalesced={}",
+                short_id(req_id),
+                gaps.len(),
+                network_gaps.len()
+            );
+        }
+        for (gap_from, gap_to_exclusive) in network_gaps {
             if gap_from >= gap_to_exclusive {
                 continue;
             }
@@ -2003,18 +2133,23 @@ pub fn fetch_trades_batched(
                 // Overall worker timeout covers all network gaps, but cached
                 // batches are emitted immediately and do not consume it.
                 if network_started.elapsed() >= TRADE_WORKER_TIMEOUT {
-                    log::error!(
-                        "TRADE Worker Timeout | venue={venue} symbol={symbol} req={} range={} elapsed={} requests={request_count} trades={total_trades} latest={} target_to={}",
+                    log::warn!(
+                        "TRADE Worker Yield | venue={venue} symbol={symbol} req={} range={} elapsed={} requests={request_count} trades={total_trades} retry_from={} target_to={}",
                         short_id(req_id),
                         format_time_range(from_time, to_time),
                         format_duration_ms(started.elapsed().as_millis() as u64),
                         format_time_short(latest_trade_t),
-                        format_time_short(target_to)
+                        format_time_short(to_time)
                     );
-                    return Err(AdapterError::InvalidRequest(format!(
-                        "TimedOut: worker exceeded {}",
-                        format_duration_ms(TRADE_WORKER_TIMEOUT.as_millis() as u64)
-                    )));
+                    return interrupted_trade_fetch(
+                        from_time,
+                        to_time,
+                        latest_trade_t,
+                        format!(
+                            "worker exceeded {}",
+                            format_duration_ms(TRADE_WORKER_TIMEOUT.as_millis() as u64)
+                        ),
+                    );
                 }
 
                 request_count += 1;
@@ -2056,10 +2191,15 @@ pub fn fetch_trades_batched(
                             format_duration_ms(TRADE_REST_REQUEST_TIMEOUT.as_millis() as u64),
                             format_duration_ms(elapsed)
                         );
-                        return Err(AdapterError::InvalidRequest(format!(
-                            "TimedOut: REST trade fetch exceeded {}",
-                            format_duration_ms(TRADE_REST_REQUEST_TIMEOUT.as_millis() as u64)
-                        )));
+                        return interrupted_trade_fetch(
+                            from_time,
+                            to_time,
+                            request_from,
+                            format!(
+                                "REST trade fetch exceeded {}",
+                                format_duration_ms(TRADE_REST_REQUEST_TIMEOUT.as_millis() as u64)
+                            ),
+                        );
                     }
                     Ok(Ok(raw_batch)) => {
                         let elapsed = request_started.elapsed().as_millis() as u64;
@@ -2074,7 +2214,6 @@ pub fn fetch_trades_batched(
                         );
 
                         if raw_batch.is_empty() {
-                            empty_covered_tail = Some((request_from, target_to));
                             log::warn!(
                                 "TRADE Stop | venue={venue} symbol={symbol} reason=empty_batch_before_target latest={} target_to={} remaining_ms={} requests={request_count} trades={total_trades} total_duration={}",
                                 format_time_short(latest_trade_t),
@@ -2082,23 +2221,25 @@ pub fn fetch_trades_batched(
                                 target_to.saturating_diff(latest_trade_t),
                                 format_duration_ms(started.elapsed().as_millis() as u64)
                             );
-                            break;
+                            return Ok(TradeFetchOutcome::empty(request_from, to_time));
                         }
 
                         latest_trade_t =
                             raw_batch.last().map_or(latest_trade_t, |trade| trade.time);
                         final_latest = final_latest.max(latest_trade_t.min(target_to));
                         let covered_to_exclusive = latest_trade_t.min(target_to).saturating_add(1);
-                        let (batch, discarded) = filter_new_fetched_trades(
+                        let (cache_batch, discarded) = filter_new_fetched_trades(
                             raw_batch,
                             request_from,
                             gap_to_exclusive,
                             &mut last_trade_id,
                         );
+                        let mut batch = cache_batch.clone();
+                        batch.retain(|trade| trade_time_is_in_gaps(trade.time, &gaps));
                         if discarded > 0 {
                             log::debug!(
                                 "TRADE Dedup | venue={venue} symbol={symbol} request_idx={request_count} discarded={discarded} retained={}",
-                                batch.len()
+                                cache_batch.len()
                             );
                         }
                         if let Some(cache) = market_cache()
@@ -2108,7 +2249,7 @@ pub fn fetch_trades_batched(
                                 ticker_info,
                                 request_from,
                                 covered_to_exclusive,
-                                &batch,
+                                &cache_batch,
                             );
                         }
 
@@ -2129,7 +2270,7 @@ pub fn fetch_trades_batched(
                                 if !batch.is_empty() {
                                     let () = progress.send(batch).await;
                                 }
-                                return Ok(Some((tail_from, target_to)));
+                                return Ok(TradeFetchOutcome::retryable(tail_from, to_time));
                             }
 
                             let advanced = latest_trade_t.saturating_add(1);
@@ -2137,7 +2278,7 @@ pub fn fetch_trades_batched(
                                 if !batch.is_empty() {
                                     let () = progress.send(batch).await;
                                 }
-                                return Ok(Some((advanced, target_to)));
+                                return Ok(TradeFetchOutcome::retryable(advanced, to_time));
                             }
                             latest_trade_t = advanced;
                             prev_request_from = None;
@@ -2187,7 +2328,7 @@ pub fn fetch_trades_batched(
             format_duration_ms(started.elapsed().as_millis() as u64)
         );
 
-        Ok(empty_covered_tail)
+        Ok(TradeFetchOutcome::default())
     })
 }
 
@@ -2273,16 +2414,16 @@ async fn fetch_bubble_summaries_cached(
         let gap_to = gap_to_exclusive.saturating_sub(1);
         let (fetched, gap_trades_seen, gap_raw_discarded, verified_to_exclusive) =
             fetch_bubble_summaries(
-            handles.clone(),
-            ticker_info,
-            gap_from,
-            gap_to,
-            timeframe_ms,
-            price_step,
-            max_candidates_per_candle,
-            data_path.clone(),
-        )
-        .await?;
+                handles.clone(),
+                ticker_info,
+                gap_from,
+                gap_to,
+                timeframe_ms,
+                price_step,
+                max_candidates_per_candle,
+                data_path.clone(),
+            )
+            .await?;
         if gap_from < verified_to_exclusive {
             verified_ranges.push((gap_from, verified_to_exclusive.min(gap_to_exclusive)));
         }
@@ -2366,9 +2507,7 @@ async fn fetch_bubble_summaries(
         }
 
         let prev_latest_trade_t = latest_trade_t;
-        latest_trade_t = raw_batch
-            .last()
-            .map_or(latest_trade_t, |trade| trade.time);
+        latest_trade_t = raw_batch.last().map_or(latest_trade_t, |trade| trade.time);
         let (batch, discarded) = filter_new_fetched_trades(
             raw_batch,
             request_from,
@@ -2439,12 +2578,7 @@ async fn fetch_bubble_summaries(
         from_time
     };
 
-    Ok((
-        summaries,
-        trades_seen,
-        raw_discarded,
-        verified_to_exclusive,
-    ))
+    Ok((summaries, trades_seen, raw_discarded, verified_to_exclusive))
 }
 
 fn retained_bubble_candidate_count(
@@ -2532,6 +2666,37 @@ fn bubble_summaries_from_buckets(
 mod tests {
     use super::*;
 
+    fn ticker_info() -> TickerInfo {
+        TickerInfo::new(
+            exchange::Ticker::new("BTCUSDT", Exchange::BinanceLinear),
+            0.1,
+            0.001,
+            None,
+        )
+    }
+
+    #[test]
+    fn open_interest_requirement_uses_explicit_source_timeframe() {
+        let ticker_info = ticker_info();
+        let chart_stream = StreamKind::Kline {
+            ticker_info,
+            timeframe: Timeframe::M1,
+        };
+        let request = FetchRange::OpenInterest {
+            from: UnixMs::new(1),
+            to: UnixMs::new(2),
+            timeframe: Timeframe::M5,
+        };
+        let (key, _) = request.requirement(chart_stream).unwrap();
+        assert_eq!(
+            key.stream,
+            StreamKind::Kline {
+                ticker_info,
+                timeframe: Timeframe::M5,
+            }
+        );
+    }
+
     fn trade(id: Option<u64>, time: u64) -> Trade {
         Trade {
             id,
@@ -2567,7 +2732,91 @@ mod tests {
             &mut last_id,
         );
         assert_eq!(discarded, 1);
-        assert_eq!(second.iter().filter_map(|trade| trade.id).collect::<Vec<_>>(), vec![12]);
+        assert_eq!(
+            second
+                .iter()
+                .filter_map(|trade| trade.id)
+                .collect::<Vec<_>>(),
+            vec![12]
+        );
+    }
+
+    #[test]
+    fn nearby_trade_cache_gaps_are_fetched_as_one_span() {
+        let gaps = vec![
+            (UnixMs::new(1_000), UnixMs::new(2_000)),
+            (UnixMs::new(2_500), UnixMs::new(3_000)),
+            (UnixMs::new(70_000), UnixMs::new(71_000)),
+        ];
+
+        assert_eq!(
+            coalesce_trade_fetch_gaps(&gaps, 1_000),
+            vec![
+                (UnixMs::new(1_000), UnixMs::new(3_000)),
+                (UnixMs::new(70_000), UnixMs::new(71_000)),
+            ]
+        );
+    }
+
+    #[test]
+    fn coalesced_trade_fetch_only_emits_original_cache_gaps() {
+        let gaps = vec![
+            (UnixMs::new(1_000), UnixMs::new(2_000)),
+            (UnixMs::new(2_500), UnixMs::new(3_000)),
+        ];
+
+        assert!(trade_time_is_in_gaps(UnixMs::new(1_500), &gaps));
+        assert!(!trade_time_is_in_gaps(UnixMs::new(2_250), &gaps));
+        assert!(trade_time_is_in_gaps(UnixMs::new(2_750), &gaps));
+    }
+
+    #[test]
+    fn interrupted_trade_worker_preserves_progress_as_retryable_tail() {
+        let outcome = interrupted_trade_fetch(
+            UnixMs::new(1_000),
+            UnixMs::new(5_000),
+            UnixMs::new(3_000),
+            "test budget".to_string(),
+        )
+        .unwrap();
+        assert_eq!(
+            outcome.unfilled_tail,
+            Some((UnixMs::new(3_000), UnixMs::new(5_000)))
+        );
+        assert_eq!(outcome.empty_tail, None);
+    }
+
+    #[test]
+    fn interrupted_trade_worker_without_progress_remains_an_error() {
+        assert!(
+            interrupted_trade_fetch(
+                UnixMs::new(1_000),
+                UnixMs::new(5_000),
+                UnixMs::new(1_000),
+                "test budget".to_string(),
+            )
+            .is_err()
+        );
+    }
+
+    #[test]
+    fn request_kind_lookup_does_not_confuse_oi_with_trades() {
+        let mut handler = RequestHandler::default();
+        let trade_id = handler
+            .add_request(FetchRange::Trades(UnixMs::new(1_000), UnixMs::new(2_000)))
+            .unwrap()
+            .unwrap();
+        let oi_id = handler
+            .add_request(FetchRange::OpenInterest {
+                from: UnixMs::new(1_000),
+                to: UnixMs::new(2_000),
+                timeframe: Timeframe::M5,
+            })
+            .unwrap()
+            .unwrap();
+
+        assert!(handler.is_trade_request(trade_id));
+        assert!(!handler.is_trade_request(oi_id));
     }
 
     #[test]

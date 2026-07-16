@@ -2,7 +2,9 @@ use std::collections::BTreeMap;
 
 use crate::chart::Basis;
 use crate::chart::heatmap::HeatmapDataPoint;
-use crate::chart::kline::{BubbleVolumeSummary, ClusterKind, KlineDataPoint, KlineTrades, NPoc};
+use crate::chart::kline::{
+    BubbleVolumeSummary, ClusterKind, KlineDataPoint, KlineTrades, NPoc, TradeCoverage,
+};
 
 use exchange::unit::{Price, PriceStep, Qty};
 use exchange::{Kline, Timeframe, Trade, UnixMs, Volume};
@@ -251,7 +253,9 @@ impl TimeSeries<KlineDataPoint> {
                     kline: *kline,
                     footprint: KlineTrades::new(),
                     bubble_summary: BubbleVolumeSummary::default(),
-                    trades_checked: false,
+                    trade_coverage: TradeCoverage::Unknown,
+                    trade_sequence: Vec::new(),
+                    trade_ids: Default::default(),
                 });
 
             entry.kline = *kline;
@@ -287,7 +291,9 @@ impl TimeSeries<KlineDataPoint> {
                     },
                     footprint: KlineTrades::new(),
                     bubble_summary: BubbleVolumeSummary::default(),
-                    trades_checked: false,
+                    trade_coverage: TradeCoverage::Unknown,
+                    trade_sequence: Vec::new(),
+                    trade_ids: Default::default(),
                 });
 
             entry.add_trade(trade, self.tick_size);
@@ -314,7 +320,6 @@ impl TimeSeries<KlineDataPoint> {
                     updated_times.push(rounded_time);
                 }
                 entry.add_trade(trade, self.tick_size);
-                entry.trades_checked = true;
             }
         }
 
@@ -325,12 +330,15 @@ impl TimeSeries<KlineDataPoint> {
         }
     }
 
-    /// Mark all kline buckets in a time range as trades_checked = true.
+    /// Mark all kline buckets in a time range as having complete raw-trade coverage.
     /// Used when a trade fetch completes with no/empty results to prevent
     /// re-requesting the same empty range.
-    pub fn mark_range_trades_checked(&mut self, from: UnixMs, to: UnixMs) {
-        for (_, dp) in self.datapoints.range_mut(from..=to) {
-            dp.trades_checked = true;
+    pub fn mark_range_trades_complete(&mut self, from: UnixMs, to: UnixMs) {
+        let interval_ms = self.interval.to_milliseconds();
+        for (&time, dp) in self.datapoints.range_mut(from..=to) {
+            if time.saturating_add(interval_ms) <= to.saturating_add(1) {
+                dp.trade_coverage = TradeCoverage::Complete;
+            }
         }
     }
 
@@ -338,7 +346,6 @@ impl TimeSeries<KlineDataPoint> {
         for summary in summaries {
             if let Some(dp) = self.datapoints.get_mut(&summary.candle_time) {
                 dp.set_bubble_summary(summary);
-                dp.trades_checked = true;
             }
         }
     }
@@ -457,7 +464,9 @@ impl TimeSeries<KlineDataPoint> {
             .datapoints
             .iter()
             .rev()
-            .find(|(_, dp)| dp.footprint.trades.is_empty() && !dp.trades_checked)
+            .find(|(_, dp)| {
+                dp.footprint.trades.is_empty() && dp.trade_coverage != TradeCoverage::Complete
+            })
             .map(|(&time, _)| time);
 
         if let Some(target_time) = empty_kline_time {

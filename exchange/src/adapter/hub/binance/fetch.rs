@@ -15,7 +15,31 @@ use crate::adapter::hub::AdapterError;
 use csv::ReaderBuilder;
 use serde::Deserialize;
 use serde_json::Value;
-use std::{collections::HashMap, io::BufReader, path::PathBuf, time::UNIX_EPOCH};
+use std::{
+    collections::{HashMap, HashSet},
+    io::BufReader,
+    path::PathBuf,
+    sync::{LazyLock, Mutex},
+    time::UNIX_EPOCH,
+};
+
+/// Binance can publish a daily archive after the UTC day has already closed.
+/// Remember a 404 for the lifetime of the process so REST pagination does not
+/// download the same missing URL once per page.
+static MISSING_HIST_TRADE_ARCHIVES: LazyLock<Mutex<HashSet<String>>> =
+    LazyLock::new(|| Mutex::new(HashSet::new()));
+
+fn historical_trade_archive_is_missing(path: &str) -> bool {
+    MISSING_HIST_TRADE_ARCHIVES
+        .lock()
+        .is_ok_and(|missing| missing.contains(path))
+}
+
+fn remember_missing_historical_trade_archive(path: &str) {
+    if let Ok(mut missing) = MISSING_HIST_TRADE_ARCHIVES.lock() {
+        missing.insert(path.to_string());
+    }
+}
 
 #[derive(Deserialize, Debug, Clone)]
 struct FetchedKline(
@@ -524,7 +548,7 @@ pub(super) async fn fetch_historical_oi(
         };
 
         let interval_ms = period.to_milliseconds();
-        let num_intervals = ((end - adjusted_start) / interval_ms).min(500);
+        let num_intervals = oi_request_limit(adjusted_start, end, interval_ms, 500);
 
         url.push_str(&format!(
             "&startTime={adjusted_start}&endTime={end}&limit={num_intervals}"
@@ -546,6 +570,12 @@ pub(super) async fn fetch_historical_oi(
         .collect::<Vec<OpenInterest>>();
 
     Ok(open_interest)
+}
+
+fn oi_request_limit(start: u64, end: u64, interval_ms: u64, maximum: u64) -> u64 {
+    end.saturating_sub(start)
+        .div_ceil(interval_ms)
+        .clamp(1, maximum)
 }
 
 async fn fetch_intraday_trades(
@@ -619,12 +649,21 @@ async fn get_hist_trades_with_client(
     if std::fs::metadata(&base_zip_path).is_ok() {
         log::info!("Using cached {}", zip_path);
     } else {
+        if historical_trade_archive_is_missing(&zip_path) {
+            return Err(AdapterError::InvalidRequest(format!(
+                "Historical archive is not available yet: {zip_path}"
+            )));
+        }
+
         let url = format!("https://data.binance.vision/{zip_path}");
 
         log::info!("Downloading from {}", url);
 
         let resp = client.get(&url).send().await.map_err(AdapterError::from)?;
 
+        if resp.status() == reqwest::StatusCode::NOT_FOUND {
+            remember_missing_historical_trade_archive(&zip_path);
+        }
         if !resp.status().is_success() {
             return Err(AdapterError::InvalidRequest(format!(
                 "Failed to fetch from {}: {}",
@@ -741,5 +780,27 @@ pub(super) async fn fetch_trades(
             );
             fetch_intraday_trades(hub, ticker_info, from_time).await
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{
+        historical_trade_archive_is_missing, oi_request_limit,
+        remember_missing_historical_trade_archive,
+    };
+
+    #[test]
+    fn open_interest_short_range_never_uses_zero_limit() {
+        assert_eq!(oi_request_limit(1_000, 1_001, 300_000, 500), 1);
+        assert_eq!(oi_request_limit(1_000, 301_000, 300_000, 500), 1);
+    }
+
+    #[test]
+    fn missing_historical_trade_archive_is_not_retried() {
+        let path = "test/futures/um/daily/aggTrades/BTCUSDT/never-published.zip";
+        assert!(!historical_trade_archive_is_missing(path));
+        remember_missing_historical_trade_archive(path);
+        assert!(historical_trade_archive_is_missing(path));
     }
 }

@@ -59,8 +59,18 @@ pub enum Effect {
 pub enum Status {
     #[default]
     Ready,
-    Loading(InfoKind),
+    Loading {
+        info: InfoKind,
+        source: LoadingSource,
+    },
     Stale(String),
+}
+
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+pub enum LoadingSource {
+    #[default]
+    Historical,
+    Reconnect,
 }
 
 pub enum Action {
@@ -167,6 +177,9 @@ impl State {
     /// consume trades. This also fixes runtime enable/disable without requiring
     /// an application restart.
     pub fn reconcile_candlestick_trade_stream(&mut self) {
+        let Some(ticker_info) = self.stream_pair() else {
+            return;
+        };
         let needs_trades = match &self.content {
             Content::Kline {
                 indicators,
@@ -174,11 +187,8 @@ impl State {
                 ..
             } => indicators
                 .iter()
-                .any(|indicator| indicator.requires_trades()),
+                .any(|indicator| indicator.requires_trades(ticker_info.exchange())),
             _ => return,
-        };
-        let Some(ticker_info) = self.stream_pair() else {
-            return;
         };
         let ResolvedStream::Ready(streams) = &mut self.streams else {
             return;
@@ -233,7 +243,9 @@ impl State {
             let trade_overlay_enabled = matches!(
                 &self.content,
                 Content::Kline { indicators, .. }
-                    if indicators.iter().any(|indicator| indicator.requires_trades())
+                    if indicators.iter().any(|indicator| indicator.requires_trades(
+                        derived_plan.ticker_info.exchange()
+                    ))
             );
 
             match kind {
@@ -453,7 +465,9 @@ impl State {
         let final_trade_overlays = matches!(
             &self.content,
             Content::Kline { indicators, .. }
-                if indicators.iter().any(|indicator| indicator.requires_trades())
+                if indicators.iter().any(|indicator| indicator.requires_trades(
+                    base_ticker.exchange()
+                ))
         );
 
         log::info!(
@@ -630,13 +644,13 @@ impl State {
     pub fn mark_backfill_completed(
         &mut self,
         fetch: Option<crate::connector::fetcher::FetchRange>,
-        empty_covered_tail: Option<(exchange::UnixMs, exchange::UnixMs)>,
+        trade_outcome: crate::connector::fetcher::TradeFetchOutcome,
     ) {
         if let Content::Kline {
             chart: Some(chart), ..
         } = &mut self.content
         {
-            chart.complete_backfill(fetch, empty_covered_tail);
+            chart.complete_backfill(fetch, trade_outcome);
         }
         self.status = Status::Ready;
     }
@@ -1257,18 +1271,40 @@ impl State {
         };
 
         match &self.status {
-            Status::Loading(InfoKind::FetchingKlines) => {
-                top_left_buttons = top_left_buttons.push(text("Fetching Klines..."));
-            }
-            Status::Loading(InfoKind::FetchingTrades(count)) => {
-                top_left_buttons =
-                    top_left_buttons.push(text(format!("Fetching Trades... {count} fetched")));
-            }
-            Status::Loading(InfoKind::FetchingBubbleSummaries) => {
-                top_left_buttons = top_left_buttons.push(text("Fetching Bubble summaries..."));
-            }
-            Status::Loading(InfoKind::FetchingOI) => {
-                top_left_buttons = top_left_buttons.push(text("Fetching Open Interest..."));
+            Status::Loading { info, source } => {
+                let action = match (source, info) {
+                    (LoadingSource::Historical, InfoKind::FetchingKlines) => {
+                        "Loading historical candlesticks".to_string()
+                    }
+                    (LoadingSource::Historical, InfoKind::FetchingTrades(count)) => {
+                        format!("Loading historical trades ({count} received)")
+                    }
+                    (LoadingSource::Historical, InfoKind::FetchingBubbleSummaries) => {
+                        "Analyzing historical trades for volume bubbles".to_string()
+                    }
+                    (LoadingSource::Historical, InfoKind::FetchingOI) => {
+                        "Loading historical open interest".to_string()
+                    }
+                    (LoadingSource::Reconnect, InfoKind::FetchingKlines) => {
+                        "Connection restored: recovering missed candlesticks".to_string()
+                    }
+                    (LoadingSource::Reconnect, InfoKind::FetchingTrades(count)) => {
+                        format!("Connection restored: recovering missed trades ({count} received)")
+                    }
+                    (LoadingSource::Reconnect, InfoKind::FetchingBubbleSummaries) => {
+                        "Connection restored: rebuilding missed volume bubbles".to_string()
+                    }
+                    (LoadingSource::Reconnect, InfoKind::FetchingOI) => {
+                        "Connection restored: recovering missed open interest".to_string()
+                    }
+                };
+                let indicator = iced::widget::tooltip(
+                    widget::loading_spinner(),
+                    container(text(action)).style(style::tooltip).padding(8),
+                    tooltip::Position::Bottom,
+                )
+                .delay(widget::DEFAULT_TOOLTIP_DELAY);
+                top_left_buttons = top_left_buttons.push(indicator);
             }
             Status::Stale(msg) => {
                 top_left_buttons = top_left_buttons.push(text(msg));
@@ -1366,8 +1402,12 @@ impl State {
                 _ => {}
             },
             Event::ToggleIndicator(ind) => {
-                let refresh_streams =
-                    matches!(ind, UiIndicator::Kline(indicator) if indicator.requires_trades());
+                let exchange = self.stream_pair().map(|ticker| ticker.exchange());
+                let refresh_streams = matches!(
+                    (ind, exchange),
+                    (UiIndicator::Kline(indicator), Some(exchange))
+                        if indicator.requires_trades(exchange)
+                );
                 self.content.toggle_indicator(ind);
                 if refresh_streams {
                     self.reconcile_candlestick_trade_stream();
@@ -1942,7 +1982,7 @@ impl State {
             FetchRange::Trades(_, _)
             | FetchRange::BubbleSummary { .. }
             | FetchRange::Kline(_, _)
-            | FetchRange::OpenInterest(_, _) => {
+            | FetchRange::OpenInterest { .. } => {
                 matches!(self.content, Content::Kline { chart: Some(_), .. })
             }
         }

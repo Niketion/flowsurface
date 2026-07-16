@@ -5,7 +5,7 @@ use exchange::{
     unit::qty::Qty,
 };
 
-use rustc_hash::FxHashMap;
+use rustc_hash::{FxHashMap, FxHashSet};
 use serde::{Deserialize, Serialize};
 
 #[derive(Clone)]
@@ -13,9 +13,22 @@ pub struct KlineDataPoint {
     pub kline: Kline,
     pub footprint: KlineTrades,
     pub bubble_summary: BubbleVolumeSummary,
-    /// Whether trades have been fetched/checked for this kline bucket.
-    /// Prevents re-requesting the same empty range repeatedly.
-    pub trades_checked: bool,
+    /// Completeness of the raw directional executions for this bucket.
+    pub trade_coverage: TradeCoverage,
+    /// Raw executions retained in arrival order so indicators can reconstruct
+    /// a real intrabar path when the bucket has complete historical coverage.
+    pub trade_sequence: Vec<Trade>,
+    /// Stable exchange IDs already aggregated into this candle. Unlike the
+    /// chart-level raw buffer, this lives as long as the candle bucket.
+    pub trade_ids: FxHashSet<u64>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum TradeCoverage {
+    #[default]
+    Unknown,
+    Partial,
+    Complete,
 }
 
 impl KlineDataPoint {
@@ -25,7 +38,16 @@ impl KlineDataPoint {
     }
 
     pub fn add_trade(&mut self, trade: &Trade, step: PriceStep) {
+        if let Some(id) = trade.id
+            && !self.trade_ids.insert(id)
+        {
+            return;
+        }
         self.footprint.add_trade_to_nearest_bin(trade, step);
+        self.trade_sequence.push(*trade);
+        if self.trade_coverage == TradeCoverage::Unknown {
+            self.trade_coverage = TradeCoverage::Partial;
+        }
     }
 
     pub fn poc_price(&self) -> Option<Price> {
@@ -38,6 +60,8 @@ impl KlineDataPoint {
 
     pub fn clear_trades(&mut self) {
         self.footprint.clear();
+        self.trade_sequence.clear();
+        self.trade_ids.clear();
     }
 
     pub fn set_bubble_summary(&mut self, summary: BubbleVolumeSummary) {
@@ -500,6 +524,7 @@ pub struct CvdConfig {
     pub candle_width_percent: f32,
     pub show_wicks: bool,
     pub line_width: f32,
+    pub reset: CvdReset,
 }
 
 impl Default for CvdConfig {
@@ -507,9 +532,30 @@ impl Default for CvdConfig {
         Self {
             render_style: CvdRenderStyle::Candlesticks,
             candle_width_percent: 70.0,
-            show_wicks: true,
+            show_wicks: false,
             line_width: 1.0,
+            reset: CvdReset::DailyUtc,
         }
+    }
+}
+
+#[derive(Debug, Copy, Clone, PartialEq, Eq, Default, Deserialize, Serialize)]
+pub enum CvdReset {
+    #[default]
+    DailyUtc,
+    Continuous,
+}
+
+impl CvdReset {
+    pub const ALL: [Self; 2] = [Self::DailyUtc, Self::Continuous];
+}
+
+impl std::fmt::Display for CvdReset {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(match self {
+            Self::DailyUtc => "Daily UTC",
+            Self::Continuous => "Continuous",
+        })
     }
 }
 
@@ -682,7 +728,7 @@ pub struct VolumeBubbleConfig {
     pub max_bubbles_per_bar: usize,
     pub historical_mode: BubbleHistoricalMode,
     pub max_candidates_per_candle: usize,
-    pub max_history_minutes_per_request: u64,
+    pub history_window_minutes: u64,
     pub use_raw_trades_when_available: bool,
     pub min_radius_px: f32,
     pub max_radius_px: f32,
@@ -699,7 +745,7 @@ impl Default for VolumeBubbleConfig {
             max_bubbles_per_bar: 3,
             historical_mode: BubbleHistoricalMode::SummaryOnly,
             max_candidates_per_candle: 3,
-            max_history_minutes_per_request: 15,
+            history_window_minutes: 30,
             use_raw_trades_when_available: true,
             min_radius_px: 3.0,
             max_radius_px: 14.0,

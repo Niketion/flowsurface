@@ -8,7 +8,9 @@ use iced::{
     Color,
     Length::Fill,
     Theme, border, padding,
-    widget::{button, column, container, row, scrollable, slider, space, text, tooltip::Position},
+    widget::{
+        button, column, container, image, row, scrollable, slider, space, text, tooltip::Position,
+    },
 };
 
 pub mod chart;
@@ -22,6 +24,41 @@ pub const PANE_CONTROL_BTN_HEIGHT: f32 = 26.0;
 
 #[allow(dead_code)]
 pub const DEFAULT_TOOLTIP_DELAY: std::time::Duration = std::time::Duration::from_millis(500);
+
+/// A compact GIF-backed activity indicator used in pane headers.
+pub fn loading_spinner<'a, Message: 'a>() -> Element<'a, Message> {
+    static FRAMES: std::sync::OnceLock<Vec<image::Handle>> = std::sync::OnceLock::new();
+    let frames =
+        FRAMES.get_or_init(|| decode_gif_frames(include_bytes!("../assets/ui/loading-dots.gif")));
+    let elapsed_ms = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_millis();
+    let frame = frames[(elapsed_ms / 120) as usize % frames.len()].clone();
+
+    image(frame).width(24).height(8).into()
+}
+
+fn decode_gif_frames(bytes: &[u8]) -> Vec<image::Handle> {
+    let mut options = gif::DecodeOptions::new();
+    options.set_color_output(gif::ColorOutput::RGBA);
+    let mut decoder = options
+        .read_info(std::io::Cursor::new(bytes))
+        .expect("embedded loading GIF must be valid");
+    let mut frames = Vec::new();
+    while let Some(frame) = decoder
+        .read_next_frame()
+        .expect("embedded loading GIF frame must be valid")
+    {
+        frames.push(image::Handle::from_rgba(
+            u32::from(frame.width),
+            u32::from(frame.height),
+            frame.buffer.to_vec(),
+        ));
+    }
+    assert!(!frames.is_empty(), "embedded loading GIF has no frames");
+    frames
+}
 
 pub fn tooltip<'a, Message: 'a>(
     content: impl Into<Element<'a, Message>>,

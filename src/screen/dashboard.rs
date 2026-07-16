@@ -49,7 +49,7 @@ pub enum Message {
         pane_id: uuid::Uuid,
         req_id: Option<uuid::Uuid>,
         fetch: Option<fetcher::FetchRange>,
-        empty_covered_tail: Option<(UnixMs, UnixMs)>,
+        trade_outcome: Option<fetcher::TradeFetchOutcome>,
     },
     FetchFailed {
         pane_id: uuid::Uuid,
@@ -69,6 +69,7 @@ pub enum Message {
     BackfillFetchUpdate {
         pane_ids: Vec<uuid::Uuid>,
         stream: StreamKind,
+        show_activity: bool,
         update: fetcher::FetchUpdate,
     },
     ResolveStreams(uuid::Uuid, Vec<PersistStreamKind>),
@@ -518,9 +519,9 @@ impl Dashboard {
                 pane_id,
                 req_id,
                 fetch,
-                empty_covered_tail,
+                trade_outcome,
             } => {
-                self.complete_fetch(main_window.id, pane_id, req_id, fetch, empty_covered_tail);
+                self.complete_fetch(main_window.id, pane_id, req_id, fetch, trade_outcome);
             }
             Message::FetchFailed {
                 pane_id,
@@ -568,9 +569,10 @@ impl Dashboard {
             Message::BackfillFetchUpdate {
                 pane_ids,
                 stream,
+                show_activity,
                 update,
             } => {
-                self.apply_backfill_update(main_window.id, pane_ids, stream, update);
+                self.apply_backfill_update(main_window.id, pane_ids, stream, show_activity, update);
             }
             Message::ResolveStreams(pane_id, streams) => {
                 return (
@@ -1229,7 +1231,7 @@ impl Dashboard {
         pane_id: uuid::Uuid,
         req_id: Option<uuid::Uuid>,
         fetch: Option<fetcher::FetchRange>,
-        empty_covered_tail: Option<(UnixMs, UnixMs)>,
+        trade_outcome: Option<fetcher::TradeFetchOutcome>,
     ) {
         let Some(pane_state) = self.get_mut_pane_state_by_uuid(main_window, pane_id) else {
             log::warn!(
@@ -1249,7 +1251,7 @@ impl Dashboard {
             c.complete_trade_fetch(
                 req_id,
                 Some(fetcher::FetchRange::Trades(from, to)),
-                empty_covered_tail,
+                trade_outcome.unwrap_or_default(),
             );
         }
 
@@ -1267,6 +1269,7 @@ impl Dashboard {
         main_window: window::Id,
         pane_ids: Vec<uuid::Uuid>,
         stream: StreamKind,
+        show_activity: bool,
         update: fetcher::FetchUpdate,
     ) {
         match update {
@@ -1281,14 +1284,19 @@ impl Dashboard {
                         if let Some(pane_state) =
                             self.get_mut_pane_state_by_uuid(main_window, pane_id)
                         {
-                            pane_state.status = pane::Status::Loading(info);
+                            if show_activity {
+                                pane_state.status = pane::Status::Loading {
+                                    info,
+                                    source: pane::LoadingSource::Reconnect,
+                                };
+                            }
                         }
                     }
                 }
                 fetcher::FetchTaskStatus::Completed {
                     req_id,
                     fetch,
-                    empty_covered_tail,
+                    trade_outcome,
                 } => {
                     log::info!(
                         "BACKFILL Completed | stream={} pane_ids={} req={} fetch={} tail={}",
@@ -1296,7 +1304,8 @@ impl Dashboard {
                         pane_ids.len(),
                         fetcher::format_req_id(req_id),
                         fetcher::format_fetch_range_compact(fetch),
-                        empty_covered_tail
+                        trade_outcome
+                            .and_then(|outcome| outcome.unfilled_tail)
                             .map(|(f, t)| fetcher::format_time_range(f, t))
                             .unwrap_or_else(|| "-".to_string())
                     );
@@ -1321,7 +1330,11 @@ impl Dashboard {
                                 .unwrap_or(true);
 
                             if supports {
-                                pane_state.mark_backfill_completed(fetch, empty_covered_tail);
+                                pane_state.mark_backfill_completed(
+                                    fetch,
+                                    trade_outcome.unwrap_or_default(),
+                                );
+                                pane_state.status = pane::Status::Ready;
                             } else {
                                 log::debug!(
                                     "BACKFILL CompletionSkip | pane={} content={} reason=unsupported_fetch_range",
@@ -1397,6 +1410,35 @@ impl Dashboard {
                         stream,
                         true, // backfill: skip stale generation check
                     );
+
+                    // Backfill data insertion normally toggles the pane's
+                    // historical loading state. Restore the reconnect context,
+                    // or keep short routine repairs entirely silent.
+                    if let Some(pane_state) = self.get_mut_pane_state_by_uuid(main_window, pane_id)
+                    {
+                        if show_activity {
+                            let received = match &pane_state.status {
+                                pane::Status::Loading {
+                                    info: InfoKind::FetchingTrades(count),
+                                    ..
+                                } => *count,
+                                _ => match &data {
+                                    FetchedData::Trades { batch, .. } => batch.len(),
+                                    _ => 0,
+                                },
+                            };
+                            pane_state.status = pane::Status::Loading {
+                                info: match stream {
+                                    StreamKind::Trades { .. } => InfoKind::FetchingTrades(received),
+                                    StreamKind::Kline { .. } => InfoKind::FetchingKlines,
+                                    StreamKind::Depth { .. } => continue,
+                                },
+                                source: pane::LoadingSource::Reconnect,
+                            };
+                        } else {
+                            pane_state.status = pane::Status::Ready;
+                        }
+                    }
                 }
             }
             fetcher::FetchUpdate::Error {
@@ -1461,9 +1503,10 @@ impl Dashboard {
 
     fn clear_pending_backfill(&mut self, stream: StreamKind, fetch: fetcher::FetchRange) {
         let (from, to) = match fetch {
-            fetcher::FetchRange::Kline(from, to)
-            | fetcher::FetchRange::OpenInterest(from, to)
-            | fetcher::FetchRange::Trades(from, to) => (from, to),
+            fetcher::FetchRange::Kline(from, to) | fetcher::FetchRange::Trades(from, to) => {
+                (from, to)
+            }
+            fetcher::FetchRange::OpenInterest { from, to, .. } => (from, to),
             fetcher::FetchRange::BubbleSummary { from, to, .. } => (from, to),
         };
 
@@ -1499,12 +1542,17 @@ impl Dashboard {
                 if let Some(c) = chart {
                     // Update loading status
                     match &mut pane_state.status {
-                        pane::Status::Loading(InfoKind::FetchingTrades(count)) => {
+                        pane::Status::Loading {
+                            info: InfoKind::FetchingTrades(count),
+                            ..
+                        } => {
                             *count += trades.len();
                         }
                         _ => {
-                            pane_state.status =
-                                pane::Status::Loading(InfoKind::FetchingTrades(trades.len()));
+                            pane_state.status = pane::Status::Loading {
+                                info: InfoKind::FetchingTrades(trades.len()),
+                                source: pane::LoadingSource::Historical,
+                            };
                         }
                     }
 
@@ -2075,6 +2123,9 @@ impl Dashboard {
     ) -> Task<Message> {
         /// Minimum gap (ms) to bother backfilling; avoids tiny useless fetches.
         const MIN_BACKFILL_GAP_MS: u64 = 1_000;
+        /// Routine reconnect repairs stay silent. Only a meaningful period
+        /// without live data gets a visible recovery indicator.
+        const RECONNECT_ACTIVITY_THRESHOLD_MS: u64 = 5_000;
         /// Keeps each trade worker comfortably below its global timeout. Chunks
         /// for the same pane/range are chained and therefore run sequentially.
         const TRADE_BACKFILL_CHUNK_MS: u64 = 15 * 60 * 1_000;
@@ -2135,6 +2186,7 @@ impl Dashboard {
             let full_from = last_t.saturating_add(1);
             let full_to = now;
             let gap_ms = full_to.saturating_diff(full_from);
+            let show_activity = gap_ms >= RECONNECT_ACTIVITY_THRESHOLD_MS;
 
             if gap_ms < MIN_BACKFILL_GAP_MS {
                 log::info!(
@@ -2256,9 +2308,7 @@ impl Dashboard {
 
                 for (chunk_from, chunk_to) in chunk_ranges {
                     let pending_overlap = self.pending_backfills.keys().find(|(s, ef, et)| {
-                        *s == *stream
-                            && *ef <= chunk_to.as_u64()
-                            && *et >= chunk_from.as_u64()
+                        *s == *stream && *ef <= chunk_to.as_u64() && *et >= chunk_from.as_u64()
                     });
 
                     if let Some((_, ef, et)) = pending_overlap {
@@ -2334,6 +2384,7 @@ impl Dashboard {
                         Message::BackfillFetchUpdate {
                             pane_ids: target_panes.clone(),
                             stream: stream_kind,
+                            show_activity,
                             update,
                         }
                     }));
@@ -2475,18 +2526,22 @@ impl From<fetcher::FetchUpdate> for Message {
     fn from(update: fetcher::FetchUpdate) -> Self {
         match update {
             fetcher::FetchUpdate::Status { pane_id, status } => match status {
-                fetcher::FetchTaskStatus::Loading(info) => {
-                    Message::ChangePaneStatus(pane_id, pane::Status::Loading(info))
-                }
+                fetcher::FetchTaskStatus::Loading(info) => Message::ChangePaneStatus(
+                    pane_id,
+                    pane::Status::Loading {
+                        info,
+                        source: pane::LoadingSource::Historical,
+                    },
+                ),
                 fetcher::FetchTaskStatus::Completed {
                     req_id,
                     fetch,
-                    empty_covered_tail,
+                    trade_outcome,
                 } => Message::FetchCompleted {
                     pane_id,
                     req_id,
                     fetch,
-                    empty_covered_tail,
+                    trade_outcome,
                 },
             },
             fetcher::FetchUpdate::Data {
