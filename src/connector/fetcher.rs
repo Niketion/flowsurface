@@ -2029,27 +2029,24 @@ pub fn kline_fetch_task(
 
             Task::perform(
                 iced::futures::TryFutureExt::map_err(fetch, |err| err.ui_message()),
-                move |result| match result {
-                    Ok(klines) => {
-                        let data = FetchedData::Klines {
-                            data: klines,
-                            req_id,
-                        };
-                        FetchUpdate::Data {
-                            layout_id,
-                            pane_id,
-                            data,
-                            stream,
-                        }
-                    }
-                    Err(err) => FetchUpdate::Error {
-                        pane_id,
-                        error: err,
-                        req_id,
-                        fetch: range.map(|(from, to)| FetchRange::Kline(from, to)),
-                    },
-                },
+                std::convert::identity,
             )
+            .then(move |result| match result {
+                Ok(klines) => {
+                    let (data, completed) =
+                        kline_success_updates(layout_id, pane_id, stream, req_id, range, klines);
+
+                    // Data must reach every target pane before the terminal update
+                    // clears reconnect activity and global backfill bookkeeping.
+                    Task::done(data).chain(Task::done(completed))
+                }
+                Err(err) => Task::done(FetchUpdate::Error {
+                    pane_id,
+                    error: err,
+                    req_id,
+                    fetch: range.map(|(from, to)| FetchRange::Kline(from, to)),
+                }),
+            })
         }
         _ => {
             log::debug!(
@@ -2062,6 +2059,35 @@ pub fn kline_fetch_task(
     };
 
     update_status.chain(fetch_task)
+}
+
+fn kline_success_updates(
+    layout_id: Uuid,
+    pane_id: Uuid,
+    stream: StreamKind,
+    req_id: Option<Uuid>,
+    range: Option<(UnixMs, UnixMs)>,
+    klines: Vec<Kline>,
+) -> (FetchUpdate, FetchUpdate) {
+    let data = FetchUpdate::Data {
+        layout_id,
+        pane_id,
+        data: FetchedData::Klines {
+            data: klines,
+            req_id,
+        },
+        stream,
+    };
+    let completed = FetchUpdate::Status {
+        pane_id,
+        status: FetchTaskStatus::Completed {
+            req_id,
+            fetch: range.map(|(from, to)| FetchRange::Kline(from, to)),
+            trade_outcome: None,
+        },
+    };
+
+    (data, completed)
 }
 
 pub fn fetch_trades_batched(
@@ -2673,6 +2699,56 @@ mod tests {
             0.001,
             None,
         )
+    }
+
+    #[test]
+    fn successful_kline_fetch_emits_data_then_terminal_completion() {
+        let layout_id = Uuid::new_v4();
+        let pane_id = Uuid::new_v4();
+        let req_id = Uuid::new_v4();
+        let range = (UnixMs::new(1_000), UnixMs::new(61_000));
+        let stream = StreamKind::Kline {
+            ticker_info: ticker_info(),
+            timeframe: Timeframe::M1,
+        };
+
+        let (first, second) = kline_success_updates(
+            layout_id,
+            pane_id,
+            stream,
+            Some(req_id),
+            Some(range),
+            Vec::new(),
+        );
+
+        assert!(matches!(
+            first,
+            FetchUpdate::Data {
+                layout_id: actual_layout,
+                pane_id: actual_pane,
+                stream: actual_stream,
+                data: FetchedData::Klines {
+                    req_id: Some(actual_req),
+                    ..
+                },
+            } if actual_layout == layout_id
+                && actual_pane == pane_id
+                && actual_stream == stream
+                && actual_req == req_id
+        ));
+        assert!(matches!(
+            second,
+            FetchUpdate::Status {
+                pane_id: actual_pane,
+                status: FetchTaskStatus::Completed {
+                    req_id: Some(actual_req),
+                    fetch: Some(FetchRange::Kline(from, to)),
+                    trade_outcome: None,
+                },
+            } if actual_pane == pane_id
+                && actual_req == req_id
+                && (from, to) == range
+        ));
     }
 
     #[test]
