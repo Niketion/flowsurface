@@ -59,8 +59,18 @@ pub enum Effect {
 pub enum Status {
     #[default]
     Ready,
-    Loading(InfoKind),
+    Loading {
+        info: InfoKind,
+        source: LoadingSource,
+    },
     Stale(String),
+}
+
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+pub enum LoadingSource {
+    #[default]
+    Historical,
+    Reconnect,
 }
 
 pub enum Action {
@@ -163,6 +173,36 @@ impl State {
         }
     }
 
+    /// Keep the optional candlestick trade stream in sync with studies that
+    /// consume trades. This also fixes runtime enable/disable without requiring
+    /// an application restart.
+    pub fn reconcile_candlestick_trade_stream(&mut self) {
+        let Some(ticker_info) = self.stream_pair() else {
+            return;
+        };
+        let needs_trades = match &self.content {
+            Content::Kline {
+                indicators,
+                kind: data::chart::KlineChartKind::Candles,
+                ..
+            } => indicators
+                .iter()
+                .any(|indicator| indicator.requires_trades(ticker_info.exchange())),
+            _ => return,
+        };
+        let ResolvedStream::Ready(streams) = &mut self.streams else {
+            return;
+        };
+        let trade_stream = StreamKind::Trades { ticker_info };
+        if needs_trades {
+            if !streams.contains(&trade_stream) {
+                streams.push(trade_stream);
+            }
+        } else {
+            streams.retain(|stream| !matches!(stream, StreamKind::Trades { .. }));
+        }
+    }
+
     pub fn set_content_and_streams(
         &mut self,
         tickers: Vec<TickerInfo>,
@@ -200,12 +240,13 @@ impl State {
             let trades_stream = |derived_plan: &PaneSetup| StreamKind::Trades {
                 ticker_info: derived_plan.ticker_info,
             };
-            let volume_bubbles_enabled = self
-                .settings
-                .visual_config
-                .as_ref()
-                .and_then(|cfg| cfg.kline())
-                .is_some_and(|cfg| cfg.volume_bubbles.enabled);
+            let trade_overlay_enabled = matches!(
+                &self.content,
+                Content::Kline { indicators, .. }
+                    if indicators.iter().any(|indicator| indicator.requires_trades(
+                        derived_plan.ticker_info.exchange()
+                    ))
+            );
 
             match kind {
                 ContentKind::HeatmapChart => {
@@ -257,7 +298,7 @@ impl State {
 
                     let time_basis_stream = |tf| {
                         let mut streams = vec![kline_stream(derived_plan.ticker_info, tf)];
-                        if volume_bubbles_enabled {
+                        if trade_overlay_enabled {
                             streams.push(trades_stream(&derived_plan));
                         }
                         streams
@@ -421,12 +462,13 @@ impl State {
 
         self.content = content;
         self.streams = ResolvedStream::Ready(streams.clone());
-        let final_volume_bubbles_enabled = self
-            .settings
-            .visual_config
-            .as_ref()
-            .and_then(|cfg| cfg.kline())
-            .is_some_and(|cfg| cfg.volume_bubbles.enabled);
+        let final_trade_overlays = matches!(
+            &self.content,
+            Content::Kline { indicators, .. }
+                if indicators.iter().any(|indicator| indicator.requires_trades(
+                    base_ticker.exchange()
+                ))
+        );
 
         log::info!(
             "STREAM PaneContent | pane={} content={kind:?} base_ticker={} basis={:?} tick_multiplier={:?} streams={}",
@@ -438,9 +480,9 @@ impl State {
         );
         if matches!(kind, ContentKind::CandlestickChart) {
             log::debug!(
-                "STREAM Candlestick | pane={} volume_bubbles_enabled={} trades_stream_included={}",
+                "STREAM Candlestick | pane={} trade_overlay_enabled={} trades_stream_included={}",
                 fetcher::short_id(self.id),
-                final_volume_bubbles_enabled,
+                final_trade_overlays,
                 streams
                     .iter()
                     .any(|stream| matches!(stream, StreamKind::Trades { .. }))
@@ -602,13 +644,13 @@ impl State {
     pub fn mark_backfill_completed(
         &mut self,
         fetch: Option<crate::connector::fetcher::FetchRange>,
-        empty_covered_tail: Option<(exchange::UnixMs, exchange::UnixMs)>,
+        trade_outcome: crate::connector::fetcher::TradeFetchOutcome,
     ) {
         if let Content::Kline {
             chart: Some(chart), ..
         } = &mut self.content
         {
-            chart.complete_backfill(fetch, empty_covered_tail);
+            chart.complete_backfill(fetch, trade_outcome);
         }
         self.status = Status::Ready;
     }
@@ -1100,11 +1142,13 @@ impl State {
                     };
 
                     let indicator_modal = if self.modal == Some(Modal::Indicators) {
-                        Some(modal::indicators::view(
+                        Some(modal::indicators::view_kline(
                             id,
                             self,
                             indicators,
                             self.stream_pair().map(|i| i.ticker.market_type()),
+                            chart.visual_config(),
+                            chart.volume_bubble_qty_scale(),
                         ))
                     } else {
                         None
@@ -1227,18 +1271,40 @@ impl State {
         };
 
         match &self.status {
-            Status::Loading(InfoKind::FetchingKlines) => {
-                top_left_buttons = top_left_buttons.push(text("Fetching Klines..."));
-            }
-            Status::Loading(InfoKind::FetchingTrades(count)) => {
-                top_left_buttons =
-                    top_left_buttons.push(text(format!("Fetching Trades... {count} fetched")));
-            }
-            Status::Loading(InfoKind::FetchingBubbleSummaries) => {
-                top_left_buttons = top_left_buttons.push(text("Fetching Bubble summaries..."));
-            }
-            Status::Loading(InfoKind::FetchingOI) => {
-                top_left_buttons = top_left_buttons.push(text("Fetching Open Interest..."));
+            Status::Loading { info, source } => {
+                let action = match (source, info) {
+                    (LoadingSource::Historical, InfoKind::FetchingKlines) => {
+                        "Loading historical candlesticks".to_string()
+                    }
+                    (LoadingSource::Historical, InfoKind::FetchingTrades(count)) => {
+                        format!("Loading historical trades ({count} received)")
+                    }
+                    (LoadingSource::Historical, InfoKind::FetchingBubbleSummaries) => {
+                        "Analyzing historical trades for volume bubbles".to_string()
+                    }
+                    (LoadingSource::Historical, InfoKind::FetchingOI) => {
+                        "Loading historical open interest".to_string()
+                    }
+                    (LoadingSource::Reconnect, InfoKind::FetchingKlines) => {
+                        "Connection restored: recovering missed candlesticks".to_string()
+                    }
+                    (LoadingSource::Reconnect, InfoKind::FetchingTrades(count)) => {
+                        format!("Connection restored: recovering missed trades ({count} received)")
+                    }
+                    (LoadingSource::Reconnect, InfoKind::FetchingBubbleSummaries) => {
+                        "Connection restored: rebuilding missed volume bubbles".to_string()
+                    }
+                    (LoadingSource::Reconnect, InfoKind::FetchingOI) => {
+                        "Connection restored: recovering missed open interest".to_string()
+                    }
+                };
+                let indicator = iced::widget::tooltip(
+                    widget::loading_spinner(),
+                    container(text(action)).style(style::tooltip).padding(8),
+                    tooltip::Position::Bottom,
+                )
+                .delay(widget::DEFAULT_TOOLTIP_DELAY);
+                top_left_buttons = top_left_buttons.push(indicator);
             }
             Status::Stale(msg) => {
                 top_left_buttons = top_left_buttons.push(text(msg));
@@ -1336,7 +1402,17 @@ impl State {
                 _ => {}
             },
             Event::ToggleIndicator(ind) => {
+                let exchange = self.stream_pair().map(|ticker| ticker.exchange());
+                let refresh_streams = matches!(
+                    (ind, exchange),
+                    (UiIndicator::Kline(indicator), Some(exchange))
+                        if indicator.requires_trades(exchange)
+                );
                 self.content.toggle_indicator(ind);
+                if refresh_streams {
+                    self.reconcile_candlestick_trade_stream();
+                    return Some(Effect::RefreshStreams);
+                }
             }
             Event::DeleteNotification(idx) => {
                 if idx < self.notifications.len() {
@@ -1906,7 +1982,7 @@ impl State {
             FetchRange::Trades(_, _)
             | FetchRange::BubbleSummary { .. }
             | FetchRange::Kline(_, _)
-            | FetchRange::OpenInterest(_, _) => {
+            | FetchRange::OpenInterest { .. } => {
                 matches!(self.content, Content::Kline { chart: Some(_), .. })
             }
         }
@@ -2206,19 +2282,19 @@ impl Content {
             let main_chart_split: f32 = 0.8;
             let mut splits_vec = vec![main_chart_split];
 
-            if !enabled_indicators.is_empty() {
-                let num_indicators = enabled_indicators.len();
+            let num_indicators = enabled_indicators
+                .iter()
+                .filter(|indicator| !indicator.is_overlay())
+                .count();
+            if num_indicators > 0 {
+                let indicator_total_height_ratio = 1.0 - main_chart_split;
+                let height_per_indicator_pane =
+                    indicator_total_height_ratio / num_indicators as f32;
 
-                if num_indicators > 0 {
-                    let indicator_total_height_ratio = 1.0 - main_chart_split;
-                    let height_per_indicator_pane =
-                        indicator_total_height_ratio / num_indicators as f32;
-
-                    let mut current_split_pos = main_chart_split;
-                    for _ in 0..(num_indicators - 1) {
-                        current_split_pos += height_per_indicator_pane;
-                        splits_vec.push(current_split_pos);
-                    }
+                let mut current_split_pos = main_chart_split;
+                for _ in 0..(num_indicators - 1) {
+                    current_split_pos += height_per_indicator_pane;
+                    splits_vec.push(current_split_pos);
                 }
             }
             splits_vec
@@ -2397,26 +2473,9 @@ impl Content {
 
     pub fn change_visual_config(&mut self, config: VisualConfig) -> bool {
         match (self, config) {
-            (
-                Content::Kline {
-                    chart: Some(c),
-                    kind,
-                    ..
-                },
-                VisualConfig::Kline(cfg),
-            ) => {
-                let old_bubbles = c.visual_config().volume_bubbles;
-                let should_refresh_streams = matches!(kind, data::chart::KlineChartKind::Candles)
-                    && old_bubbles.enabled != cfg.volume_bubbles.enabled;
-                log::debug!(
-                    "CHART BubblesConfig | old_enabled={} new_enabled={} old_session={:?} new_session={:?} refresh_streams={should_refresh_streams}",
-                    old_bubbles.enabled,
-                    cfg.volume_bubbles.enabled,
-                    old_bubbles.session,
-                    cfg.volume_bubbles.session
-                );
+            (Content::Kline { chart: Some(c), .. }, VisualConfig::Kline(cfg)) => {
                 c.set_visual_config(cfg);
-                should_refresh_streams
+                false
             }
             (Content::Heatmap { chart: Some(c), .. }, VisualConfig::Heatmap(cfg)) => {
                 c.set_visual_config(cfg);

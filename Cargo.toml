@@ -41,6 +41,7 @@ iced = { version = "0.14.0", default-features = false, features = [
     "wgpu",
     "tokio",
     "canvas",
+    "image",
     "sipper",
     "advanced",
     "unconditional-rendering",
@@ -53,6 +54,8 @@ chrono.workspace = true
 chrono-tz = "0.10.4"
 serde_json.workspace = true
 serde.workspace = true
+bincode = { version = "2.0.1", features = ["serde"] }
+redb = "4.1.0"
 thiserror.workspace = true
 log.workspace = true
 uuid.workspace = true
@@ -64,6 +67,7 @@ url.workspace = true
 fern = "0.7.1"
 rodio = { version = "0.22.2", default-features = false, features = [ "playback", "wav" ]}
 tokio = { version = "1.52", default-features = false, features = ["time"] }
+gif = "0.14.2"
 
 bytemuck = "1.25.0"
 iced_wgpu = "0.14.0"

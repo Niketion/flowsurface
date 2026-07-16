@@ -7,7 +7,10 @@ use crate::widget::{classic_slider_row, labeled_slider};
 use crate::{style, tooltip, widget::scrollable_content};
 
 use data::chart::heatmap::HeatmapStudy;
-use data::chart::kline::{BubbleColorMode, FootprintStudy, VolumeBubbleSession};
+use data::chart::kline::{
+    BubbleColorMode, FootprintStudy, SessionProfileInterval, SessionProfileMode,
+    SessionProfilePlacement, VolumeBubbleSession,
+};
 use data::chart::{
     KlineChartKind,
     heatmap::{self, CoalesceKind},
@@ -630,6 +633,215 @@ pub fn kline_cfg_view<'a>(
     let content = match kind {
         KlineChartKind::Candles => {
             let bubbles_cfg = cfg.volume_bubbles;
+            let svp_cfg = cfg.session_volume_profile;
+            let session_volume_profile_section = {
+                let enabled = checkbox(svp_cfg.enabled)
+                    .label("Show session volume profile")
+                    .on_toggle(move |enabled| {
+                        Message::VisualConfigChanged(
+                            pane,
+                            VisualConfig::Kline(data::chart::kline::Config {
+                                session_volume_profile:
+                                    data::chart::kline::SessionVolumeProfileConfig {
+                                        enabled,
+                                        ..svp_cfg
+                                    },
+                                ..cfg
+                            }),
+                            false,
+                        )
+                    });
+                let interval = pick_list(
+                    SessionProfileInterval::ALL,
+                    Some(svp_cfg.interval),
+                    move |interval| {
+                        Message::VisualConfigChanged(
+                            pane,
+                            VisualConfig::Kline(data::chart::kline::Config {
+                                session_volume_profile:
+                                    data::chart::kline::SessionVolumeProfileConfig {
+                                        interval,
+                                        ..svp_cfg
+                                    },
+                                ..cfg
+                            }),
+                            false,
+                        )
+                    },
+                );
+                let placement = pick_list(
+                    SessionProfilePlacement::ALL,
+                    Some(svp_cfg.placement),
+                    move |placement| {
+                        Message::VisualConfigChanged(
+                            pane,
+                            VisualConfig::Kline(data::chart::kline::Config {
+                                session_volume_profile:
+                                    data::chart::kline::SessionVolumeProfileConfig {
+                                        placement,
+                                        ..svp_cfg
+                                    },
+                                ..cfg
+                            }),
+                            false,
+                        )
+                    },
+                );
+                let mode = pick_list(SessionProfileMode::ALL, Some(svp_cfg.mode), move |mode| {
+                    Message::VisualConfigChanged(
+                        pane,
+                        VisualConfig::Kline(data::chart::kline::Config {
+                            session_volume_profile:
+                                data::chart::kline::SessionVolumeProfileConfig { mode, ..svp_cfg },
+                            ..cfg
+                        }),
+                        false,
+                    )
+                });
+                let width = labeled_slider(
+                    "Profile width",
+                    10.0..=90.0,
+                    svp_cfg.width_percent,
+                    move |width_percent| {
+                        Message::VisualConfigChanged(
+                            pane,
+                            VisualConfig::Kline(data::chart::kline::Config {
+                                session_volume_profile:
+                                    data::chart::kline::SessionVolumeProfileConfig {
+                                        width_percent,
+                                        ..svp_cfg
+                                    },
+                                ..cfg
+                            }),
+                            false,
+                        )
+                    },
+                    |value| format!("{value:.0}%"),
+                    Some(1.0),
+                );
+                let value_area = labeled_slider(
+                    "Value area",
+                    50.0..=95.0,
+                    svp_cfg.value_area_percent,
+                    move |value_area_percent| {
+                        Message::VisualConfigChanged(
+                            pane,
+                            VisualConfig::Kline(data::chart::kline::Config {
+                                session_volume_profile:
+                                    data::chart::kline::SessionVolumeProfileConfig {
+                                        value_area_percent,
+                                        ..svp_cfg
+                                    },
+                                ..cfg
+                            }),
+                            false,
+                        )
+                    },
+                    |value| format!("{value:.0}%"),
+                    Some(1.0),
+                );
+                let row_size = labeled_slider(
+                    "Ticks per row",
+                    1.0..=50.0,
+                    svp_cfg.row_size_ticks as f32,
+                    move |value| {
+                        Message::VisualConfigChanged(
+                            pane,
+                            VisualConfig::Kline(data::chart::kline::Config {
+                                session_volume_profile:
+                                    data::chart::kline::SessionVolumeProfileConfig {
+                                        row_size_ticks: value as u16,
+                                        ..svp_cfg
+                                    },
+                                ..cfg
+                            }),
+                            false,
+                        )
+                    },
+                    |value| format!("{value:.0}"),
+                    Some(1.0),
+                );
+                let poc = checkbox(svp_cfg.show_poc)
+                    .label("POC")
+                    .on_toggle(move |show_poc| {
+                        Message::VisualConfigChanged(
+                            pane,
+                            VisualConfig::Kline(data::chart::kline::Config {
+                                session_volume_profile:
+                                    data::chart::kline::SessionVolumeProfileConfig {
+                                        show_poc,
+                                        ..svp_cfg
+                                    },
+                                ..cfg
+                            }),
+                            false,
+                        )
+                    });
+                let va = checkbox(svp_cfg.show_value_area)
+                    .label("VAH / VAL")
+                    .on_toggle(move |show_value_area| {
+                        Message::VisualConfigChanged(
+                            pane,
+                            VisualConfig::Kline(data::chart::kline::Config {
+                                session_volume_profile:
+                                    data::chart::kline::SessionVolumeProfileConfig {
+                                        show_value_area,
+                                        ..svp_cfg
+                                    },
+                                ..cfg
+                            }),
+                            false,
+                        )
+                    });
+                let vwap =
+                    checkbox(svp_cfg.show_vwap)
+                        .label("Session VWAP")
+                        .on_toggle(move |show_vwap| {
+                            Message::VisualConfigChanged(
+                                pane,
+                                VisualConfig::Kline(data::chart::kline::Config {
+                                    session_volume_profile:
+                                        data::chart::kline::SessionVolumeProfileConfig {
+                                            show_vwap,
+                                            ..svp_cfg
+                                        },
+                                    ..cfg
+                                }),
+                                false,
+                            )
+                        });
+                let high_low = checkbox(svp_cfg.show_session_high_low)
+                    .label("Session high / low")
+                    .on_toggle(move |show_session_high_low| {
+                        Message::VisualConfigChanged(
+                            pane,
+                            VisualConfig::Kline(data::chart::kline::Config {
+                                session_volume_profile:
+                                    data::chart::kline::SessionVolumeProfileConfig {
+                                        show_session_high_low,
+                                        ..svp_cfg
+                                    },
+                                ..cfg
+                            }),
+                            false,
+                        )
+                    });
+                column![
+                    text("Session volume profile").size(crate::style::text_size::SECTION),
+                    enabled,
+                    text("Uses the shared trades dataset; default session is hourly.")
+                        .size(crate::style::text_size::SMALL),
+                    interval,
+                    placement,
+                    mode,
+                    width,
+                    value_area,
+                    row_size,
+                    row![poc, va].spacing(12),
+                    row![vwap, high_low].spacing(12),
+                ]
+                .spacing(8)
+            };
             let volume_bubbles_section = {
                 let enabled_checkbox = tooltip(
                     checkbox(bubbles_cfg.enabled)
@@ -810,9 +1022,13 @@ pub fn kline_cfg_view<'a>(
                 .spacing(8)
             };
 
+            // Overlay configuration lives exclusively in the Indicators modal.
+            // Keep these values consumed during the compatibility transition so
+            // old serialized configs remain readable without presenting a
+            // second settings surface.
+            let _legacy_overlay_sections = (session_volume_profile_section, volume_bubbles_section);
             split_column![
                 display_readout_section,
-                volume_bubbles_section,
                 row![
                     space::horizontal(),
                     sync_all_button(pane, VisualConfig::Kline(cfg))

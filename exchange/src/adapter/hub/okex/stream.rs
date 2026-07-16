@@ -176,6 +176,7 @@ impl WsAdapter for TradeAdapter {
                     let qty = qty_norm.normalize_qty(de_trade.qty, de_trade.price);
 
                     let trade = Trade {
+                        id: None,
                         time: de_trade.time.into(),
                         is_sell: de_trade.is_sell == "sell" || de_trade.is_sell == "SELL",
                         price,

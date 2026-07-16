@@ -243,6 +243,7 @@ impl WsAdapter for TradeAdapter {
                     self.buffer.push(
                         *ticker,
                         Trade {
+                            id: None,
                             time: hl_trade.time.into(),
                             is_sell: hl_trade.side == "A",
                             price,

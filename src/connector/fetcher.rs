@@ -1,7 +1,9 @@
+use super::market_data::{DataRequirement, DataSet, RefreshPolicy, RequestKey, TimeRange};
+use super::persistent_cache::{MarketDataCache, market_cache, merge_bubble_summaries};
 use data::chart::kline::{BubbleCandidate, BubbleVolumeSummary};
 use exchange::adapter::{AdapterError, AdapterHandles, Exchange, StreamKind};
 use exchange::unit::{Price, PriceStep, Qty};
-use exchange::{Kline, OpenInterest, TickerInfo, Trade, UnixMs};
+use exchange::{Kline, OpenInterest, TickerInfo, Timeframe, Trade, UnixMs};
 use iced::{
     Task,
     task::{Handle, Straw, sipper},
@@ -113,8 +115,12 @@ pub fn format_fetch_range(fetch: &FetchRange) -> String {
         FetchRange::Kline(from, to) => {
             format!("Kline {}", format_time_range(*from, *to))
         }
-        FetchRange::OpenInterest(from, to) => {
-            format!("OI {}", format_time_range(*from, *to))
+        FetchRange::OpenInterest {
+            from,
+            to,
+            timeframe,
+        } => {
+            format!("OI {} source={timeframe}", format_time_range(*from, *to))
         }
         FetchRange::Trades(from, to) => {
             format!("Trades {}", format_time_range(*from, *to))
@@ -171,9 +177,64 @@ const TRADE_NO_PROGRESS_MAX_CONSECUTIVE: usize = 3;
 /// have already been collected, treat the fetch as complete rather than
 /// retrying the same tiny tail indefinitely.
 const NO_PROGRESS_REMAINING_EPSILON_MS: u64 = 1000;
+const TRADE_GAP_COALESCE_BRIDGE_MS: u64 = 60_000;
+
+/// Merge nearby uncovered cache slices before REST pagination. The original
+/// gaps are still used to decide which records are new to the caller.
+fn coalesce_trade_fetch_gaps(
+    gaps: &[(UnixMs, UnixMs)],
+    max_bridge_ms: u64,
+) -> Vec<(UnixMs, UnixMs)> {
+    let mut coalesced: Vec<(UnixMs, UnixMs)> = Vec::with_capacity(gaps.len());
+    for &(from, to) in gaps {
+        if from >= to {
+            continue;
+        }
+        if let Some((_, previous_to)) = coalesced.last_mut()
+            && from.saturating_diff(*previous_to) <= max_bridge_ms
+        {
+            *previous_to = (*previous_to).max(to);
+        } else {
+            coalesced.push((from, to));
+        }
+    }
+    coalesced
+}
+
+fn trade_time_is_in_gaps(time: UnixMs, gaps: &[(UnixMs, UnixMs)]) -> bool {
+    gaps.iter().any(|(from, to)| time >= *from && time < *to)
+}
 
 /// How long to remember that a trade range returned empty.
 const EMPTY_TRADE_FETCH_TTL: Duration = Duration::from_secs(60);
+
+/// Keep only records inside the requested slice and remove REST pagination
+/// overlap by stable exchange id. Id-less records are deliberately preserved:
+/// equal price/qty/time values can still represent distinct real executions.
+fn filter_new_fetched_trades(
+    mut batch: Vec<Trade>,
+    from: UnixMs,
+    to_exclusive: UnixMs,
+    last_trade_id: &mut Option<u64>,
+) -> (Vec<Trade>, usize) {
+    let raw_count = batch.len();
+    batch.sort_by_key(|trade| (trade.time, trade.id));
+    batch.retain(|trade| {
+        if trade.time < from || trade.time >= to_exclusive {
+            return false;
+        }
+        let Some(id) = trade.id else {
+            return true;
+        };
+        if last_trade_id.is_some_and(|last| id <= last) {
+            return false;
+        }
+        *last_trade_id = Some((*last_trade_id).map_or(id, |last| last.max(id)));
+        true
+    });
+    let discarded = raw_count.saturating_sub(batch.len());
+    (batch, discarded)
+}
 
 #[derive(Debug, Clone)]
 pub enum FetchedData {
@@ -326,6 +387,12 @@ impl RequestHandler {
             matches!(request.fetch_type, FetchRange::Trades(_, _))
                 && matches!(request.status, RequestStatus::Pending)
         })
+    }
+
+    pub fn is_trade_request(&self, id: Uuid) -> bool {
+        self.requests
+            .get(&id)
+            .is_some_and(|request| matches!(request.fetch_type, FetchRange::Trades(_, _)))
     }
 
     fn cleanup_empty_trade_fetches(&mut self) {
@@ -925,7 +992,11 @@ impl RequestHandler {
 #[derive(PartialEq, Debug, Clone, Copy)]
 pub enum FetchRange {
     Kline(UnixMs, UnixMs),
-    OpenInterest(UnixMs, UnixMs),
+    OpenInterest {
+        from: UnixMs,
+        to: UnixMs,
+        timeframe: Timeframe,
+    },
     Trades(UnixMs, UnixMs),
     BubbleSummary {
         from: UnixMs,
@@ -939,11 +1010,67 @@ pub enum FetchRange {
 impl FetchRange {
     fn is_valid(&self) -> bool {
         match *self {
-            FetchRange::Kline(from, to)
-            | FetchRange::OpenInterest(from, to)
-            | FetchRange::Trades(from, to) => from < to,
+            FetchRange::Kline(from, to) | FetchRange::Trades(from, to) => from < to,
+            FetchRange::OpenInterest { from, to, .. } => from < to,
             FetchRange::BubbleSummary { from, to, .. } => from < to,
         }
+    }
+
+    /// Compatibility bridge used while legacy chart callers are migrated to
+    /// declaring `DataRequirement` directly. Bubble summaries deliberately map
+    /// to raw trades: aggregation is a derivation concern, not a transport.
+    pub fn requirement(self, stream: StreamKind) -> Option<(RequestKey, DataRequirement)> {
+        let (dataset, from, to) = match (self, stream) {
+            (FetchRange::Kline(from, to), StreamKind::Kline { timeframe, .. }) => (
+                DataSet::Klines {
+                    timeframe_ms: timeframe.to_milliseconds(),
+                },
+                from,
+                to,
+            ),
+            (
+                FetchRange::OpenInterest {
+                    from,
+                    to,
+                    timeframe,
+                },
+                StreamKind::Kline { ticker_info, .. },
+            ) => {
+                let source_stream = StreamKind::Kline {
+                    ticker_info,
+                    timeframe,
+                };
+                let range = TimeRange::new(from, to)?;
+                let dataset = DataSet::OpenInterest;
+                let key = RequestKey::new(source_stream, dataset)?;
+                return Some((
+                    key,
+                    DataRequirement {
+                        dataset,
+                        range,
+                        refresh: RefreshPolicy::Historical,
+                    },
+                ));
+            }
+            (FetchRange::Trades(from, to), StreamKind::Trades { .. }) => {
+                (DataSet::Trades, from, to)
+            }
+            (FetchRange::BubbleSummary { from, to, .. }, StreamKind::Kline { ticker_info, .. }) => {
+                return DataRequirement::trades(TimeRange::new(from, to)?)
+                    .with_stream(StreamKind::Trades { ticker_info });
+            }
+            _ => return None,
+        };
+        let range = TimeRange::new(from, to)?;
+        let key = RequestKey::new(stream, dataset)?;
+        Some((
+            key,
+            DataRequirement {
+                dataset,
+                range,
+                refresh: RefreshPolicy::Historical,
+            },
+        ))
     }
 }
 
@@ -972,9 +1099,18 @@ impl FetchRequest {
     fn same_with(&self, other: &FetchRequest) -> bool {
         match (&self.fetch_type, &other.fetch_type) {
             (FetchRange::Kline(s1, e1), FetchRange::Kline(s2, e2)) => e1 == e2 && s1 == s2,
-            (FetchRange::OpenInterest(s1, e1), FetchRange::OpenInterest(s2, e2)) => {
-                e1 == e2 && s1 == s2
-            }
+            (
+                FetchRange::OpenInterest {
+                    from: s1,
+                    to: e1,
+                    timeframe: t1,
+                },
+                FetchRange::OpenInterest {
+                    from: s2,
+                    to: e2,
+                    timeframe: t2,
+                },
+            ) => e1 == e2 && s1 == s2 && t1 == t2,
             (FetchRange::Trades(s1, e1), FetchRange::Trades(s2, e2)) => e1 == e2 && s1 == s2,
             (
                 FetchRange::BubbleSummary {
@@ -1047,11 +1183,49 @@ pub enum FetchTaskStatus {
     Completed {
         req_id: Option<Uuid>,
         fetch: Option<FetchRange>,
-        /// When the worker stopped early due to no-progress near target,
-        /// this carries the unfilled tail range that should be marked
-        /// empty-covered in the negative cache.
-        empty_covered_tail: Option<(UnixMs, UnixMs)>,
+        trade_outcome: Option<TradeFetchOutcome>,
     },
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct TradeFetchOutcome {
+    /// The worker verified every timestamp before this tail. The tail itself
+    /// still needs another pass.
+    pub unfilled_tail: Option<(UnixMs, UnixMs)>,
+    /// A short-lived negative-cache hint. A retryable timeout tail must never
+    /// be treated as an empty market-data interval.
+    pub empty_tail: Option<(UnixMs, UnixMs)>,
+}
+
+impl TradeFetchOutcome {
+    fn retryable(from: UnixMs, to: UnixMs) -> Self {
+        Self {
+            unfilled_tail: Some((from, to)),
+            empty_tail: None,
+        }
+    }
+
+    fn empty(from: UnixMs, to: UnixMs) -> Self {
+        Self {
+            unfilled_tail: Some((from, to)),
+            empty_tail: Some((from, to)),
+        }
+    }
+}
+
+fn interrupted_trade_fetch(
+    requested_from: UnixMs,
+    requested_to: UnixMs,
+    retry_from: UnixMs,
+    reason: String,
+) -> Result<TradeFetchOutcome, AdapterError> {
+    if retry_from > requested_from {
+        Ok(TradeFetchOutcome::retryable(retry_from, requested_to))
+    } else {
+        Err(AdapterError::InvalidRequest(format!(
+            "TimedOut: {reason} without progress"
+        )))
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -1142,13 +1316,32 @@ pub fn request_fetch(
                 format_streams(ready_streams)
             );
         }
-        FetchRange::OpenInterest(from, to) => {
+        FetchRange::OpenInterest {
+            from,
+            to,
+            timeframe,
+        } => {
             let kline_stream = if let Some(s) = stream {
-                Some((s, pane_id))
+                match s {
+                    StreamKind::Kline { ticker_info, .. } => Some((
+                        StreamKind::Kline {
+                            ticker_info,
+                            timeframe,
+                        },
+                        pane_id,
+                    )),
+                    _ => None,
+                }
             } else {
                 ready_streams.iter().find_map(|stream| {
-                    if let StreamKind::Kline { .. } = stream {
-                        Some((*stream, pane_id))
+                    if let StreamKind::Kline { ticker_info, .. } = stream {
+                        Some((
+                            StreamKind::Kline {
+                                ticker_info: *ticker_info,
+                                timeframe,
+                            },
+                            pane_id,
+                        ))
                     } else {
                         None
                     }
@@ -1239,14 +1432,14 @@ pub fn request_fetch(
                             }
                         },
                         move |result| match result {
-                            Ok(empty_covered_tail) => {
+                            Ok(trade_outcome) => {
                                 log::info!(
                                     "TRADE Done | venue={} symbol={} req={} range={} tail={}",
                                     format_venue(&ticker_info),
                                     format_symbol(&ticker_info),
                                     short_id(req_id),
                                     format_time_range(from_time, to_time),
-                                    empty_covered_tail
+                                    trade_outcome.unfilled_tail
                                         .map(|(f, t)| format_time_range(f, t))
                                         .unwrap_or_else(|| "-".to_string())
                                 );
@@ -1255,7 +1448,7 @@ pub fn request_fetch(
                                     status: FetchTaskStatus::Completed {
                                         req_id: Some(req_id),
                                         fetch: Some(FetchRange::Trades(from_time, to_time)),
-                                        empty_covered_tail,
+                                        trade_outcome: Some(trade_outcome),
                                     },
                                 }
                             }
@@ -1425,7 +1618,7 @@ fn bubble_summary_fetch_task(
     });
 
     let fetch = async move {
-        fetch_bubble_summaries(
+        fetch_bubble_summaries_cached(
             handles,
             ticker_info,
             from_time,
@@ -1519,6 +1712,139 @@ pub fn request_fetch_many(
     Task::batch(tasks)
 }
 
+async fn fetch_klines_cached(
+    handles: &AdapterHandles,
+    ticker_info: TickerInfo,
+    timeframe: Timeframe,
+    range: Option<(UnixMs, UnixMs)>,
+) -> Result<Vec<Kline>, AdapterError> {
+    let Some((from, to)) = range else {
+        return handles.fetch_klines(ticker_info, timeframe, None).await;
+    };
+    let to_exclusive = to.saturating_add(1);
+    let Some(cache) = market_cache() else {
+        return handles
+            .fetch_klines(ticker_info, timeframe, Some((from, to)))
+            .await;
+    };
+
+    let cached = cache.read_klines(ticker_info, timeframe, from, to_exclusive);
+    let cache_complete = cached.is_complete();
+    let mut combined = cached.records;
+    for (gap_from, gap_to_exclusive) in cached.gaps {
+        let gap_to = gap_to_exclusive.saturating_sub(1);
+        let mut fetched = handles
+            .fetch_klines(ticker_info, timeframe, Some((gap_from, gap_to)))
+            .await?;
+        fetched.sort_by_key(|kline| kline.time);
+        fetched.dedup_by_key(|kline| kline.time);
+        store_contiguous_klines(
+            cache,
+            ticker_info,
+            timeframe,
+            gap_from,
+            gap_to_exclusive,
+            &fetched,
+        );
+        combined.extend(fetched);
+    }
+    combined.sort_by_key(|kline| kline.time);
+    combined.dedup_by_key(|kline| kline.time);
+    if cache_complete {
+        log::debug!(
+            "KLINE Network Skipped | venue={} symbol={} tf={timeframe:?} range={}",
+            format_venue(&ticker_info),
+            format_symbol(&ticker_info),
+            format_time_range(from, to)
+        );
+    }
+    Ok(combined)
+}
+
+/// Persist only ranges proven by contiguous candles. Storing the complete REST
+/// request around a partial response makes a missing candle look permanently
+/// covered and prevents both the integrity repair and reconnect backfill.
+fn store_contiguous_klines(
+    cache: &MarketDataCache,
+    ticker_info: TickerInfo,
+    timeframe: Timeframe,
+    requested_from: UnixMs,
+    requested_to_exclusive: UnixMs,
+    klines: &[Kline],
+) {
+    let interval = timeframe.to_milliseconds();
+    if interval == 0 || klines.is_empty() {
+        return;
+    }
+
+    let mut run_start = 0usize;
+    for index in 1..=klines.len() {
+        let run_ended = index == klines.len()
+            || klines[index].time > klines[index - 1].time.saturating_add(interval);
+        if !run_ended {
+            continue;
+        }
+
+        let run = &klines[run_start..index];
+        let first = run[0].time;
+        let last = run[run.len() - 1].time;
+        let coverage_from =
+            if first <= requested_from && first.saturating_add(interval) > requested_from {
+                requested_from
+            } else {
+                first.max(requested_from)
+            };
+        let coverage_to = last.saturating_add(interval).min(requested_to_exclusive);
+
+        if coverage_from < coverage_to {
+            cache.store_klines(ticker_info, timeframe, coverage_from, coverage_to, run);
+        }
+        run_start = index;
+    }
+}
+
+async fn fetch_open_interest_cached(
+    handles: &AdapterHandles,
+    ticker_info: TickerInfo,
+    timeframe: Timeframe,
+    range: Option<(UnixMs, UnixMs)>,
+) -> Result<Vec<OpenInterest>, AdapterError> {
+    let Some((from, to)) = range else {
+        return handles
+            .fetch_open_interest(ticker_info, timeframe, None)
+            .await;
+    };
+    let to_exclusive = to.saturating_add(1);
+    let Some(cache) = market_cache() else {
+        return handles
+            .fetch_open_interest(ticker_info, timeframe, Some((from, to)))
+            .await;
+    };
+
+    let cached = cache.read_open_interest(ticker_info, timeframe, from, to_exclusive);
+    let cache_complete = cached.is_complete();
+    let mut combined = cached.records;
+    for (gap_from, gap_to_exclusive) in cached.gaps {
+        let gap_to = gap_to_exclusive.saturating_sub(1);
+        let fetched = handles
+            .fetch_open_interest(ticker_info, timeframe, Some((gap_from, gap_to)))
+            .await?;
+        cache.store_open_interest(ticker_info, timeframe, gap_from, gap_to_exclusive, &fetched);
+        combined.extend(fetched);
+    }
+    combined.sort_by_key(|oi| oi.time);
+    combined.dedup_by_key(|oi| oi.time);
+    if cache_complete {
+        log::debug!(
+            "OI Network Skipped | venue={} symbol={} tf={timeframe:?} range={}",
+            format_venue(&ticker_info),
+            format_symbol(&ticker_info),
+            format_time_range(from, to)
+        );
+    }
+    Ok(combined)
+}
+
 pub fn oi_fetch_task(
     handles: AdapterHandles,
     layout_id: Uuid,
@@ -1548,9 +1874,8 @@ pub fn oi_fetch_task(
                     range.map_or("-".to_string(), |(from, to)| format_time_range(from, to))
                 );
 
-                let result = handles
-                    .fetch_open_interest(ticker_info, timeframe, range)
-                    .await;
+                let result =
+                    fetch_open_interest_cached(&handles, ticker_info, timeframe, range).await;
 
                 match &result {
                     Ok(oi) => {
@@ -1604,7 +1929,11 @@ pub fn oi_fetch_task(
                         pane_id,
                         error: err,
                         req_id,
-                        fetch: range.map(|(from, to)| FetchRange::OpenInterest(from, to)),
+                        fetch: range.map(|(from, to)| FetchRange::OpenInterest {
+                            from,
+                            to,
+                            timeframe,
+                        }),
                     },
                 },
             )
@@ -1649,7 +1978,7 @@ pub fn kline_fetch_task(
                     range.map_or("-".to_string(), |(from, to)| format_time_range(from, to))
                 );
 
-                let mut result = handles.fetch_klines(ticker_info, timeframe, range).await;
+                let mut result = fetch_klines_cached(&handles, ticker_info, timeframe, range).await;
                 let raw_count = result.as_ref().map_or(0, Vec::len);
                 if let (Ok(klines), Some((from, to))) = (&mut result, range) {
                     let timeframe_ms = timeframe.to_milliseconds();
@@ -1742,207 +2071,264 @@ pub fn fetch_trades_batched(
     to_time: UnixMs,
     data_path: PathBuf,
     req_id: Uuid,
-) -> impl Straw<Option<(UnixMs, UnixMs)>, Vec<Trade>, AdapterError> {
+) -> impl Straw<TradeFetchOutcome, Vec<Trade>, AdapterError> {
     let venue = format_venue(&ticker_info);
     let symbol = format_symbol(&ticker_info);
 
     sipper(async move |mut progress| {
-        let mut latest_trade_t = from_time;
         let started = Instant::now();
         let mut total_trades = 0usize;
         let mut request_count = 0usize;
         let mut last_progress_log = Instant::now();
-        let mut consecutive_no_progress: usize = 0;
-        let mut prev_request_from: Option<UnixMs> = None;
-        let mut prev_request_to: Option<UnixMs> = None;
+        let to_exclusive = to_time.saturating_add(1);
+        let (cached_trades, gaps) = if let Some(cache) = market_cache() {
+            let cached = cache.read_trades(ticker_info, from_time, to_exclusive);
+            (cached.records, cached.gaps)
+        } else {
+            (Vec::new(), vec![(from_time, to_exclusive)])
+        };
 
         log::info!(
-            "TRADE Worker | {venue} {symbol} req={} range={} path={}",
+            "TRADE Worker | {venue} {symbol} req={} range={} path={} cached={} gaps={}",
             short_id(req_id),
             format_time_range(from_time, to_time),
-            data_path.display()
+            data_path.display(),
+            cached_trades.len(),
+            gaps.len()
         );
 
-        while latest_trade_t < to_time {
-            // Overall worker timeout: bail out if we've been running too long.
-            if started.elapsed() >= TRADE_WORKER_TIMEOUT {
-                log::error!(
-                    "TRADE Worker Timeout | venue={venue} symbol={symbol} req={} range={} elapsed={} requests={request_count} trades={total_trades} latest={} target_to={}",
-                    short_id(req_id),
-                    format_time_range(from_time, to_time),
-                    format_duration_ms(started.elapsed().as_millis() as u64),
-                    format_time_short(latest_trade_t),
-                    format_time_short(to_time)
-                );
-                return Err(AdapterError::InvalidRequest(format!(
-                    "TimedOut: worker exceeded {}",
-                    format_duration_ms(TRADE_WORKER_TIMEOUT.as_millis() as u64)
-                )));
-            }
+        let mut final_latest = cached_trades
+            .last()
+            .map_or(from_time, |trade| trade.time.min(to_time));
+        for chunk in cached_trades.chunks(10_000) {
+            total_trades = total_trades.saturating_add(chunk.len());
+            let () = progress.send(chunk.to_vec()).await;
+        }
 
-            request_count += 1;
-
-            // Safety: stop if we're about to make the exact same request as
-            // last time (same startTime/endTime).  This catches edge cases
-            // where cursor advancement was skipped.
-            if prev_request_from == Some(latest_trade_t) && prev_request_to == Some(to_time) {
-                log::warn!(
-                    "TRADE Stop | venue={venue} symbol={symbol} reason=duplicate_request_bounds from={} target_to={} requests={request_count} trades={total_trades} duration={}",
-                    format_time_short(latest_trade_t),
-                    format_time_short(to_time),
-                    format_duration_ms(started.elapsed().as_millis() as u64)
-                );
-                break;
-            }
-            prev_request_from = Some(latest_trade_t);
-            prev_request_to = Some(to_time);
-
-            let request_started = Instant::now();
-            log::debug!(
-                "TRADE Request | venue={venue} symbol={symbol} req={} request_idx={request_count} from={} target_to={}",
+        let network_started = Instant::now();
+        let network_gaps = coalesce_trade_fetch_gaps(&gaps, TRADE_GAP_COALESCE_BRIDGE_MS);
+        if network_gaps.len() < gaps.len() {
+            log::info!(
+                "TRADE GapCoalesce | venue={venue} symbol={symbol} req={} original={} coalesced={}",
                 short_id(req_id),
-                format_time_short(latest_trade_t),
-                format_time_short(to_time)
+                gaps.len(),
+                network_gaps.len()
             );
+        }
+        for (gap_from, gap_to_exclusive) in network_gaps {
+            if gap_from >= gap_to_exclusive {
+                continue;
+            }
+            let target_to = gap_to_exclusive.saturating_sub(1);
+            let mut latest_trade_t = gap_from;
+            let mut consecutive_no_progress = 0usize;
+            let mut prev_request_from = None;
+            let mut prev_request_to = None;
+            let mut last_trade_id = None;
 
-            let fetch_result = tokio::time::timeout(
-                TRADE_REST_REQUEST_TIMEOUT,
-                handles.fetch_trades(ticker_info, latest_trade_t, Some(data_path.clone())),
-            )
-            .await;
-
-            match fetch_result {
-                Err(_) => {
-                    let elapsed = request_started.elapsed().as_millis() as u64;
-                    log::error!(
-                        "TRADE TimedOut | venue={venue} symbol={symbol} req={} request_idx={request_count} from={} target_to={} timeout={} duration={}",
-                        short_id(req_id),
-                        format_time_short(latest_trade_t),
-                        format_time_short(to_time),
-                        format_duration_ms(TRADE_REST_REQUEST_TIMEOUT.as_millis() as u64),
-                        format_duration_ms(elapsed)
-                    );
-                    return Err(AdapterError::InvalidRequest(format!(
-                        "TimedOut: REST trade fetch exceeded {}",
-                        format_duration_ms(TRADE_REST_REQUEST_TIMEOUT.as_millis() as u64)
-                    )));
+            loop {
+                if latest_trade_t > target_to {
+                    break;
                 }
-                Ok(Ok(batch)) => {
-                    let elapsed = request_started.elapsed().as_millis() as u64;
-                    let prev_latest_trade_t = latest_trade_t;
-                    log::debug!(
-                        "TRADE Response | venue={venue} symbol={symbol} req={} request_idx={request_count} trades={} first={} last={} duration={}",
+                // Overall worker timeout covers all network gaps, but cached
+                // batches are emitted immediately and do not consume it.
+                if network_started.elapsed() >= TRADE_WORKER_TIMEOUT {
+                    log::warn!(
+                        "TRADE Worker Yield | venue={venue} symbol={symbol} req={} range={} elapsed={} requests={request_count} trades={total_trades} retry_from={} target_to={}",
                         short_id(req_id),
-                        batch.len(),
-                        format_optional_time(batch.first().map(|trade| trade.time)),
-                        format_optional_time(batch.last().map(|trade| trade.time)),
-                        format_duration_ms(elapsed)
+                        format_time_range(from_time, to_time),
+                        format_duration_ms(started.elapsed().as_millis() as u64),
+                        format_time_short(latest_trade_t),
+                        format_time_short(to_time)
                     );
+                    return interrupted_trade_fetch(
+                        from_time,
+                        to_time,
+                        latest_trade_t,
+                        format!(
+                            "worker exceeded {}",
+                            format_duration_ms(TRADE_WORKER_TIMEOUT.as_millis() as u64)
+                        ),
+                    );
+                }
 
-                    if batch.is_empty() {
-                        log::warn!(
-                            "TRADE Stop | venue={venue} symbol={symbol} reason=empty_batch_before_target latest={} target_to={} remaining_ms={} requests={request_count} trades={total_trades} total_duration={}",
-                            format_time_short(latest_trade_t),
-                            format_time_short(to_time),
-                            to_time.saturating_diff(latest_trade_t),
-                            format_duration_ms(started.elapsed().as_millis() as u64)
+                request_count += 1;
+                if prev_request_from == Some(latest_trade_t) && prev_request_to == Some(target_to) {
+                    log::warn!(
+                        "TRADE Stop | venue={venue} symbol={symbol} reason=duplicate_request_bounds from={} target_to={} requests={request_count} trades={total_trades} duration={}",
+                        format_time_short(latest_trade_t),
+                        format_time_short(target_to),
+                        format_duration_ms(started.elapsed().as_millis() as u64)
+                    );
+                    break;
+                }
+                prev_request_from = Some(latest_trade_t);
+                prev_request_to = Some(target_to);
+
+                let request_from = latest_trade_t;
+                let request_started = Instant::now();
+                log::debug!(
+                    "TRADE Request | venue={venue} symbol={symbol} req={} request_idx={request_count} from={} target_to={}",
+                    short_id(req_id),
+                    format_time_short(request_from),
+                    format_time_short(target_to)
+                );
+
+                let fetch_result = tokio::time::timeout(
+                    TRADE_REST_REQUEST_TIMEOUT,
+                    handles.fetch_trades(ticker_info, request_from, Some(data_path.clone())),
+                )
+                .await;
+
+                match fetch_result {
+                    Err(_) => {
+                        let elapsed = request_started.elapsed().as_millis() as u64;
+                        log::error!(
+                            "TRADE TimedOut | venue={venue} symbol={symbol} req={} request_idx={request_count} from={} target_to={} timeout={} duration={}",
+                            short_id(req_id),
+                            format_time_short(request_from),
+                            format_time_short(target_to),
+                            format_duration_ms(TRADE_REST_REQUEST_TIMEOUT.as_millis() as u64),
+                            format_duration_ms(elapsed)
                         );
-                        break;
+                        return interrupted_trade_fetch(
+                            from_time,
+                            to_time,
+                            request_from,
+                            format!(
+                                "REST trade fetch exceeded {}",
+                                format_duration_ms(TRADE_REST_REQUEST_TIMEOUT.as_millis() as u64)
+                            ),
+                        );
                     }
-
-                    latest_trade_t = batch.last().map_or(latest_trade_t, |trade| trade.time);
-                    if latest_trade_t <= prev_latest_trade_t {
-                        consecutive_no_progress += 1;
-                        let remaining_ms = to_time.saturating_diff(latest_trade_t);
-                        log::warn!(
-                            "TRADE NoProgress | venue={venue} symbol={symbol} request_idx={request_count} prev_latest={} new_latest={} target_to={} remaining_ms={remaining_ms} consecutive={consecutive_no_progress} reason=batch_last_not_after_latest",
-                            format_time_short(prev_latest_trade_t),
-                            format_time_short(latest_trade_t),
-                            format_time_short(to_time)
+                    Ok(Ok(raw_batch)) => {
+                        let elapsed = request_started.elapsed().as_millis() as u64;
+                        let prev_latest_trade_t = latest_trade_t;
+                        log::debug!(
+                            "TRADE Response | venue={venue} symbol={symbol} req={} request_idx={request_count} trades={} first={} last={} duration={}",
+                            short_id(req_id),
+                            raw_batch.len(),
+                            format_optional_time(raw_batch.first().map(|trade| trade.time)),
+                            format_optional_time(raw_batch.last().map(|trade| trade.time)),
+                            format_duration_ms(elapsed)
                         );
 
-                        // Near-target with tiny unreachable tail → complete as
-                        // partial result instead of retrying forever.
-                        if remaining_ms <= NO_PROGRESS_REMAINING_EPSILON_MS {
-                            let tail_from = latest_trade_t.saturating_add(1);
-                            log::info!(
-                                "TRADE Stop | venue={venue} symbol={symbol} reason=no_progress_near_target latest={} target_to={} remaining_ms={remaining_ms} requests={request_count} trades={total_trades} duration={}",
-                                format_time_short(latest_trade_t),
-                                format_time_short(to_time),
-                                format_duration_ms(started.elapsed().as_millis() as u64)
-                            );
-                            return Ok(Some((tail_from, to_time)));
-                        }
-
-                        // Consecutive no-progress threshold → stop early,
-                        // long before the 90s watchdog.
-                        if consecutive_no_progress >= TRADE_NO_PROGRESS_MAX_CONSECUTIVE {
-                            let tail_from = latest_trade_t.saturating_add(1);
+                        if raw_batch.is_empty() {
                             log::warn!(
-                                "TRADE Stop | venue={venue} symbol={symbol} reason=no_progress latest={} target_to={} remaining_ms={remaining_ms} requests={request_count} trades={total_trades} duration={}",
+                                "TRADE Stop | venue={venue} symbol={symbol} reason=empty_batch_before_target latest={} target_to={} remaining_ms={} requests={request_count} trades={total_trades} total_duration={}",
                                 format_time_short(latest_trade_t),
-                                format_time_short(to_time),
+                                format_time_short(target_to),
+                                target_to.saturating_diff(latest_trade_t),
                                 format_duration_ms(started.elapsed().as_millis() as u64)
                             );
-                            return Ok(Some((tail_from, to_time)));
+                            return Ok(TradeFetchOutcome::empty(request_from, to_time));
                         }
 
-                        // Advance cursor by 1ms so the next request uses
-                        // different startTime and avoids re-fetching the
-                        // identical batch.
-                        let advanced = latest_trade_t.saturating_add(1);
-                        if advanced >= to_time {
-                            log::info!(
-                                "TRADE Stop | venue={venue} symbol={symbol} reason=cursor_exceeds_target latest={} target_to={} requests={request_count} trades={total_trades}",
-                                format_time_short(latest_trade_t),
-                                format_time_short(to_time)
-                            );
-                            return Ok(Some((advanced, to_time)));
-                        }
-                        latest_trade_t = advanced;
-                        prev_request_from = None; // bounds changed
-                    } else {
-                        consecutive_no_progress = 0;
-                    }
-                    total_trades += batch.len();
-
-                    // Progress log every 5 seconds or every 10 requests
-                    if last_progress_log.elapsed().as_secs() >= 5
-                        || request_count.is_multiple_of(10)
-                    {
-                        log::info!(
-                            "TRADE Progress | venue={venue} symbol={symbol} request_idx={request_count} trades={total_trades} latest={} target_to={} remaining_ms={} elapsed={}",
-                            format_time_short(latest_trade_t),
-                            format_time_short(to_time),
-                            to_time.saturating_diff(latest_trade_t),
-                            format_duration_ms(started.elapsed().as_millis() as u64)
+                        latest_trade_t =
+                            raw_batch.last().map_or(latest_trade_t, |trade| trade.time);
+                        final_latest = final_latest.max(latest_trade_t.min(target_to));
+                        let covered_to_exclusive = latest_trade_t.min(target_to).saturating_add(1);
+                        let (cache_batch, discarded) = filter_new_fetched_trades(
+                            raw_batch,
+                            request_from,
+                            gap_to_exclusive,
+                            &mut last_trade_id,
                         );
-                        last_progress_log = Instant::now();
-                    }
+                        let mut batch = cache_batch.clone();
+                        batch.retain(|trade| trade_time_is_in_gaps(trade.time, &gaps));
+                        if discarded > 0 {
+                            log::debug!(
+                                "TRADE Dedup | venue={venue} symbol={symbol} request_idx={request_count} discarded={discarded} retained={}",
+                                cache_batch.len()
+                            );
+                        }
+                        if let Some(cache) = market_cache()
+                            && request_from < covered_to_exclusive
+                        {
+                            cache.store_trades(
+                                ticker_info,
+                                request_from,
+                                covered_to_exclusive,
+                                &cache_batch,
+                            );
+                        }
 
-                    let () = progress.send(batch).await;
-                }
-                Ok(Err(err)) => {
-                    log::error!(
-                        "TRADE Error | venue={venue} symbol={symbol} req={} request_idx={request_count} from={} duration={} error={err}",
-                        short_id(req_id),
-                        format_time_short(latest_trade_t),
-                        format_duration_ms(request_started.elapsed().as_millis() as u64)
-                    );
-                    return Err(err);
+                        if latest_trade_t <= prev_latest_trade_t {
+                            consecutive_no_progress += 1;
+                            let remaining_ms = target_to.saturating_diff(latest_trade_t);
+                            log::warn!(
+                                "TRADE NoProgress | venue={venue} symbol={symbol} request_idx={request_count} prev_latest={} new_latest={} target_to={} remaining_ms={remaining_ms} consecutive={consecutive_no_progress} reason=batch_last_not_after_latest",
+                                format_time_short(prev_latest_trade_t),
+                                format_time_short(latest_trade_t),
+                                format_time_short(target_to)
+                            );
+
+                            if remaining_ms <= NO_PROGRESS_REMAINING_EPSILON_MS
+                                || consecutive_no_progress >= TRADE_NO_PROGRESS_MAX_CONSECUTIVE
+                            {
+                                let tail_from = latest_trade_t.saturating_add(1);
+                                if !batch.is_empty() {
+                                    let () = progress.send(batch).await;
+                                }
+                                return Ok(TradeFetchOutcome::retryable(tail_from, to_time));
+                            }
+
+                            let advanced = latest_trade_t.saturating_add(1);
+                            if advanced >= target_to {
+                                if !batch.is_empty() {
+                                    let () = progress.send(batch).await;
+                                }
+                                return Ok(TradeFetchOutcome::retryable(advanced, to_time));
+                            }
+                            latest_trade_t = advanced;
+                            prev_request_from = None;
+                        } else {
+                            consecutive_no_progress = 0;
+                        }
+
+                        total_trades = total_trades.saturating_add(batch.len());
+                        if last_progress_log.elapsed().as_secs() >= 5
+                            || request_count.is_multiple_of(10)
+                        {
+                            log::info!(
+                                "TRADE Progress | venue={venue} symbol={symbol} request_idx={request_count} trades={total_trades} latest={} target_to={} remaining_ms={} elapsed={}",
+                                format_time_short(latest_trade_t),
+                                format_time_short(target_to),
+                                target_to.saturating_diff(latest_trade_t),
+                                format_duration_ms(started.elapsed().as_millis() as u64)
+                            );
+                            last_progress_log = Instant::now();
+                        }
+                        if !batch.is_empty() {
+                            let () = progress.send(batch).await;
+                        }
+                        if latest_trade_t >= target_to {
+                            break;
+                        }
+                    }
+                    Ok(Err(err)) => {
+                        log::error!(
+                            "TRADE Error | venue={venue} symbol={symbol} req={} request_idx={request_count} from={} duration={} error={err}",
+                            short_id(req_id),
+                            format_time_short(latest_trade_t),
+                            format_duration_ms(request_started.elapsed().as_millis() as u64)
+                        );
+                        return Err(err);
+                    }
                 }
             }
         }
 
         log::info!(
-            "TRADE Worker Done | venue={venue} symbol={symbol} req={} range={} requests={request_count} returned_trades={total_trades} final_latest={} duration={}",
+            "TRADE Worker Done | venue={venue} symbol={symbol} req={} range={} requests={request_count} returned_trades={total_trades} cached={} final_latest={} duration={}",
             short_id(req_id),
             format_time_range(from_time, to_time),
-            format_time_short(latest_trade_t),
+            cached_trades.len(),
+            format_time_short(final_latest),
             format_duration_ms(started.elapsed().as_millis() as u64)
         );
 
-        Ok(None)
+        Ok(TradeFetchOutcome::default())
     })
 }
 
@@ -1979,7 +2365,8 @@ impl BubbleBucketAccum {
     }
 }
 
-async fn fetch_bubble_summaries(
+#[allow(clippy::too_many_arguments)]
+async fn fetch_bubble_summaries_cached(
     handles: AdapterHandles,
     ticker_info: TickerInfo,
     from_time: UnixMs,
@@ -1989,12 +2376,111 @@ async fn fetch_bubble_summaries(
     max_candidates_per_candle: usize,
     data_path: PathBuf,
 ) -> Result<(Vec<BubbleVolumeSummary>, usize, usize), AdapterError> {
+    let to_exclusive = to_time.saturating_add(1);
+    let Some(cache) = market_cache() else {
+        let (summaries, trades_seen, raw_discarded, _) = fetch_bubble_summaries(
+            handles,
+            ticker_info,
+            from_time,
+            to_time,
+            timeframe_ms,
+            price_step,
+            max_candidates_per_candle,
+            data_path,
+        )
+        .await?;
+        return Ok((summaries, trades_seen, raw_discarded));
+    };
+
+    let cached = cache.read_bubble_summaries(
+        ticker_info,
+        timeframe_ms,
+        price_step.units,
+        max_candidates_per_candle,
+        from_time,
+        to_exclusive,
+    );
+    let cache_complete = cached.is_complete();
+    let mut summaries = cached.records;
+    let mut trades_seen = summaries
+        .iter()
+        .flat_map(|summary| &summary.candidates)
+        .map(|candidate| candidate.trade_count)
+        .sum::<usize>();
+    let mut raw_discarded = 0usize;
+    let mut verified_ranges = Vec::new();
+
+    for (gap_from, gap_to_exclusive) in cached.gaps {
+        let gap_to = gap_to_exclusive.saturating_sub(1);
+        let (fetched, gap_trades_seen, gap_raw_discarded, verified_to_exclusive) =
+            fetch_bubble_summaries(
+                handles.clone(),
+                ticker_info,
+                gap_from,
+                gap_to,
+                timeframe_ms,
+                price_step,
+                max_candidates_per_candle,
+                data_path.clone(),
+            )
+            .await?;
+        if gap_from < verified_to_exclusive {
+            verified_ranges.push((gap_from, verified_to_exclusive.min(gap_to_exclusive)));
+        }
+        trades_seen = trades_seen.saturating_add(gap_trades_seen);
+        raw_discarded = raw_discarded.saturating_add(gap_raw_discarded);
+        summaries.extend(fetched);
+    }
+
+    let summaries = merge_bubble_summaries(summaries, max_candidates_per_candle);
+    for (verified_from, verified_to_exclusive) in verified_ranges {
+        let verified_summaries = summaries
+            .iter()
+            .filter(|summary| {
+                summary.candle_time < verified_to_exclusive
+                    && summary.candle_time.saturating_add(timeframe_ms) > verified_from
+            })
+            .cloned()
+            .collect::<Vec<_>>();
+        cache.store_bubble_summaries(
+            ticker_info,
+            timeframe_ms,
+            price_step.units,
+            max_candidates_per_candle,
+            verified_from,
+            verified_to_exclusive,
+            &verified_summaries,
+        );
+    }
+    if cache_complete {
+        log::debug!(
+            "BUBBLE Network Skipped | venue={} symbol={} range={} timeframe_ms={timeframe_ms}",
+            format_venue(&ticker_info),
+            format_symbol(&ticker_info),
+            format_time_range(from_time, to_time)
+        );
+    }
+    Ok((summaries, trades_seen, raw_discarded))
+}
+
+async fn fetch_bubble_summaries(
+    handles: AdapterHandles,
+    ticker_info: TickerInfo,
+    from_time: UnixMs,
+    to_time: UnixMs,
+    timeframe_ms: u64,
+    price_step: PriceStep,
+    max_candidates_per_candle: usize,
+    data_path: PathBuf,
+) -> Result<(Vec<BubbleVolumeSummary>, usize, usize, UnixMs), AdapterError> {
     let venue = format_venue(&ticker_info);
     let symbol = format_symbol(&ticker_info);
     let started = Instant::now();
     let mut latest_trade_t = from_time;
     let mut request_count = 0usize;
     let mut trades_seen = 0usize;
+    let mut raw_discarded = 0usize;
+    let mut last_trade_id = None;
     let mut buckets: FxHashMap<(UnixMs, Price), BubbleBucketAccum> = FxHashMap::default();
 
     log::info!(
@@ -2006,11 +2492,12 @@ async fn fetch_bubble_summaries(
     while latest_trade_t < to_time {
         request_count += 1;
         let batch_started = Instant::now();
-        let batch = handles
+        let request_from = latest_trade_t;
+        let raw_batch = handles
             .fetch_trades(ticker_info, latest_trade_t, Some(data_path.clone()))
             .await?;
 
-        if batch.is_empty() {
+        if raw_batch.is_empty() {
             log::warn!(
                 "BUBBLE Summary Batch | trades_seen={trades_seen} buckets={} retained_candidates={} reason=empty_batch",
                 buckets.len(),
@@ -2020,11 +2507,15 @@ async fn fetch_bubble_summaries(
         }
 
         let prev_latest_trade_t = latest_trade_t;
+        latest_trade_t = raw_batch.last().map_or(latest_trade_t, |trade| trade.time);
+        let (batch, discarded) = filter_new_fetched_trades(
+            raw_batch,
+            request_from,
+            to_time.saturating_add(1),
+            &mut last_trade_id,
+        );
+        raw_discarded = raw_discarded.saturating_add(discarded);
         for trade in &batch {
-            if trade.time < from_time || trade.time > to_time {
-                continue;
-            }
-
             let candle_time =
                 UnixMs::new(trade.time.as_u64() - (trade.time.as_u64() % timeframe_ms));
             let price = trade.price.round_to_step(price_step);
@@ -2035,7 +2526,15 @@ async fn fetch_bubble_summaries(
         }
 
         trades_seen += batch.len();
-        latest_trade_t = batch.last().map_or(latest_trade_t, |trade| trade.time);
+        if let Some(cache) = market_cache() {
+            let cache_to_exclusive = latest_trade_t.min(to_time).saturating_add(1);
+            let cache_batch = batch
+                .iter()
+                .copied()
+                .filter(|trade| trade.time >= request_from && trade.time < cache_to_exclusive)
+                .collect::<Vec<_>>();
+            cache.store_trades(ticker_info, request_from, cache_to_exclusive, &cache_batch);
+        }
         retain_top_bubble_buckets(&mut buckets, max_candidates_per_candle);
 
         log::debug!(
@@ -2068,12 +2567,18 @@ async fn fetch_bubble_summaries(
         format_time_range(from_time, to_time),
         summaries.len(),
         candidate_count,
-        trades_seen,
+        raw_discarded,
         trades_seen,
         format_duration_ms(started.elapsed().as_millis() as u64)
     );
 
-    Ok((summaries, trades_seen, trades_seen))
+    let verified_to_exclusive = if latest_trade_t > from_time {
+        latest_trade_t.min(to_time).saturating_add(1)
+    } else {
+        from_time
+    };
+
+    Ok((summaries, trades_seen, raw_discarded, verified_to_exclusive))
 }
 
 fn retained_bubble_candidate_count(
@@ -2160,6 +2665,159 @@ fn bubble_summaries_from_buckets(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn ticker_info() -> TickerInfo {
+        TickerInfo::new(
+            exchange::Ticker::new("BTCUSDT", Exchange::BinanceLinear),
+            0.1,
+            0.001,
+            None,
+        )
+    }
+
+    #[test]
+    fn open_interest_requirement_uses_explicit_source_timeframe() {
+        let ticker_info = ticker_info();
+        let chart_stream = StreamKind::Kline {
+            ticker_info,
+            timeframe: Timeframe::M1,
+        };
+        let request = FetchRange::OpenInterest {
+            from: UnixMs::new(1),
+            to: UnixMs::new(2),
+            timeframe: Timeframe::M5,
+        };
+        let (key, _) = request.requirement(chart_stream).unwrap();
+        assert_eq!(
+            key.stream,
+            StreamKind::Kline {
+                ticker_info,
+                timeframe: Timeframe::M5,
+            }
+        );
+    }
+
+    fn trade(id: Option<u64>, time: u64) -> Trade {
+        Trade {
+            id,
+            time: UnixMs::new(time),
+            is_sell: false,
+            price: Price::from_f64(100.0),
+            qty: Qty::from_f64(1.0),
+        }
+    }
+
+    #[test]
+    fn fetched_trade_dedup_uses_exchange_id_not_trade_values() {
+        let mut last_id = None;
+        let (first, discarded) = filter_new_fetched_trades(
+            vec![
+                trade(Some(10), 1_000),
+                trade(Some(10), 1_000),
+                trade(Some(11), 1_000),
+                trade(None, 1_000),
+                trade(None, 1_000),
+            ],
+            UnixMs::new(1_000),
+            UnixMs::new(2_000),
+            &mut last_id,
+        );
+        assert_eq!(discarded, 1);
+        assert_eq!(first.len(), 4);
+
+        let (second, discarded) = filter_new_fetched_trades(
+            vec![trade(Some(11), 1_000), trade(Some(12), 1_001)],
+            UnixMs::new(1_000),
+            UnixMs::new(2_000),
+            &mut last_id,
+        );
+        assert_eq!(discarded, 1);
+        assert_eq!(
+            second
+                .iter()
+                .filter_map(|trade| trade.id)
+                .collect::<Vec<_>>(),
+            vec![12]
+        );
+    }
+
+    #[test]
+    fn nearby_trade_cache_gaps_are_fetched_as_one_span() {
+        let gaps = vec![
+            (UnixMs::new(1_000), UnixMs::new(2_000)),
+            (UnixMs::new(2_500), UnixMs::new(3_000)),
+            (UnixMs::new(70_000), UnixMs::new(71_000)),
+        ];
+
+        assert_eq!(
+            coalesce_trade_fetch_gaps(&gaps, 1_000),
+            vec![
+                (UnixMs::new(1_000), UnixMs::new(3_000)),
+                (UnixMs::new(70_000), UnixMs::new(71_000)),
+            ]
+        );
+    }
+
+    #[test]
+    fn coalesced_trade_fetch_only_emits_original_cache_gaps() {
+        let gaps = vec![
+            (UnixMs::new(1_000), UnixMs::new(2_000)),
+            (UnixMs::new(2_500), UnixMs::new(3_000)),
+        ];
+
+        assert!(trade_time_is_in_gaps(UnixMs::new(1_500), &gaps));
+        assert!(!trade_time_is_in_gaps(UnixMs::new(2_250), &gaps));
+        assert!(trade_time_is_in_gaps(UnixMs::new(2_750), &gaps));
+    }
+
+    #[test]
+    fn interrupted_trade_worker_preserves_progress_as_retryable_tail() {
+        let outcome = interrupted_trade_fetch(
+            UnixMs::new(1_000),
+            UnixMs::new(5_000),
+            UnixMs::new(3_000),
+            "test budget".to_string(),
+        )
+        .unwrap();
+        assert_eq!(
+            outcome.unfilled_tail,
+            Some((UnixMs::new(3_000), UnixMs::new(5_000)))
+        );
+        assert_eq!(outcome.empty_tail, None);
+    }
+
+    #[test]
+    fn interrupted_trade_worker_without_progress_remains_an_error() {
+        assert!(
+            interrupted_trade_fetch(
+                UnixMs::new(1_000),
+                UnixMs::new(5_000),
+                UnixMs::new(1_000),
+                "test budget".to_string(),
+            )
+            .is_err()
+        );
+    }
+
+    #[test]
+    fn request_kind_lookup_does_not_confuse_oi_with_trades() {
+        let mut handler = RequestHandler::default();
+        let trade_id = handler
+            .add_request(FetchRange::Trades(UnixMs::new(1_000), UnixMs::new(2_000)))
+            .unwrap()
+            .unwrap();
+        let oi_id = handler
+            .add_request(FetchRange::OpenInterest {
+                from: UnixMs::new(1_000),
+                to: UnixMs::new(2_000),
+                timeframe: Timeframe::M5,
+            })
+            .unwrap()
+            .unwrap();
+
+        assert!(handler.is_trade_request(trade_id));
+        assert!(!handler.is_trade_request(oi_id));
+    }
 
     #[test]
     fn test_generation_id_increments_on_supersede() {

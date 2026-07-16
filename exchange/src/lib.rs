@@ -549,15 +549,19 @@ impl TickerInfo {
     }
 }
 
-#[derive(Debug, Clone, Copy, Deserialize)]
+#[derive(Debug, Clone, Copy, Deserialize, Serialize)]
 pub struct Trade {
+    /// Stable exchange trade identifier when the venue exposes one.
+    /// Binance REST/archives use the aggregate-trade id (`a`).
+    #[serde(default)]
+    pub id: Option<u64>,
     pub time: UnixMs,
     pub is_sell: bool,
     pub price: Price,
     pub qty: Qty,
 }
 
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone, Copy, Deserialize, Serialize)]
 pub struct Kline {
     pub time: UnixMs,
     pub open: Price,
@@ -590,7 +594,7 @@ impl Kline {
     }
 }
 
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone, Copy, Deserialize, Serialize)]
 pub enum Volume {
     TotalOnly(Qty),
     BuySell(Qty, Qty),
@@ -678,7 +682,7 @@ pub struct TickerStats {
     pub daily_volume: Qty,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq)]
+#[derive(Debug, Clone, Copy, PartialEq, Deserialize, Serialize)]
 pub struct OpenInterest {
     pub time: UnixMs,
     pub value: f64,

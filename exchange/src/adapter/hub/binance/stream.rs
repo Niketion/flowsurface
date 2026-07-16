@@ -92,6 +92,8 @@ struct SonicKlineWrap {
 
 #[derive(Deserialize, Debug)]
 struct SonicTrade {
+    #[serde(rename = "a")]
+    id: u64,
     #[serde(rename = "T")]
     time: u64,
     #[serde(rename = "p", deserialize_with = "de_string_to_number")]
@@ -370,6 +372,7 @@ impl WsAdapter for TradeAdapter {
                     Price::from_f64(de_trade.price).round_to_min_tick(ticker_info.min_ticksize);
 
                 let trade = Trade {
+                    id: Some(de_trade.id),
                     time: de_trade.time.into(),
                     is_sell: de_trade.is_sell,
                     price,

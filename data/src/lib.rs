@@ -593,7 +593,15 @@ fn sanitize_pane(value: &mut serde_json::Value, warnings: &mut Vec<String>) {
             {
                 sanitize_vec_tagged_enum(
                     pane.get_mut("indicators"),
-                    &["Volume", "BarAnalysis", "CumulativeDelta", "OpenInterest"],
+                    &[
+                        "Volume",
+                        "BarAnalysis",
+                        "CumulativeDelta",
+                        "OpenInterest",
+                        "VolumeBubbles",
+                        "SessionVolumeProfile",
+                        "Vwap",
+                    ],
                     warnings,
                     "kline indicator",
                 );
@@ -1032,6 +1040,61 @@ mod tests {
                 assert!(warnings.iter().any(|warning| warning.contains("indicator")));
             }
             _ => panic!("unexpected outcome"),
+        }
+    }
+
+    #[test]
+    fn overlay_indicators_are_preserved_through_sanitize() {
+        let path = temp_state_path("saved-state.json");
+        let value = serde_json::json!({
+            "saved_state_version": CURRENT_SAVED_STATE_VERSION,
+            "layout_manager": {
+                "layouts": [{
+                    "name": "Default",
+                    "dashboard": {
+                        "pane": {
+                            "KlineChart": {
+                                "layout": { "splits": [], "autoscale": null },
+                                "kind": "Candles",
+                                "stream_type": [],
+                                "settings": {},
+                                "indicators": ["Volume", "VolumeBubbles", "SessionVolumeProfile", "Vwap", "CumulativeDelta"],
+                                "link_group": null
+                            }
+                        },
+                        "popout": []
+                    }
+                }],
+                "active_layout": "Default"
+            }
+        });
+        std::fs::write(&path, serde_json::to_string(&value).unwrap()).unwrap();
+
+        match load_saved_state_from_path(&path) {
+            StateLoadOutcome::Loaded(state) => {
+                let pane = &state.layout_manager.layouts[0].dashboard.pane;
+                if let crate::Pane::KlineChart { indicators, .. } = pane {
+                    assert_eq!(indicators.len(), 5, "all 5 indicators should be preserved");
+                    assert!(indicators.contains(&crate::chart::indicator::KlineIndicator::Volume));
+                    assert!(
+                        indicators
+                            .contains(&crate::chart::indicator::KlineIndicator::VolumeBubbles)
+                    );
+                    assert!(
+                        indicators.contains(
+                            &crate::chart::indicator::KlineIndicator::SessionVolumeProfile
+                        )
+                    );
+                    assert!(indicators.contains(&crate::chart::indicator::KlineIndicator::Vwap));
+                    assert!(
+                        indicators
+                            .contains(&crate::chart::indicator::KlineIndicator::CumulativeDelta)
+                    );
+                } else {
+                    panic!("expected KlineChart pane");
+                }
+            }
+            _ => panic!("expected Loaded outcome"),
         }
     }
 

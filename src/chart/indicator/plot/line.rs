@@ -15,6 +15,17 @@ const DEFAULT_BAR_WIDTH_FACTOR: f32 = 0.9;
 /// Predicate that decides whether a datapoint is valid for drawing.
 type ValidFn<T> = Box<dyn Fn(&T) -> bool>;
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum LineInterpolation {
+    #[default]
+    Linear,
+    StepAfter,
+}
+
+fn step_after_corner(previous: (f32, f32), next: (f32, f32)) -> (f32, f32) {
+    (next.0, previous.1)
+}
+
 pub struct LinePlot<V, T> {
     pub value: V,
     pub tooltip: Option<TooltipFn<T>>,
@@ -23,6 +34,7 @@ pub struct LinePlot<V, T> {
     pub stroke_width: f32,
     pub show_points: bool,
     pub point_radius_factor: f32,
+    pub interpolation: LineInterpolation,
     /// Horizontal shift in bucket units (screen-space).
     /// Positive values move points right, negative values move left.
     pub x_shift_buckets: i32,
@@ -48,6 +60,7 @@ impl<V, T> LinePlot<V, T> {
             stroke_width: 1.0,
             show_points: true,
             point_radius_factor: 0.2,
+            interpolation: LineInterpolation::Linear,
             x_shift_buckets: 0,
             is_valid: None,
             invalid_point_message: None,
@@ -78,11 +91,8 @@ impl<V, T> LinePlot<V, T> {
         self
     }
 
-    /// Shift datapoint x-position by whole bucket units in screen-space.
-    ///
-    /// e.g. `shift(1)` moves each point one bucket to the right.
-    pub fn shift(mut self, buckets: i32) -> Self {
-        self.x_shift_buckets = buckets;
+    pub fn interpolation(mut self, interpolation: LineInterpolation) -> Self {
+        self.interpolation = interpolation;
         self
     }
 
@@ -125,6 +135,16 @@ where
     fn y_extents(&self, datapoints: &S, range: RangeInclusive<u64>) -> Option<(f32, f32)> {
         let mut min_v = f32::MAX;
         let mut max_v = f32::MIN;
+
+        if self.interpolation == LineInterpolation::StepAfter
+            && let Some((x, y)) = datapoints.last_in(0..=*range.start())
+            && x < *range.start()
+            && self.is_valid.as_ref().is_none_or(|f| f(y))
+        {
+            let value = (self.value)(y);
+            min_v = min_v.min(value);
+            max_v = max_v.max(value);
+        }
 
         datapoints.for_each_in(range, |_, y| {
             if self.is_valid.as_ref().is_none_or(|f| f(y)) {
@@ -188,17 +208,37 @@ where
         // Draw line segments, skipping over invalid points.
         // When a point is invalid, `prev` is reset so the next valid
         // point starts a new disconnected segment.
-        let mut prev: Option<(f32, f32)> = None;
+        let mut prev = if self.interpolation == LineInterpolation::StepAfter {
+            datapoints
+                .last_in(0..=*range.start())
+                .filter(|(x, y)| *x < *range.start() && self.is_valid.as_ref().is_none_or(|f| f(y)))
+                .map(|(_, y)| (x_for(*range.start()), scale.to_y((self.value)(y))))
+        } else {
+            None
+        };
         datapoints.for_each_in(range.clone(), |x, y| {
             let valid = self.is_valid.as_ref().is_none_or(|f| f(y));
             if valid {
                 let sx = x_for(x);
                 let sy = scale.to_y((self.value)(y));
                 if let Some((px, py)) = prev {
-                    frame.stroke(
-                        &Path::line(iced::Point::new(px, py), iced::Point::new(sx, sy)),
-                        stroke,
-                    );
+                    match self.interpolation {
+                        LineInterpolation::Linear => frame.stroke(
+                            &Path::line(iced::Point::new(px, py), iced::Point::new(sx, sy)),
+                            stroke,
+                        ),
+                        LineInterpolation::StepAfter => {
+                            let (cx, cy) = step_after_corner((px, py), (sx, sy));
+                            frame.stroke(
+                                &Path::line(iced::Point::new(px, py), iced::Point::new(cx, cy)),
+                                stroke,
+                            );
+                            frame.stroke(
+                                &Path::line(iced::Point::new(cx, cy), iced::Point::new(sx, sy)),
+                                stroke,
+                            );
+                        }
+                    }
                 }
                 if let Some(r) = radius {
                     frame.fill(&Path::circle(iced::Point::new(sx, sy), r), color);
@@ -224,5 +264,19 @@ where
 
     fn x_shift_buckets(&self) -> i32 {
         self.x_shift_buckets
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn step_after_uses_horizontal_then_vertical_segments() {
+        let previous = (10.0, 3.0);
+        let next = (20.0, 8.0);
+        let corner = step_after_corner(previous, next);
+        assert_eq!(corner.1, previous.1);
+        assert_eq!(corner.0, next.0);
     }
 }

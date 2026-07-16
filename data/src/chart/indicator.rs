@@ -1,7 +1,7 @@
 use std::fmt::{self, Debug, Display};
 
 use enum_map::Enum;
-use exchange::adapter::MarketKind;
+use exchange::adapter::{Exchange, MarketKind};
 use serde::{Deserialize, Serialize};
 
 pub trait Indicator: PartialEq + Display + 'static {
@@ -10,12 +10,21 @@ pub trait Indicator: PartialEq + Display + 'static {
         Self: Sized;
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum IndicatorPlacement {
+    Panel,
+    Overlay,
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Deserialize, Serialize, Eq, Enum)]
 pub enum KlineIndicator {
     Volume,
     BarAnalysis,
     CumulativeDelta,
     OpenInterest,
+    VolumeBubbles,
+    SessionVolumeProfile,
+    Vwap,
 }
 
 impl Indicator for KlineIndicator {
@@ -31,18 +40,50 @@ impl KlineIndicator {
     // Indicator togglers on UI menus depend on these arrays.
     // Every variant needs to be in either SPOT, PERPS or both.
     /// Indicators that can be used with spot market tickers
-    const FOR_SPOT: [KlineIndicator; 3] = [
+    const FOR_SPOT: [KlineIndicator; 6] = [
         KlineIndicator::Volume,
         KlineIndicator::BarAnalysis,
         KlineIndicator::CumulativeDelta,
+        KlineIndicator::VolumeBubbles,
+        KlineIndicator::SessionVolumeProfile,
+        KlineIndicator::Vwap,
     ];
     /// Indicators that can be used with perpetual swap market tickers
-    const FOR_PERPS: [KlineIndicator; 4] = [
+    const FOR_PERPS: [KlineIndicator; 7] = [
         KlineIndicator::Volume,
         KlineIndicator::BarAnalysis,
         KlineIndicator::CumulativeDelta,
         KlineIndicator::OpenInterest,
+        KlineIndicator::VolumeBubbles,
+        KlineIndicator::SessionVolumeProfile,
+        KlineIndicator::Vwap,
     ];
+
+    pub fn placement(self) -> IndicatorPlacement {
+        if matches!(
+            self,
+            Self::VolumeBubbles | Self::SessionVolumeProfile | Self::Vwap
+        ) {
+            IndicatorPlacement::Overlay
+        } else {
+            IndicatorPlacement::Panel
+        }
+    }
+
+    pub fn is_overlay(self) -> bool {
+        self.placement() == IndicatorPlacement::Overlay
+    }
+
+    pub fn requires_trades(self, exchange: Exchange) -> bool {
+        matches!(
+            self,
+            Self::VolumeBubbles | Self::SessionVolumeProfile | Self::Vwap
+        ) || (self == Self::CumulativeDelta
+            && !matches!(
+                exchange,
+                Exchange::BinanceLinear | Exchange::BinanceInverse | Exchange::BinanceSpot
+            ))
+    }
 }
 
 impl Display for KlineIndicator {
@@ -52,6 +93,9 @@ impl Display for KlineIndicator {
             KlineIndicator::BarAnalysis => write!(f, "Bar Analysis"),
             KlineIndicator::CumulativeDelta => write!(f, "CVD"),
             KlineIndicator::OpenInterest => write!(f, "Open Interest"),
+            KlineIndicator::VolumeBubbles => write!(f, "Volume Bubbles"),
+            KlineIndicator::SessionVolumeProfile => write!(f, "Session Volume Profile"),
+            KlineIndicator::Vwap => write!(f, "VWAP"),
         }
     }
 }

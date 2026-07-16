@@ -2,3 +2,6 @@
 /target
 /.vscode
 *.log
+*.zip
+*.bat
+*.ps1

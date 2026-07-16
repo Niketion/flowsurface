@@ -5,7 +5,7 @@ use exchange::{
     unit::qty::Qty,
 };
 
-use rustc_hash::FxHashMap;
+use rustc_hash::{FxHashMap, FxHashSet};
 use serde::{Deserialize, Serialize};
 
 #[derive(Clone)]
@@ -13,9 +13,22 @@ pub struct KlineDataPoint {
     pub kline: Kline,
     pub footprint: KlineTrades,
     pub bubble_summary: BubbleVolumeSummary,
-    /// Whether trades have been fetched/checked for this kline bucket.
-    /// Prevents re-requesting the same empty range repeatedly.
-    pub trades_checked: bool,
+    /// Completeness of the raw directional executions for this bucket.
+    pub trade_coverage: TradeCoverage,
+    /// Raw executions retained in arrival order so indicators can reconstruct
+    /// a real intrabar path when the bucket has complete historical coverage.
+    pub trade_sequence: Vec<Trade>,
+    /// Stable exchange IDs already aggregated into this candle. Unlike the
+    /// chart-level raw buffer, this lives as long as the candle bucket.
+    pub trade_ids: FxHashSet<u64>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum TradeCoverage {
+    #[default]
+    Unknown,
+    Partial,
+    Complete,
 }
 
 impl KlineDataPoint {
@@ -25,7 +38,16 @@ impl KlineDataPoint {
     }
 
     pub fn add_trade(&mut self, trade: &Trade, step: PriceStep) {
+        if let Some(id) = trade.id
+            && !self.trade_ids.insert(id)
+        {
+            return;
+        }
         self.footprint.add_trade_to_nearest_bin(trade, step);
+        self.trade_sequence.push(*trade);
+        if self.trade_coverage == TradeCoverage::Unknown {
+            self.trade_coverage = TradeCoverage::Partial;
+        }
     }
 
     pub fn poc_price(&self) -> Option<Price> {
@@ -38,6 +60,8 @@ impl KlineDataPoint {
 
     pub fn clear_trades(&mut self) {
         self.footprint.clear();
+        self.trade_sequence.clear();
+        self.trade_ids.clear();
     }
 
     pub fn set_bubble_summary(&mut self, summary: BubbleVolumeSummary) {
@@ -173,7 +197,7 @@ pub enum BubbleHistoricalMode {
     SummaryOnly,
 }
 
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone, Copy, Deserialize, Serialize)]
 pub struct BubbleCandidate {
     pub candle_time: UnixMs,
     pub price: Price,
@@ -187,7 +211,7 @@ pub struct BubbleCandidate {
     pub last_time: Option<UnixMs>,
 }
 
-#[derive(Debug, Clone, Default)]
+#[derive(Debug, Clone, Default, Deserialize, Serialize)]
 pub struct BubbleVolumeSummary {
     pub candle_time: UnixMs,
     pub candidates: Vec<BubbleCandidate>,
@@ -367,10 +391,10 @@ pub enum KlineChartKind {
 
 impl KlineChartKind {
     pub fn allows_indicator(&self, indicator: KlineIndicator) -> bool {
-        !matches!(
-            (self, indicator),
-            (KlineChartKind::Candles, KlineIndicator::BarAnalysis)
-        )
+        match self {
+            KlineChartKind::Candles => !matches!(indicator, KlineIndicator::BarAnalysis),
+            KlineChartKind::Footprint { .. } => !indicator.is_overlay(),
+        }
     }
 
     pub fn min_scaling(&self) -> f32 {
@@ -471,6 +495,12 @@ pub struct Config {
     pub show_footprint_table_candle: bool,
     // Optional main-chart order-flow bubbles for regular candlesticks.
     pub volume_bubbles: VolumeBubbleConfig,
+    /// Session volume profile overlay for regular candlesticks.
+    pub session_volume_profile: SessionVolumeProfileConfig,
+    /// Settings owned by the VWAP overlay indicator.
+    pub vwap: VwapConfig,
+    /// Settings owned by the CVD panel indicator.
+    pub cvd: CvdConfig,
 }
 
 impl Default for Config {
@@ -480,7 +510,213 @@ impl Default for Config {
             show_footprint_summary: true,
             show_footprint_table_candle: true,
             volume_bubbles: VolumeBubbleConfig::default(),
+            session_volume_profile: SessionVolumeProfileConfig::default(),
+            vwap: VwapConfig::default(),
+            cvd: CvdConfig::default(),
         }
+    }
+}
+
+#[derive(Debug, Copy, Clone, PartialEq, Deserialize, Serialize)]
+#[serde(default)]
+pub struct CvdConfig {
+    pub render_style: CvdRenderStyle,
+    pub candle_width_percent: f32,
+    pub show_wicks: bool,
+    pub line_width: f32,
+    pub reset: CvdReset,
+}
+
+impl Default for CvdConfig {
+    fn default() -> Self {
+        Self {
+            render_style: CvdRenderStyle::Candlesticks,
+            candle_width_percent: 70.0,
+            show_wicks: false,
+            line_width: 1.0,
+            reset: CvdReset::DailyUtc,
+        }
+    }
+}
+
+#[derive(Debug, Copy, Clone, PartialEq, Eq, Default, Deserialize, Serialize)]
+pub enum CvdReset {
+    #[default]
+    DailyUtc,
+    Continuous,
+}
+
+impl CvdReset {
+    pub const ALL: [Self; 2] = [Self::DailyUtc, Self::Continuous];
+}
+
+impl std::fmt::Display for CvdReset {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(match self {
+            Self::DailyUtc => "Daily UTC",
+            Self::Continuous => "Continuous",
+        })
+    }
+}
+
+#[derive(Debug, Copy, Clone, PartialEq, Eq, Default, Deserialize, Serialize)]
+pub enum CvdRenderStyle {
+    Line,
+    #[default]
+    Candlesticks,
+}
+
+impl CvdRenderStyle {
+    pub const ALL: [Self; 2] = [Self::Candlesticks, Self::Line];
+}
+
+impl std::fmt::Display for CvdRenderStyle {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(match self {
+            Self::Line => "Line",
+            Self::Candlesticks => "Candlesticks",
+        })
+    }
+}
+
+#[derive(Debug, Copy, Clone, PartialEq, Deserialize, Serialize)]
+#[serde(default)]
+pub struct VwapConfig {
+    pub anchor: SessionProfileInterval,
+    pub line_width: f32,
+    pub show_bands: bool,
+    pub band_multiplier: f32,
+    pub show_labels: bool,
+}
+
+impl Default for VwapConfig {
+    fn default() -> Self {
+        Self {
+            anchor: SessionProfileInterval::Daily,
+            line_width: 1.6,
+            show_bands: true,
+            band_multiplier: 1.0,
+            show_labels: true,
+        }
+    }
+}
+
+#[derive(Debug, Copy, Clone, PartialEq, Deserialize, Serialize)]
+#[serde(default)]
+pub struct SessionVolumeProfileConfig {
+    pub enabled: bool,
+    pub interval: SessionProfileInterval,
+    pub placement: SessionProfilePlacement,
+    pub mode: SessionProfileMode,
+    /// Percentage of session volume enclosed by VAH/VAL.
+    pub value_area_percent: f32,
+    /// Maximum profile width as percentage of the session width.
+    pub width_percent: f32,
+    /// Number of chart ticks aggregated into one profile row.
+    pub row_size_ticks: u16,
+    pub show_poc: bool,
+    pub show_value_area: bool,
+    pub show_vwap: bool,
+    pub show_session_high_low: bool,
+}
+
+impl Default for SessionVolumeProfileConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            interval: SessionProfileInterval::Hourly,
+            placement: SessionProfilePlacement::Left,
+            mode: SessionProfileMode::Volume,
+            value_area_percent: 70.0,
+            width_percent: 35.0,
+            row_size_ticks: 1,
+            show_poc: true,
+            show_value_area: true,
+            show_vwap: true,
+            show_session_high_low: true,
+        }
+    }
+}
+
+#[derive(Debug, Copy, Clone, PartialEq, Eq, Default, Deserialize, Serialize)]
+pub enum SessionProfileInterval {
+    Minutes30,
+    #[default]
+    Hourly,
+    Hours4,
+    Daily,
+    Weekly,
+}
+
+impl SessionProfileInterval {
+    pub const ALL: [Self; 5] = [
+        Self::Minutes30,
+        Self::Hourly,
+        Self::Hours4,
+        Self::Daily,
+        Self::Weekly,
+    ];
+
+    pub fn milliseconds(self) -> u64 {
+        match self {
+            Self::Minutes30 => 30 * 60_000,
+            Self::Hourly => 60 * 60_000,
+            Self::Hours4 => 4 * 60 * 60_000,
+            Self::Daily => 24 * 60 * 60_000,
+            Self::Weekly => 7 * 24 * 60 * 60_000,
+        }
+    }
+}
+
+impl std::fmt::Display for SessionProfileInterval {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(match self {
+            Self::Minutes30 => "30 minutes",
+            Self::Hourly => "Hourly",
+            Self::Hours4 => "4 hours",
+            Self::Daily => "Daily",
+            Self::Weekly => "Weekly",
+        })
+    }
+}
+
+#[derive(Debug, Copy, Clone, PartialEq, Eq, Default, Deserialize, Serialize)]
+pub enum SessionProfilePlacement {
+    #[default]
+    Left,
+    Right,
+}
+
+impl SessionProfilePlacement {
+    pub const ALL: [Self; 2] = [Self::Left, Self::Right];
+}
+
+impl std::fmt::Display for SessionProfilePlacement {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(match self {
+            Self::Left => "Left / session open",
+            Self::Right => "Right / session close",
+        })
+    }
+}
+
+#[derive(Debug, Copy, Clone, PartialEq, Eq, Default, Deserialize, Serialize)]
+pub enum SessionProfileMode {
+    #[default]
+    Volume,
+    Delta,
+}
+
+impl SessionProfileMode {
+    pub const ALL: [Self; 2] = [Self::Volume, Self::Delta];
+}
+
+impl std::fmt::Display for SessionProfileMode {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(match self {
+            Self::Volume => "Volume",
+            Self::Delta => "Delta",
+        })
     }
 }
 
@@ -492,7 +728,7 @@ pub struct VolumeBubbleConfig {
     pub max_bubbles_per_bar: usize,
     pub historical_mode: BubbleHistoricalMode,
     pub max_candidates_per_candle: usize,
-    pub max_history_minutes_per_request: u64,
+    pub history_window_minutes: u64,
     pub use_raw_trades_when_available: bool,
     pub min_radius_px: f32,
     pub max_radius_px: f32,
@@ -509,7 +745,7 @@ impl Default for VolumeBubbleConfig {
             max_bubbles_per_bar: 3,
             historical_mode: BubbleHistoricalMode::SummaryOnly,
             max_candidates_per_candle: 3,
-            max_history_minutes_per_request: 15,
+            history_window_minutes: 30,
             use_raw_trades_when_available: true,
             min_radius_px: 3.0,
             max_radius_px: 14.0,
