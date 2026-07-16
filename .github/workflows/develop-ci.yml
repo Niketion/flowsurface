@@ -1,0 +1,134 @@
+name: Develop CI
+
+on:
+  push:
+    branches:
+      - develop
+
+  pull_request:
+    branches:
+      - develop
+
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+  RUSTFLAGS: "-D warnings"
+
+jobs:
+  quality:
+    name: Quality gate
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Install Linux dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y \
+            build-essential \
+            pkg-config \
+            libasound2-dev
+
+      - name: Install configured Rust toolchain
+        run: |
+          rustup show
+          rustup component add rustfmt clippy
+
+      - name: Cache Cargo
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: ${{ runner.os }}-cargo-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: |
+            ${{ runner.os }}-cargo-
+
+      - name: Check formatting
+        run: cargo fmt --all -- --check
+
+      - name: Cargo check
+        run: cargo check --workspace --all-targets --all-features --locked
+
+      - name: Cargo clippy
+        run: cargo clippy --workspace --all-targets --all-features --locked -- -D warnings
+
+      - name: Run all tests
+        run: cargo test --workspace --all-targets --all-features --locked
+
+  build-windows:
+    name: Windows release build
+    needs:
+      - quality
+
+    if: github.event_name == 'push' || github.event_name == 'workflow_dispatch'
+
+    runs-on: windows-latest
+
+    env:
+      CARGO_TERM_COLOR: always
+      RUSTFLAGS: "-D warnings"
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Install configured Rust toolchain
+        shell: pwsh
+        run: |
+          rustup show
+          rustup target add x86_64-pc-windows-msvc
+
+      - name: Cache Cargo
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: ${{ runner.os }}-cargo-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: |
+            ${{ runner.os }}-cargo-
+
+      - name: Build Windows release
+        shell: pwsh
+        run: |
+          cargo build `
+            --release `
+            --locked `
+            --target x86_64-pc-windows-msvc
+
+      - name: Prepare distributable
+        shell: pwsh
+        run: |
+          $dist = "dist\flowsurface-windows-x64"
+
+          New-Item `
+            -ItemType Directory `
+            -Path $dist `
+            -Force | Out-Null
+
+          Copy-Item `
+            "target\x86_64-pc-windows-msvc\release\flowsurface.exe" `
+            "$dist\flowsurface.exe"
+
+          Copy-Item "README.md" "$dist\README.md"
+          Copy-Item "LICENSE" "$dist\LICENSE"
+
+          Write-Host "Distributable contents:"
+          Get-ChildItem -Path $dist -Recurse
+
+      - name: Upload Windows artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: flowsurface-windows-x64-${{ github.sha }}
+          path: dist/flowsurface-windows-x64
+          if-no-files-found: error
+          retention-days: 30
