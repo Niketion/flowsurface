@@ -66,18 +66,6 @@ pub mod windows_power {
 /// Cross-platform power guard that does nothing on non-Windows platforms.
 #[cfg(not(target_os = "windows"))]
 pub mod windows_power {
-    pub fn disable_power_throttling() -> bool {
-        true
-    }
-
-    pub fn set_system_required(_active: bool) -> bool {
-        true
-    }
-
-    pub fn is_active() -> bool {
-        false
-    }
-
     pub fn init() {}
 
     pub fn cleanup() {}

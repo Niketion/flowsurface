@@ -1280,11 +1280,11 @@ impl Dashboard {
                         fetcher::format_stream(&stream),
                         pane_ids.len()
                     );
-                    for pane_id in pane_ids {
-                        if let Some(pane_state) =
-                            self.get_mut_pane_state_by_uuid(main_window, pane_id)
-                        {
-                            if show_activity {
+                    if show_activity {
+                        for pane_id in pane_ids {
+                            if let Some(pane_state) =
+                                self.get_mut_pane_state_by_uuid(main_window, pane_id)
+                            {
                                 pane_state.status = pane::Status::Loading {
                                     info,
                                     source: pane::LoadingSource::Reconnect,
