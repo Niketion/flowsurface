@@ -66,7 +66,5 @@ pub mod windows_power {
 /// Cross-platform power guard that does nothing on non-Windows platforms.
 #[cfg(not(target_os = "windows"))]
 pub mod windows_power {
-    pub fn init() {}
-
     pub fn cleanup() {}
 }
