@@ -646,6 +646,19 @@ pub fn view_kline<'a>(
             |value| format!("{value:.1} × strike gap"),
             Some(0.1),
         );
+        let horizontal_span = labeled_slider(
+            "Horizontal span",
+            15.0..=70.0,
+            levels.horizontal_span_percent,
+            move |horizontal_span_percent| {
+                update(GexLevelsConfig {
+                    horizontal_span_percent,
+                    ..levels
+                })
+            },
+            |value| format!("{value:.0}%"),
+            Some(1.0),
+        );
         let line_width = labeled_slider(
             "Level line width",
             0.5..=3.0,
@@ -746,6 +759,7 @@ pub fn view_kline<'a>(
                     Some(levels.cluster_color),
                     move |cluster_color| update(GexLevelsConfig {
                         cluster_color,
+                        cluster_color_customized: true,
                         ..levels
                     })
                 )
@@ -775,16 +789,8 @@ pub fn view_kline<'a>(
                     .show_top_clusters =
                     v),
                 max_clusters,
-                toggle("Clusters as bands", levels.clusters_as_bands, |c, v| c
-                    .clusters_as_bands =
-                    v),
                 band_width,
-                toggle("Show value", levels.show_value, |c, v| c.show_value = v),
-                toggle(
-                    "Show distance from price",
-                    levels.show_distance_percent,
-                    |c, v| c.show_distance_percent = v
-                ),
+                horizontal_span,
                 line_width,
                 flip_width,
                 line_opacity,

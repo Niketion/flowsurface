@@ -141,10 +141,13 @@ pub struct GexLevelsConfig {
     pub gamma_flip_width: f32,
     pub line_opacity: f32,
     pub band_opacity: f32,
+    pub horizontal_span_percent: f32,
     pub gamma_flip_color: GexLevelColor,
     pub call_wall_color: GexLevelColor,
     pub put_wall_color: GexLevelColor,
     pub cluster_color: GexLevelColor,
+    #[serde(default)]
+    pub cluster_color_customized: bool,
 }
 
 impl Default for GexLevelsConfig {
@@ -166,10 +169,20 @@ impl Default for GexLevelsConfig {
             gamma_flip_width: 1.8,
             line_opacity: 0.78,
             band_opacity: 0.12,
+            horizontal_span_percent: 35.0,
             gamma_flip_color: GexLevelColor::Warning,
             call_wall_color: GexLevelColor::Success,
             put_wall_color: GexLevelColor::Danger,
-            cluster_color: GexLevelColor::Secondary,
+            cluster_color: GexLevelColor::Primary,
+            cluster_color_customized: false,
+        }
+    }
+}
+
+impl GexLevelsConfig {
+    pub fn migrate_legacy_defaults(&mut self) {
+        if !self.cluster_color_customized && self.cluster_color == GexLevelColor::Secondary {
+            self.cluster_color = GexLevelColor::Primary;
         }
     }
 }
@@ -795,5 +808,29 @@ mod tests {
         assert!(!cfg.show_header_call_wall);
         assert!(!cfg.show_header_put_wall);
         assert!(!cfg.show_header_snapshot);
+    }
+
+    #[test]
+    fn legacy_levels_config_loads_and_migrates_old_cluster_default() {
+        let mut legacy: GexLevelsConfig = serde_json::from_str(
+            r#"{
+                "clusters_as_bands": false,
+                "show_value": false,
+                "show_distance_percent": false,
+                "cluster_color": "Secondary"
+            }"#,
+        )
+        .expect("legacy levels config");
+        legacy.migrate_legacy_defaults();
+        assert_eq!(legacy.cluster_color, GexLevelColor::Primary);
+        assert_eq!(legacy.horizontal_span_percent, 35.0);
+
+        let mut customized = GexLevelsConfig {
+            cluster_color: GexLevelColor::Secondary,
+            cluster_color_customized: true,
+            ..GexLevelsConfig::default()
+        };
+        customized.migrate_legacy_defaults();
+        assert_eq!(customized.cluster_color, GexLevelColor::Secondary);
     }
 }

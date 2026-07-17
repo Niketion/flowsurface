@@ -2424,6 +2424,9 @@ impl canvas::Program<Message> for KlineChart {
                             self.data_source
                                 .latest_y_midpoint(|kline| kline.close.to_f32_lossy())
                                 as f64,
+                            region,
+                            chart.scaling,
+                            bounds.width,
                             palette,
                         );
                     }
@@ -2614,6 +2617,29 @@ fn build_vwap_sessions(
     sessions
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum GexOverlayKind {
+    GammaFlip,
+    CallWall,
+    PutWall,
+    GammaCluster,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum GexOverlayPrimitive {
+    Line,
+    Band,
+}
+
+fn gex_overlay_primitive(kind: GexOverlayKind) -> GexOverlayPrimitive {
+    match kind {
+        GexOverlayKind::GammaCluster => GexOverlayPrimitive::Band,
+        GexOverlayKind::GammaFlip | GexOverlayKind::CallWall | GexOverlayKind::PutWall => {
+            GexOverlayPrimitive::Line
+        }
+    }
+}
+
 fn draw_gex_levels(
     frame: &mut canvas::Frame,
     price_to_y: impl Fn(Price) -> f32,
@@ -2621,22 +2647,15 @@ fn draw_gex_levels(
     config: &data::chart::gex::GexLevelsConfig,
     tick_size: PriceStep,
     latest_chart_price: f64,
+    visible_region: Rectangle,
+    chart_scaling: f32,
+    frame_width_px: f32,
     palette: &Extended,
 ) {
     use data::chart::gex::{GexBasisMode, GexLevelColor};
 
-    #[derive(Clone, Copy, PartialEq, Eq)]
-    enum Kind {
-        Flip,
-        CallWall,
-        PutWall,
-        Cluster,
-        Spot,
-    }
-
     struct Level {
-        kind: Kind,
-        label: &'static str,
+        kind: GexOverlayKind,
         raw: f64,
         half_band: f64,
         color: Color,
@@ -2658,13 +2677,20 @@ fn draw_gex_levels(
     } else {
         0.0
     };
+    let Some(horizontal) = gex_overlay_horizontal_bounds(
+        visible_region,
+        chart_scaling,
+        frame_width_px,
+        config.horizontal_span_percent,
+    ) else {
+        return;
+    };
     let mut levels = Vec::new();
     if config.show_gamma_flip
         && let Some(value) = snapshot.gamma_flip
     {
         levels.push(Level {
-            kind: Kind::Flip,
-            label: "Gamma Flip",
+            kind: GexOverlayKind::GammaFlip,
             raw: value,
             half_band: 0.0,
             color: resolve_color(config.gamma_flip_color),
@@ -2674,8 +2700,7 @@ fn draw_gex_levels(
         && let Some(value) = snapshot.call_wall
     {
         levels.push(Level {
-            kind: Kind::CallWall,
-            label: "Call Wall",
+            kind: GexOverlayKind::CallWall,
             raw: value,
             half_band: 0.0,
             color: resolve_color(config.call_wall_color),
@@ -2685,8 +2710,7 @@ fn draw_gex_levels(
         && let Some(value) = snapshot.put_wall
     {
         levels.push(Level {
-            kind: Kind::PutWall,
-            label: "Put Wall",
+            kind: GexOverlayKind::PutWall,
             raw: value,
             half_band: 0.0,
             color: resolve_color(config.put_wall_color),
@@ -2721,217 +2745,222 @@ fn draw_gex_levels(
                 minimum * 4.0
             });
             levels.push(Level {
-                kind: Kind::Cluster,
-                label: "Gamma Cluster",
+                kind: GexOverlayKind::GammaCluster,
                 raw: strike.strike,
                 half_band,
                 color: resolve_color(config.cluster_color),
             });
         }
     }
-    if latest_chart_price.is_finite() && latest_chart_price > 0.0 {
-        levels.push(Level {
-            kind: Kind::Spot,
-            label: "Spot",
-            raw: latest_chart_price - basis,
-            half_band: 0.0,
-            color: resolve_color(GexLevelColor::Primary),
-        });
-    }
 
     levels.sort_by_key(|level| match level.kind {
-        Kind::Cluster => 0,
-        Kind::CallWall | Kind::PutWall => 1,
-        Kind::Flip => 2,
-        Kind::Spot => 3,
+        GexOverlayKind::GammaCluster => 0,
+        GexOverlayKind::CallWall | GexOverlayKind::PutWall => 1,
+        GexOverlayKind::GammaFlip => 2,
     });
-    let mut labels = Vec::new();
+    let mut cluster_bands = Vec::new();
+    let mut line_levels = Vec::new();
     for level in levels {
         let displayed = level.raw + basis;
         if !displayed.is_finite() || displayed <= 0.0 {
             continue;
         }
         let y = price_to_y(Price::from_f64(displayed));
-        if !y.is_finite() || y < 0.0 || y > frame.height() {
+        if !y.is_finite() {
             continue;
         }
-        if level.kind == Kind::Cluster && config.clusters_as_bands {
+        if gex_overlay_primitive(level.kind) == GexOverlayPrimitive::Band {
             let upper_y = price_to_y(Price::from_f64(displayed + level.half_band));
             let lower_y = price_to_y(Price::from_f64(
                 (displayed - level.half_band).max(f64::EPSILON),
             ));
-            let height = cluster_band_pixel_height(upper_y, lower_y);
+            if !upper_y.is_finite() || !lower_y.is_finite() {
+                continue;
+            }
+            let cap = gex_screen_width_to_world(18.0, chart_scaling);
+            let minimum = gex_screen_width_to_world(1.0, chart_scaling);
+            let height = (upper_y - lower_y).abs().clamp(minimum, cap);
             let top = y - height * 0.5;
-            frame.fill(
-                &Path::rectangle(Point::new(0.0, top), Size::new(frame.width(), height)),
-                level
-                    .color
-                    .scale_alpha(config.band_opacity.clamp(0.02, 0.4)),
-            );
-            let center = Path::line(Point::new(0.0, y), Point::new(frame.width(), y));
-            frame.stroke(
-                &center,
-                Stroke::default()
-                    .with_color(level.color.scale_alpha(config.line_opacity.clamp(0.1, 1.0)))
-                    .with_width(config.line_width.clamp(0.5, 3.0)),
-            );
+            let bottom = y + height * 0.5;
+            let region_bottom = visible_region.y + visible_region.height;
+            if bottom < visible_region.y || top > region_bottom {
+                continue;
+            }
+            cluster_bands.push((
+                top.max(visible_region.y),
+                bottom.min(region_bottom),
+                level.color,
+            ));
         } else {
-            let path = Path::line(Point::new(0.0, y), Point::new(frame.width(), y));
-            let width = if level.kind == Kind::Flip {
+            if !gex_level_is_visible(y, visible_region) {
+                continue;
+            }
+            let width_px = if level.kind == GexOverlayKind::GammaFlip {
                 config.gamma_flip_width.clamp(1.0, 4.0)
             } else {
                 config.line_width.clamp(0.5, 3.0)
             };
-            frame.stroke(
-                &path,
-                Stroke::default()
-                    .with_color(level.color.scale_alpha(config.line_opacity.clamp(0.1, 1.0)))
-                    .with_width(width),
-            );
+            line_levels.push((y, level.color, width_px));
         }
-
-        let short = frame.width() < 520.0;
-        let mut label = if short {
-            match level.kind {
-                Kind::Flip => "GF",
-                Kind::CallWall => "CW",
-                Kind::PutWall => "PW",
-                Kind::Cluster => "GC",
-                Kind::Spot => "S",
-            }
-            .to_string()
-        } else {
-            level.label.to_string()
-        };
-        if config.show_value {
-            label.push_str(&format!(" {displayed:.2}"));
-        }
-        if config.show_distance_percent
-            && latest_chart_price.is_finite()
-            && latest_chart_price > 0.0
-        {
-            label.push_str(&format!(
-                " {:+.2}%",
-                (displayed - latest_chart_price) / latest_chart_price * 100.0
-            ));
-        }
-        if config.basis_mode == GexBasisMode::ShiftToChartPrice && level.kind != Kind::Spot {
-            label.push_str(&format!(" · SHIFT {basis:+.2}"));
-        }
-        labels.push((y, label, level.color));
     }
-
-    let positions = layout_gex_badges(
-        &labels.iter().map(|(y, _, _)| *y).collect::<Vec<_>>(),
-        frame.height(),
-        13.0,
-        20.0,
-    );
-    for ((line_y, label, color), position) in labels.into_iter().zip(positions) {
-        let label_y = position.label_y;
-        let width = (label.chars().count() as f32 * 5.2 + 10.0)
-            .min(220.0)
-            .min(frame.width() * 0.45);
-        let x = (frame.width() - width - 6.0).max(2.0);
-        if position.connector {
-            frame.stroke(
-                &Path::line(Point::new(x - 7.0, line_y), Point::new(x, label_y)),
-                Stroke::default()
-                    .with_color(color.scale_alpha(0.7))
-                    .with_width(0.8),
-            );
-        }
+    for (top, bottom, color) in merge_cluster_bands(
+        cluster_bands,
+        gex_screen_width_to_world(18.0, chart_scaling),
+    ) {
         frame.fill(
-            &Path::rectangle(Point::new(x, label_y - 7.0), Size::new(width, 13.0)),
-            palette.background.base.color.scale_alpha(0.86),
-        );
-        draw_cluster_text(
-            frame,
-            &label,
-            Point::new(x + 4.0, label_y),
-            7.0,
-            color,
-            Alignment::Start,
-            Alignment::Center,
+            &Path::rectangle(
+                Point::new(horizontal.start_x, top),
+                Size::new(horizontal.end_x - horizontal.start_x, bottom - top),
+            ),
+            color.scale_alpha(config.band_opacity.clamp(0.02, 0.4)),
         );
     }
-}
-
-fn cluster_band_pixel_height(upper_y: f32, lower_y: f32) -> f32 {
-    (upper_y - lower_y).abs().clamp(1.0, 18.0)
+    for (y, color, width_px) in line_levels {
+        frame.stroke(
+            &Path::line(
+                Point::new(horizontal.start_x, y),
+                Point::new(horizontal.end_x, y),
+            ),
+            Stroke::default()
+                .with_color(color.scale_alpha(config.line_opacity.clamp(0.1, 1.0)))
+                .with_width(gex_screen_width_to_world(width_px, chart_scaling)),
+        );
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq)]
-struct GexBadgePosition {
-    real_y: f32,
-    label_y: f32,
-    connector: bool,
+struct GexOverlayHorizontalBounds {
+    start_x: f32,
+    end_x: f32,
 }
 
-fn layout_gex_badges(
-    real_y: &[f32],
-    viewport_height: f32,
-    minimum_gap: f32,
-    maximum_shift: f32,
-) -> Vec<GexBadgePosition> {
-    let mut indexed = real_y
-        .iter()
-        .copied()
-        .enumerate()
-        .filter(|(_, y)| y.is_finite() && *y >= 0.0 && *y <= viewport_height)
-        .collect::<Vec<_>>();
-    indexed.sort_by(|a, b| a.1.total_cmp(&b.1));
-    let mut result = vec![None; real_y.len()];
-    let mut previous = f32::NEG_INFINITY;
-    for (index, y) in indexed {
-        let desired = (previous + minimum_gap).max(y);
-        let label_y = desired
-            .min(y + maximum_shift)
-            .min((viewport_height - 7.0).max(7.0));
-        previous = label_y;
-        result[index] = Some(GexBadgePosition {
-            real_y: y,
-            label_y,
-            connector: (label_y - y).abs() > 0.5,
-        });
+fn gex_level_is_visible(y: f32, region: Rectangle) -> bool {
+    y.is_finite() && y >= region.y && y <= region.y + region.height
+}
+
+fn gex_screen_width_to_world(px: f32, scaling: f32) -> f32 {
+    if scaling.is_finite() && scaling > 0.0 {
+        px / scaling
+    } else {
+        0.0
     }
-    result.into_iter().flatten().collect()
+}
+
+fn gex_overlay_horizontal_bounds(
+    region: Rectangle,
+    scaling: f32,
+    frame_width_px: f32,
+    span_percent: f32,
+) -> Option<GexOverlayHorizontalBounds> {
+    if !scaling.is_finite()
+        || scaling <= 0.0
+        || !frame_width_px.is_finite()
+        || frame_width_px <= 0.0
+        || region.width <= 0.0
+    {
+        return None;
+    }
+    let viewport_width = region.width.min(frame_width_px / scaling);
+    let right_padding = gex_screen_width_to_world(12.0, scaling);
+    let end_x = region.x + region.width - right_padding;
+    let span = viewport_width * (span_percent.clamp(15.0, 70.0) / 100.0);
+    (span > 0.0 && end_x > region.x).then_some(GexOverlayHorizontalBounds {
+        start_x: (end_x - span).max(region.x),
+        end_x,
+    })
+}
+
+fn merge_cluster_bands(
+    mut bands: Vec<(f32, f32, Color)>,
+    maximum_height: f32,
+) -> Vec<(f32, f32, Color)> {
+    bands.sort_by(|a, b| a.0.total_cmp(&b.0));
+    let mut merged: Vec<(f32, f32, Color)> = Vec::new();
+    for (top, bottom, color) in bands {
+        if let Some(last) = merged.last_mut()
+            && top <= last.1
+        {
+            let center = (last.0.min(top) + last.1.max(bottom)) * 0.5;
+            let height = (last.1.max(bottom) - last.0.min(top)).min(maximum_height);
+            last.0 = center - height * 0.5;
+            last.1 = center + height * 0.5;
+            continue;
+        }
+        merged.push((top, bottom, color));
+    }
+    merged
 }
 
 #[cfg(test)]
-mod gex_layout_tests {
+mod gex_overlay_tests {
     use super::*;
+    use data::chart::gex::{GexLevelColor, GexLevelsConfig};
 
     #[test]
-    fn nearby_badges_are_separated_with_bounded_connectors() {
-        let positions = layout_gex_badges(&[100.0, 104.0, 220.0], 300.0, 13.0, 20.0);
-        assert_eq!(positions[0].label_y, 100.0);
-        assert_eq!(positions[1].label_y, 113.0);
-        assert!(positions[1].connector);
-        assert!((positions[1].label_y - positions[1].real_y).abs() <= 20.0);
-        assert!(!positions[2].connector);
+    fn overlay_contains_only_three_line_kinds_and_cluster_bands() {
+        assert_eq!(
+            gex_overlay_primitive(GexOverlayKind::GammaFlip),
+            GexOverlayPrimitive::Line
+        );
+        assert_eq!(
+            gex_overlay_primitive(GexOverlayKind::CallWall),
+            GexOverlayPrimitive::Line
+        );
+        assert_eq!(
+            gex_overlay_primitive(GexOverlayKind::PutWall),
+            GexOverlayPrimitive::Line
+        );
+        assert_eq!(
+            gex_overlay_primitive(GexOverlayKind::GammaCluster),
+            GexOverlayPrimitive::Band
+        );
     }
 
     #[test]
-    fn offscreen_badges_are_not_clamped_to_edges() {
-        let positions = layout_gex_badges(&[-1.0, 50.0, 301.0], 300.0, 13.0, 20.0);
-        assert_eq!(positions.len(), 1);
-        assert_eq!(positions[0].real_y, 50.0);
+    fn semantic_default_colors_are_distinct() {
+        let config = GexLevelsConfig::default();
+        assert_eq!(config.call_wall_color, GexLevelColor::Success);
+        assert_eq!(config.put_wall_color, GexLevelColor::Danger);
+        assert_eq!(config.gamma_flip_color, GexLevelColor::Warning);
+        assert_eq!(config.cluster_color, GexLevelColor::Primary);
     }
 
     #[test]
-    fn resize_recomputes_from_real_y_without_time_coordinates() {
-        let small = layout_gex_badges(&[30.0, 35.0], 100.0, 13.0, 20.0);
-        let large = layout_gex_badges(&[60.0, 70.0], 200.0, 13.0, 20.0);
-        assert_eq!(small[0].real_y, 30.0);
-        assert_eq!(large[0].real_y, 60.0);
-        assert_eq!(large[1].label_y, 73.0);
+    fn visibility_uses_world_space_visible_region() {
+        let region = Rectangle::new(Point::new(400.0, 800.0), Size::new(300.0, 200.0));
+        assert!(gex_level_is_visible(900.0, region));
+        assert!(!gex_level_is_visible(399.0, region));
+        assert!(!gex_level_is_visible(1_001.0, region));
     }
 
     #[test]
-    fn gamma_cluster_band_has_a_hard_pixel_cap() {
-        assert_eq!(cluster_band_pixel_height(10.0, 100.0), 18.0);
-        assert_eq!(cluster_band_pixel_height(10.0, 20.0), 10.0);
+    fn horizontal_bounds_anchor_to_viewport_right_across_pan_and_zoom() {
+        let base = Rectangle::new(Point::new(100.0, 50.0), Size::new(1_000.0, 500.0));
+        let panned = Rectangle::new(Point::new(600.0, 50.0), Size::new(1_000.0, 500.0));
+        let first = gex_overlay_horizontal_bounds(base, 1.0, 1_000.0, 35.0).expect("bounds");
+        let second = gex_overlay_horizontal_bounds(panned, 1.0, 1_000.0, 35.0).expect("bounds");
+        assert_eq!(second.start_x - first.start_x, 500.0);
+        assert_eq!(second.end_x - first.end_x, 500.0);
+        assert!((first.end_x - first.start_x) <= base.width * 0.35 + f32::EPSILON);
+
+        let zoomed = gex_overlay_horizontal_bounds(base, 2.0, 1_000.0, 35.0).expect("zoom bounds");
+        assert_eq!((zoomed.end_x - zoomed.start_x) * 2.0, 350.0);
+        assert_eq!((base.x + base.width - zoomed.end_x) * 2.0, 12.0);
+    }
+
+    #[test]
+    fn screen_widths_remain_constant_after_scaling() {
+        assert_eq!(gex_screen_width_to_world(2.0, 1.0), 2.0);
+        assert_eq!(gex_screen_width_to_world(2.0, 2.0) * 2.0, 2.0);
+        assert_eq!(gex_screen_width_to_world(18.0, 3.0) * 3.0, 18.0);
+    }
+
+    #[test]
+    fn overlapping_cluster_bands_are_merged_and_capped() {
+        let color = Color::BLACK;
+        let merged = merge_cluster_bands(vec![(10.0, 20.0, color), (15.0, 30.0, color)], 18.0);
+        assert_eq!(merged.len(), 1);
+        assert!((merged[0].1 - merged[0].0) <= 18.0);
     }
 }
 

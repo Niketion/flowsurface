@@ -540,6 +540,7 @@ impl Config {
         if let Some(legacy) = self.legacy_gex_levels.take() {
             self.indicator_configs.gex_levels = legacy;
         }
+        self.indicator_configs.gex_levels.migrate_legacy_defaults();
     }
 }
 
