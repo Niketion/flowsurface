@@ -1,11 +1,8 @@
 use crate::{chart::gex, style};
-use data::chart::gex::{GexFreshness, GexSignModel};
+use data::chart::gex::{GexFreshness, GexSignModel, GexStrike};
 use iced::{
-    Alignment, Border, Color, Element, Length, Point, Rectangle, Renderer, Theme, mouse,
-    widget::{
-        button, canvas, column, container, mouse_area, responsive, row, scrollable, space, stack,
-        text, tooltip,
-    },
+    Alignment, Color, Element, Length, Point, Rectangle, Renderer, Size, Theme, mouse,
+    widget::{button, canvas, column, container, mouse_area, responsive, row, space, text},
 };
 
 pub fn view(chart: &gex::GexChart) -> Element<'_, gex::Message> {
@@ -29,441 +26,210 @@ impl GexLayoutDensity {
             Self::Minimal
         }
     }
-
-    fn show_net_column(self) -> bool {
-        self == Self::Full
-    }
 }
 
 fn view_sized(chart: &gex::GexChart, density: GexLayoutDensity) -> Element<'_, gex::Message> {
     let Some(snapshot) = chart.snapshot() else {
-        let message = match chart.freshness() {
-            GexFreshness::Error => "GEX data unavailable.",
-            _ => "Waiting for GEX data...",
-        };
-        return iced::widget::center(
-            column![
-                text(message).size(style::text_size::TITLE),
-                text(chart.error().unwrap_or_default())
-            ]
-            .align_x(Alignment::Center),
-        )
-        .into();
-    };
-
-    let freshness = match chart.freshness() {
-        GexFreshness::Loading => "Loading",
-        GexFreshness::Fresh => "Fresh",
-        GexFreshness::Stale => "Stale",
-        GexFreshness::Expired => "Expired",
-        GexFreshness::Error => "Error · cached",
-    };
-    let timestamp = snapshot
-        .observed_at
-        .format_utc("%Y-%m-%d %H:%M:%S UTC")
-        .unwrap_or_else(|| "unknown".into());
-
-    let title = row![
-        text(if density == GexLayoutDensity::Minimal {
-            format!("{} GEX", snapshot.underlying)
+        return iced::widget::center(text(if chart.freshness() == GexFreshness::Error {
+            "GEX data unavailable."
         } else {
-            format!(
-                "{} GEX · {} · {}",
-                snapshot.underlying, snapshot.provider, snapshot.model
-            )
-        })
-        .size(style::text_size::SECTION),
-        space::horizontal(),
-        tooltip(
-            button(style::icon_text(style::Icon::ResizeSmall, 11))
-                .padding(5)
-                .on_press(gex::Message::AutoFit),
-            container(text("Auto-fit · double-click").size(style::text_size::SMALL))
-                .padding(5)
-                .style(container::rounded_box),
-            tooltip::Position::Bottom,
-        ),
-    ]
-    .align_y(Alignment::Center);
-
-    let mut header = column![title].spacing(5);
-    if chart.config().show_summary {
-        let exposure_row = row![
-            summary_item(
-                "Net GEX",
-                snapshot
-                    .net_gex_1pct
-                    .map(format_exposure)
-                    .unwrap_or_else(|| "N/A".into()),
-            ),
-            if density != GexLayoutDensity::Minimal {
-                summary_item("Absolute GEX", format_exposure(snapshot.absolute_gex_1pct))
-            } else {
-                space::horizontal().width(0).into()
-            },
-        ]
-        .spacing(4);
-        let levels_row = row![
-            summary_item(
-                "Gamma Flip",
-                format_level_distance(snapshot.gamma_flip, snapshot.source_spot),
-            ),
-            if density != GexLayoutDensity::Minimal {
-                summary_item(
-                    "Call Wall",
-                    format_level_distance(snapshot.call_wall, snapshot.source_spot),
-                )
-            } else {
-                space::horizontal().width(0).into()
-            },
-            if density != GexLayoutDensity::Minimal {
-                summary_item(
-                    "Put Wall",
-                    format_level_distance(snapshot.put_wall, snapshot.source_spot),
-                )
-            } else {
-                space::horizontal().width(0).into()
-            },
-        ]
-        .spacing(4);
-        let short_timestamp = snapshot
-            .observed_at
-            .format_utc("%H:%M:%S")
-            .unwrap_or_else(|| "unknown".into());
-        let metadata_row = row![
-            text(format!("Expiry: {}", chart.config().expiry_filter)),
-            text(format!("Freshness: {freshness}")),
-            text(format!(
-                "Snapshot: {}",
-                if density == GexLayoutDensity::Minimal {
-                    short_timestamp
-                } else {
-                    timestamp.clone()
-                }
-            )),
-        ]
-        .spacing(14);
-        header = header
-            .push(exposure_row)
-            .push(levels_row)
-            .push(metadata_row);
-    }
-    if snapshot.model == GexSignModel::CallPutOiProxy && snapshot.gamma_flip.is_none() {
-        header = header.push(text("No gamma flip in the configured price range."));
-    }
-    if let Some(error) = chart.error() {
-        header = header.push(text(format!("Last refresh error: {error}")));
-    }
-
-    if snapshot.strikes.is_empty() {
-        return column![
-            header,
-            iced::widget::center(text("No valid options for the selected expiry filter."))
-        ]
-        .padding(8)
+            "Waiting for GEX data..."
+        }))
         .into();
-    }
-
+    };
     let visible = chart.visible_strikes();
     if visible.is_empty() {
-        return column![
-            header,
-            iced::widget::center(text("No strikes in the configured price range."))
-        ]
-        .padding(8)
-        .into();
-    }
-    let max_visible = visible
-        .iter()
-        .map(|strike| {
-            strike
-                .call_gex_1pct
-                .abs()
-                .max(strike.put_gex_1pct.abs())
-                .max(strike.net_gex_1pct.abs())
-                .max(strike.absolute_gamma_1pct)
-        })
-        .fold(0.0_f64, f64::max)
-        .max(f64::EPSILON);
-    let step = visible
-        .windows(2)
-        .map(|pair| (pair[1].strike - pair[0].strike).abs())
-        .filter(|step| *step > 0.0)
-        .fold(f64::INFINITY, f64::min);
-    let tolerance = if step.is_finite() {
-        step * 0.5
-    } else {
-        snapshot.source_spot * 0.001
-    };
-    let proximity =
-        |strike: f64, level: Option<f64>| level.is_some_and(|v| (strike - v).abs() <= tolerance);
-
-    let mut strike_rows = column![].spacing(1);
-    for strike in visible.iter().rev() {
-        let absolute_mode = snapshot.model == GexSignModel::AbsoluteGamma;
-        let put = if absolute_mode {
-            1
-        } else {
-            portion(strike.put_gex_1pct.abs(), max_visible)
-        };
-        let call = portion(
-            if absolute_mode {
-                strike.absolute_gamma_1pct
-            } else {
-                strike.call_gex_1pct
-            },
-            max_visible,
-        );
-        let mut detail_label = String::new();
-        if chart.config().show_net_gex {
-            detail_label = if absolute_mode {
-                format!("abs {}", format_exposure(strike.absolute_gamma_1pct))
-            } else {
-                format!("net {}", format_exposure(strike.net_gex_1pct))
-            };
-        }
-        if chart.config().show_absolute_gamma && !absolute_mode {
-            detail_label.push_str(&format!(
-                "{}abs {}",
-                if detail_label.is_empty() { "" } else { " · " },
-                format_exposure(strike.absolute_gamma_1pct)
-            ));
-        }
-
-        let left = if chart.config().show_put_gex && !absolute_mode {
-            row![
-                space::horizontal().width(Length::FillPortion(1000 - put)),
-                container(space::horizontal())
-                    .width(Length::FillPortion(put))
-                    .height(8)
-                    .style(container::danger)
-            ]
-        } else {
-            row![space::horizontal()]
-        };
-        let right = if chart.config().show_call_gex {
-            row![
-                container(space::horizontal())
-                    .width(Length::FillPortion(call))
-                    .height(8)
-                    .style(container::success),
-                space::horizontal().width(Length::FillPortion(1000 - call))
-            ]
-        } else {
-            row![space::horizontal()]
-        };
-
-        let is_call = chart.config().show_call_wall && proximity(strike.strike, snapshot.call_wall);
-        let is_put = chart.config().show_put_wall && proximity(strike.strike, snapshot.put_wall);
-        let mut badges = Vec::new();
-        if is_call {
-            badges.push(if density == GexLayoutDensity::Full {
-                "Call Wall"
-            } else {
-                "CW"
-            });
-        }
-        if is_put {
-            badges.push(if density == GexLayoutDensity::Full {
-                "Put Wall"
-            } else {
-                "PW"
-            });
-        }
-        let badges = if badges.is_empty() {
-            String::new()
-        } else {
-            format!("[{}]", badges.join(" · "))
-        };
-        let marker = if is_call {
-            Some(MarkerColor::Success)
-        } else if is_put {
-            Some(MarkerColor::Danger)
-        } else {
-            None
-        };
-        let mut strike_row = row![
-            left.width(Length::FillPortion(5)),
-            container(space::horizontal())
-                .width(2)
-                .height(20)
-                .style(|theme: &iced::Theme| {
-                    let palette = theme.extended_palette();
-                    container::Style {
-                        background: Some(palette.background.base.text.scale_alpha(0.75).into()),
-                        ..container::Style::default()
-                    }
-                }),
-            right.width(Length::FillPortion(5)),
-            text(format!("{:>10.2}", strike.strike)).width(88),
-        ]
-        .align_y(Alignment::Center)
-        .spacing(3);
-        if density.show_net_column() {
-            strike_row = strike_row.push(
-                text(detail_label)
-                    .wrapping(iced::widget::text::Wrapping::None)
-                    .width(Length::FillPortion(2)),
-            );
-        }
-        if density != GexLayoutDensity::Compact || !badges.is_empty() {
-            strike_row = strike_row.push(
-                text(badges)
-                    .wrapping(iced::widget::text::Wrapping::None)
-                    .width(if density == GexLayoutDensity::Full {
-                        Length::FillPortion(2)
-                    } else {
-                        Length::Fixed(34.0)
-                    }),
-            );
-        }
-        strike_row = strike_row.push(space::horizontal().width(10));
-        let strike_row = container(strike_row)
-            .padding([1, 3])
-            .style(move |theme: &iced::Theme| marker_row_style(theme, marker));
-        let detail = container(text(format!(
-            "Strike: {:.2}\nDistance from spot: {:+.2} ({:+.2}%)\nCall GEX: {}\nPut GEX: {}\nNet GEX: {}\nAbsolute gamma: {}\nCall OI: {:.2}\nPut OI: {:.2}\nExpiries: {}",
-            strike.strike,
-            strike.strike - snapshot.source_spot,
-            (strike.strike - snapshot.source_spot) / snapshot.source_spot * 100.0,
-            format_exposure(strike.call_gex_1pct),
-            format_exposure(strike.put_gex_1pct),
-            format_exposure(strike.net_gex_1pct),
-            format_exposure(strike.absolute_gamma_1pct),
-            strike.call_open_interest,
-            strike.put_open_interest,
-            strike.expiration_count,
-        )))
-        .max_width(280)
-        .padding(7)
-        .style(container::rounded_box);
-        strike_rows = strike_rows.push(tooltip(strike_row, detail, tooltip::Position::Left));
+        return iced::widget::center(text("No strikes in the configured range.")).into();
     }
 
-    let axis_labels = row![
-        text(format!(
-            "−{}",
-            format_exposure(max_visible).trim_start_matches('+')
-        ))
-        .width(Length::Fill),
-        text("0").align_x(iced::alignment::Horizontal::Center),
-        text(format_exposure(max_visible))
-            .width(Length::Fill)
-            .align_x(iced::alignment::Horizontal::Right),
-        space::horizontal().width(Length::FillPortion(4)),
-    ];
-    let axis_line = row![
-        container(space::horizontal())
-            .height(1)
-            .width(Length::FillPortion(5))
-            .style(container::bordered_box),
-        container(space::horizontal())
-            .height(7)
-            .width(2)
-            .style(container::bordered_box),
-        container(space::horizontal())
-            .height(1)
-            .width(Length::FillPortion(5))
-            .style(container::bordered_box),
-        space::horizontal().width(Length::FillPortion(4)),
-    ]
-    .align_y(Alignment::Center);
-    let toolbar = row![
-        text(if snapshot.model == GexSignModel::CallPutOiProxy {
-            "Put GEX ←  GEX / 1%  → Call GEX"
-        } else {
-            "Absolute gamma concentration"
-        }),
-        space::horizontal(),
-        if density == GexLayoutDensity::Full {
-            text("scroll zoom · drag pan · double-click auto-fit").size(style::text_size::SMALL)
-        } else {
-            text("ⓘ").size(style::text_size::SMALL)
-        },
-    ];
-
-    let interactive_profile = mouse_area(strike_rows)
+    let mut zoom_in = button("Zoom +")
+        .padding([3, 7])
+        .style(iced::widget::button::secondary);
+    if chart.can_zoom_in() {
+        zoom_in = zoom_in.on_press(gex::Message::ZoomIn);
+    }
+    let mut zoom_out = button("Zoom −")
+        .padding([3, 7])
+        .style(iced::widget::button::secondary);
+    if chart.can_zoom_out() {
+        zoom_out = zoom_out.on_press(gex::Message::ZoomOut);
+    }
+    let controls = row![zoom_in, zoom_out].spacing(4);
+    let header = header_view(chart, snapshot, density);
+    let table = canvas(GexProfileTable {
+        snapshot,
+        strikes: visible,
+        density,
+        config: chart.config(),
+    })
+    .width(Length::Fill)
+    .height(Length::Fill);
+    let table = mouse_area(table)
         .on_double_click(gex::Message::AutoFit)
         .on_scroll(gex::Message::Scrolled)
         .on_press(gex::Message::DragStarted)
         .on_move(gex::Message::Dragged)
         .on_release(gex::Message::DragEnded)
-        .interaction(iced::mouse::Interaction::Grab);
-    let low = visible.first().map_or(0.0, |strike| strike.strike);
-    let high = visible.last().map_or(1.0, |strike| strike.strike);
-    let exact_levels = canvas(ProfileExactLevels {
-        low,
-        high,
-        spot: chart
-            .config()
-            .show_current_price
-            .then_some(snapshot.source_spot),
-        flip: chart
-            .config()
-            .show_gamma_flip
-            .then_some(snapshot.gamma_flip)
-            .flatten(),
-        density,
-    })
-    .width(Length::Fill)
-    .height(Length::Fill);
-    let profile_plot = stack![
-        exact_levels,
-        scrollable(interactive_profile).height(Length::Fill)
-    ];
-    let profile = column![toolbar, axis_labels, axis_line, profile_plot].spacing(2);
-    let gap = if density == GexLayoutDensity::Full {
-        6
-    } else {
-        3
-    };
+        .interaction(if chart.is_dragging() {
+            iced::mouse::Interaction::Grabbing
+        } else {
+            iced::mouse::Interaction::Grab
+        });
     let padding = if density == GexLayoutDensity::Full {
         8
     } else {
         4
     };
-    let content = column![header, profile].spacing(gap).padding(padding);
-    if matches!(
-        chart.freshness(),
-        GexFreshness::Stale | GexFreshness::Expired
-    ) {
-        container(content)
-            .style(|theme: &iced::Theme| {
-                let palette = theme.extended_palette();
-                container::Style {
-                    text_color: Some(palette.background.base.text.scale_alpha(0.62)),
-                    ..container::Style::default()
-                }
-            })
-            .into()
-    } else {
-        content.into()
+    column![header, controls, table]
+        .spacing(4)
+        .padding(padding)
+        .into()
+}
+
+fn header_view<'a>(
+    chart: &gex::GexChart,
+    snapshot: &data::chart::gex::GexSnapshot,
+    _density: GexLayoutDensity,
+) -> Element<'a, gex::Message> {
+    let cfg = chart.config();
+    if !cfg.show_summary {
+        return space::vertical().height(0).into();
+    }
+    let status = match chart.freshness() {
+        GexFreshness::Loading => "Loading",
+        GexFreshness::Fresh => "Fresh",
+        GexFreshness::Stale => "Stale",
+        GexFreshness::Expired => "Expired",
+        GexFreshness::Error => "Error",
+    };
+    let abnormal = chart.freshness() != GexFreshness::Fresh;
+    let mut fields: Vec<Element<'a, gex::Message>> = Vec::new();
+    let mut push = |label: &'static str, value: String| {
+        fields.push(
+            container(
+                row![
+                    text(label).size(style::text_size::SMALL),
+                    text(value)
+                        .size(style::text_size::SMALL)
+                        .wrapping(iced::widget::text::Wrapping::None)
+                ]
+                .spacing(4)
+                .align_y(Alignment::Center),
+            )
+            .padding([2, 5])
+            .style(container::rounded_box)
+            .into(),
+        );
+    };
+    if cfg.show_header_net_gex {
+        push(
+            "Net",
+            snapshot
+                .net_gex_1pct
+                .map(format_exposure)
+                .unwrap_or_else(|| "N/A".into()),
+        );
+    }
+    if cfg.show_header_absolute_gex {
+        push("Abs", format_exposure(snapshot.absolute_gex_1pct));
+    }
+    if cfg.show_header_gamma_flip {
+        push("GF", format_level(snapshot.gamma_flip));
+    }
+    if cfg.show_header_call_wall {
+        push("CW", format_level(snapshot.call_wall));
+    }
+    if cfg.show_header_put_wall {
+        push("PW", format_level(snapshot.put_wall));
+    }
+    if cfg.show_header_model {
+        push(
+            "Model",
+            if snapshot.model == GexSignModel::CallPutOiProxy {
+                "OI Proxy".into()
+            } else {
+                "Absolute".into()
+            },
+        );
+    }
+    if cfg.show_header_expiry {
+        push("Expiry", cfg.expiry_filter.to_string());
+    }
+    if cfg.show_header_freshness {
+        push("●", status.into());
+    }
+    if cfg.show_header_snapshot || abnormal {
+        push(
+            "At",
+            snapshot
+                .observed_at
+                .format_utc("%H:%M:%S")
+                .unwrap_or_else(|| "unknown".into()),
+        );
+    }
+    if abnormal && let Some(error) = chart.error() {
+        push("!", error.to_string());
+    }
+    row(fields).spacing(4).align_y(Alignment::Center).into()
+}
+
+#[derive(Debug, Clone, Copy, PartialEq)]
+struct GexTableColumns {
+    put_bounds: Rectangle,
+    zero_x: f32,
+    call_bounds: Rectangle,
+    strike_bounds: Rectangle,
+    net_bounds: Option<Rectangle>,
+    abs_bounds: Option<Rectangle>,
+    level_bounds: Rectangle,
+}
+
+fn table_columns(width: f32, density: GexLayoutDensity) -> GexTableColumns {
+    let usable = (width - 10.0).max(120.0);
+    let (bars, strike, net, abs) = match density {
+        GexLayoutDensity::Full => (0.42, 0.13, 0.13, 0.13),
+        GexLayoutDensity::Compact => (0.50, 0.16, 0.15, 0.0),
+        GexLayoutDensity::Minimal => (0.60, 0.20, 0.0, 0.0),
+    };
+    let bar_width = usable * bars;
+    let half = bar_width * 0.5;
+    let strike_x = bar_width;
+    let strike_width = usable * strike;
+    let net_width = usable * net;
+    let abs_width = usable * abs;
+    let level_x = strike_x + strike_width + net_width + abs_width;
+    GexTableColumns {
+        put_bounds: Rectangle::new(Point::ORIGIN, Size::new(half, 0.0)),
+        zero_x: half,
+        call_bounds: Rectangle::new(Point::new(half, 0.0), Size::new(half, 0.0)),
+        strike_bounds: Rectangle::new(Point::new(strike_x, 0.0), Size::new(strike_width, 0.0)),
+        net_bounds: (net > 0.0).then(|| {
+            Rectangle::new(
+                Point::new(strike_x + strike_width, 0.0),
+                Size::new(net_width, 0.0),
+            )
+        }),
+        abs_bounds: (abs > 0.0).then(|| {
+            Rectangle::new(
+                Point::new(strike_x + strike_width + net_width, 0.0),
+                Size::new(abs_width, 0.0),
+            )
+        }),
+        level_bounds: Rectangle::new(
+            Point::new(level_x, 0.0),
+            Size::new((usable - level_x).max(30.0), 0.0),
+        ),
     }
 }
 
-fn price_to_profile_y(price: f64, low: f64, high: f64, height: f32) -> Option<f32> {
-    if !price.is_finite()
-        || !low.is_finite()
-        || !high.is_finite()
-        || high <= low
-        || price < low
-        || price > high
-        || height <= 0.0
-    {
-        return None;
-    }
-    Some(((high - price) / (high - low)) as f32 * height)
-}
-
-struct ProfileExactLevels {
-    low: f64,
-    high: f64,
-    spot: Option<f64>,
-    flip: Option<f64>,
+struct GexProfileTable<'a> {
+    snapshot: &'a data::chart::gex::GexSnapshot,
+    strikes: &'a [GexStrike],
     density: GexLayoutDensity,
+    config: &'a data::chart::gex::Config,
 }
 
-impl canvas::Program<gex::Message> for ProfileExactLevels {
+impl canvas::Program<gex::Message> for GexProfileTable<'_> {
     type State = ();
 
     fn update(
@@ -482,149 +248,503 @@ impl canvas::Program<gex::Message> for ProfileExactLevels {
         renderer: &Renderer,
         theme: &Theme,
         bounds: Rectangle,
-        _cursor: mouse::Cursor,
+        cursor: mouse::Cursor,
     ) -> Vec<canvas::Geometry> {
         let palette = theme.extended_palette();
         let mut frame = canvas::Frame::new(renderer, bounds.size());
-        let spot_y = self
-            .spot
-            .and_then(|price| price_to_profile_y(price, self.low, self.high, bounds.height));
-        let flip_y = self
-            .flip
-            .and_then(|price| price_to_profile_y(price, self.low, self.high, bounds.height));
-        let draw_line = |frame: &mut canvas::Frame, y: f32, color: Color, width: f32| {
-            frame.stroke(
-                &canvas::Path::line(Point::new(0.0, y), Point::new(bounds.width, y)),
-                canvas::Stroke::default()
-                    .with_color(color)
-                    .with_width(width),
-            );
-        };
-        if let Some(y) = flip_y {
-            draw_line(&mut frame, y, palette.warning.strong.color, 1.6);
-        }
-        if let Some(y) = spot_y {
-            draw_line(&mut frame, y, palette.primary.strong.color, 1.2);
-        }
+        let columns = table_columns(bounds.width, self.density);
+        let header_h = 22.0;
+        let row_h = ((bounds.height - header_h) / self.strikes.len() as f32).clamp(10.0, 22.0);
+        let table_bottom = (header_h + row_h * self.strikes.len() as f32).min(bounds.height);
+        let max_gex = self
+            .strikes
+            .iter()
+            .map(|s| {
+                if self.snapshot.model == GexSignModel::AbsoluteGamma {
+                    s.absolute_gamma_1pct
+                } else {
+                    s.call_gex_1pct.abs().max(s.put_gex_1pct.abs())
+                }
+            })
+            .fold(f64::EPSILON, f64::max);
+        let row_centers = (0..self.strikes.len())
+            .map(|index| header_h + (self.strikes.len() - index) as f32 * row_h - row_h * 0.5)
+            .collect::<Vec<_>>();
+        let hovered = cursor.position_in(bounds).and_then(|point| {
+            (point.y >= header_h && point.y < table_bottom)
+                .then(|| ((point.y - header_h) / row_h) as usize)
+                .filter(|index| *index < self.strikes.len())
+                .map(|visual| self.strikes.len() - 1 - visual)
+        });
 
-        let compact = self.density != GexLayoutDensity::Full;
-        match (spot_y, self.spot, flip_y, self.flip) {
-            (Some(sy), Some(spot), Some(fy), Some(flip)) if (sy - fy).abs() < 13.0 => {
-                draw_profile_badge(
-                    &mut frame,
-                    bounds.width,
-                    (sy + fy) * 0.5,
-                    &format!(
-                        "{} {spot:.2} · {} {flip:.2}",
-                        if compact { "S" } else { "Spot" },
-                        if compact { "GF" } else { "Gamma Flip" }
+        draw_table_header(&mut frame, &columns, max_gex, palette.background.base.text);
+        for (index, strike) in self.strikes.iter().enumerate().rev() {
+            let y = row_centers[index];
+            let top = y - row_h * 0.5;
+            let is_call = self.snapshot.call_wall == Some(strike.strike);
+            let is_put = self.snapshot.put_wall == Some(strike.strike);
+            if hovered == Some(index) || is_call || is_put {
+                let color = if is_call {
+                    palette.success.strong.color
+                } else if is_put {
+                    palette.danger.strong.color
+                } else {
+                    palette.background.base.text
+                };
+                frame.fill(
+                    &canvas::Path::rectangle(
+                        Point::new(0.0, top),
+                        Size::new(columns.level_bounds.x + columns.level_bounds.width, row_h),
                     ),
-                    palette.warning.strong.color,
+                    color.scale_alpha(if hovered == Some(index) { 0.09 } else { 0.06 }),
                 );
             }
-            _ => {
-                if let (Some(y), Some(price)) = (spot_y, self.spot) {
-                    draw_profile_badge(
-                        &mut frame,
-                        bounds.width,
-                        y,
-                        &format!("{} {price:.2}", if compact { "S" } else { "Spot" }),
-                        palette.primary.strong.color,
-                    );
-                }
-                if let (Some(y), Some(price)) = (flip_y, self.flip) {
-                    draw_profile_badge(
-                        &mut frame,
-                        bounds.width,
-                        y,
-                        &format!("{} {price:.2}", if compact { "GF" } else { "Gamma Flip" }),
-                        palette.warning.strong.color,
-                    );
-                }
-            }
+            draw_strike_row(
+                &mut frame,
+                &columns,
+                strike,
+                y,
+                row_h,
+                max_gex,
+                self.density,
+                is_call,
+                is_put,
+                self.snapshot.model == GexSignModel::AbsoluteGamma,
+                palette,
+            );
+        }
+        draw_references(
+            &mut frame,
+            &columns,
+            self.strikes,
+            &row_centers,
+            self.config
+                .show_current_price
+                .then_some(self.snapshot.source_spot),
+            self.config
+                .show_gamma_flip
+                .then_some(self.snapshot.gamma_flip)
+                .flatten(),
+            self.density,
+            palette,
+        );
+        let (zero_start, zero_end) = zero_line_points(&columns, table_bottom);
+        frame.stroke(
+            &canvas::Path::line(zero_start, zero_end),
+            canvas::Stroke::default()
+                .with_color(palette.background.base.text.scale_alpha(0.7))
+                .with_width(1.2),
+        );
+        if let (Some(index), Some(point)) = (hovered, cursor.position_in(bounds)) {
+            draw_hover(
+                &mut frame,
+                bounds.size(),
+                point,
+                &self.strikes[index],
+                self.snapshot.source_spot,
+                palette,
+            );
         }
         vec![frame.into_geometry()]
     }
 }
 
-fn draw_profile_badge(frame: &mut canvas::Frame, right: f32, y: f32, label: &str, color: Color) {
-    let width = label.chars().count() as f32 * 5.4 + 8.0;
-    let x = profile_badge_x(right, width);
-    frame.fill(
-        &canvas::Path::rectangle(Point::new(x, y - 7.0), iced::Size::new(width, 14.0)),
-        color.scale_alpha(0.88),
+fn zero_line_points(columns: &GexTableColumns, table_bottom: f32) -> (Point, Point) {
+    (
+        Point::new(columns.zero_x, 0.0),
+        Point::new(columns.zero_x, table_bottom),
+    )
+}
+
+fn draw_table_header(
+    frame: &mut canvas::Frame,
+    columns: &GexTableColumns,
+    max_gex: f64,
+    color: Color,
+) {
+    let (negative_x, zero_x, positive_x) = scale_label_positions(columns);
+    draw_text_at(
+        frame,
+        &format!("−{}", compact_abs(max_gex)),
+        negative_x,
+        11.0,
+        9.0,
+        color,
+        iced::alignment::Horizontal::Left,
     );
+    draw_text_at(
+        frame,
+        "0",
+        zero_x,
+        11.0,
+        11.0,
+        color,
+        iced::alignment::Horizontal::Center,
+    );
+    draw_text_at(
+        frame,
+        &format!("+{}", compact_abs(max_gex)),
+        positive_x,
+        11.0,
+        9.0,
+        color,
+        iced::alignment::Horizontal::Right,
+    );
+    draw_cell_text(frame, "Strike", columns.strike_bounds, 11.0, color);
+    if let Some(bounds) = columns.net_bounds {
+        draw_cell_text(frame, "Net", bounds, 11.0, color);
+    }
+    if let Some(bounds) = columns.abs_bounds {
+        draw_cell_text(frame, "Abs", bounds, 11.0, color);
+    }
+    draw_cell_text(frame, "Level", columns.level_bounds, 11.0, color);
+}
+
+fn scale_label_positions(columns: &GexTableColumns) -> (f32, f32, f32) {
+    (
+        columns.put_bounds.x + 3.0,
+        columns.zero_x,
+        columns.call_bounds.x + columns.call_bounds.width - 3.0,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn draw_strike_row(
+    frame: &mut canvas::Frame,
+    columns: &GexTableColumns,
+    strike: &GexStrike,
+    y: f32,
+    row_h: f32,
+    max_gex: f64,
+    density: GexLayoutDensity,
+    call_wall: bool,
+    put_wall: bool,
+    absolute_mode: bool,
+    palette: &iced::theme::palette::Extended,
+) {
+    let put_width = if absolute_mode {
+        0.0
+    } else {
+        (strike.put_gex_1pct.abs() / max_gex) as f32 * columns.put_bounds.width
+    };
+    let call_width = (if absolute_mode {
+        strike.absolute_gamma_1pct
+    } else {
+        strike.call_gex_1pct.abs()
+    } / max_gex) as f32
+        * columns.call_bounds.width;
+    let bar_h = (row_h * 0.38).clamp(3.0, 7.0);
+    frame.fill(
+        &canvas::Path::rectangle(
+            Point::new(columns.zero_x - put_width, y - bar_h * 0.5),
+            Size::new(put_width, bar_h),
+        ),
+        palette.danger.strong.color,
+    );
+    frame.fill(
+        &canvas::Path::rectangle(
+            Point::new(columns.zero_x, y - bar_h * 0.5),
+            Size::new(call_width, bar_h),
+        ),
+        palette.success.strong.color,
+    );
+    draw_cell_text(
+        frame,
+        &format!("{:.2}", strike.strike),
+        columns.strike_bounds,
+        y,
+        palette.background.base.text,
+    );
+    if let Some(bounds) = columns.net_bounds {
+        draw_cell_text(
+            frame,
+            &format_exposure(strike.net_gex_1pct),
+            bounds,
+            y,
+            palette.background.base.text,
+        );
+    }
+    if let Some(bounds) = columns.abs_bounds {
+        draw_cell_text(
+            frame,
+            &format_exposure(strike.absolute_gamma_1pct),
+            bounds,
+            y,
+            palette.background.base.text,
+        );
+    }
+    let level = match (call_wall, put_wall) {
+        (true, true) => {
+            if density == GexLayoutDensity::Minimal {
+                "CW/PW"
+            } else {
+                "Call / Put Wall"
+            }
+        }
+        (true, false) => {
+            if density == GexLayoutDensity::Minimal {
+                "CW"
+            } else {
+                "Call Wall"
+            }
+        }
+        (false, true) => {
+            if density == GexLayoutDensity::Minimal {
+                "PW"
+            } else {
+                "Put Wall"
+            }
+        }
+        _ => "",
+    };
+    draw_cell_text(
+        frame,
+        level,
+        columns.level_bounds,
+        y,
+        palette.background.base.text,
+    );
+}
+
+fn reference_y_for_price(
+    price: f64,
+    visible_strikes: &[GexStrike],
+    row_centers: &[f32],
+) -> Option<f32> {
+    if visible_strikes.len() != row_centers.len() || visible_strikes.is_empty() {
+        return None;
+    }
+    if price < visible_strikes.first()?.strike || price > visible_strikes.last()?.strike {
+        return None;
+    }
+    match visible_strikes.binary_search_by(|strike| strike.strike.total_cmp(&price)) {
+        Ok(index) => Some(row_centers[index]),
+        Err(upper) if upper > 0 && upper < visible_strikes.len() => {
+            let lower = upper - 1;
+            let low = visible_strikes[lower].strike;
+            let high = visible_strikes[upper].strike;
+            let fraction = ((price - low) / (high - low)) as f32;
+            Some(row_centers[lower] + (row_centers[upper] - row_centers[lower]) * fraction)
+        }
+        _ => None,
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn draw_references(
+    frame: &mut canvas::Frame,
+    columns: &GexTableColumns,
+    strikes: &[GexStrike],
+    centers: &[f32],
+    spot: Option<f64>,
+    flip: Option<f64>,
+    density: GexLayoutDensity,
+    palette: &iced::theme::palette::Extended,
+) {
+    let spot_y = spot.and_then(|price| reference_y_for_price(price, strikes, centers));
+    let flip_y = flip.and_then(|price| reference_y_for_price(price, strikes, centers));
+    if let (Some(sy), Some(fy), Some(spot), Some(flip)) = (spot_y, flip_y, spot, flip)
+        && (sy - fy).abs() < 9.0
+    {
+        draw_reference_band(
+            frame,
+            columns,
+            (sy + fy) * 0.5,
+            &format!(
+                "{} {:.2} · {} {:.2}",
+                if density == GexLayoutDensity::Minimal {
+                    "S"
+                } else {
+                    "Spot"
+                },
+                spot,
+                if density == GexLayoutDensity::Minimal {
+                    "GF"
+                } else {
+                    "Gamma Flip"
+                },
+                flip
+            ),
+            palette.warning.strong.color,
+        );
+        return;
+    }
+    if let (Some(y), Some(price)) = (spot_y, spot) {
+        draw_reference_band(
+            frame,
+            columns,
+            y,
+            &format!(
+                "{} {:.2}",
+                if density == GexLayoutDensity::Minimal {
+                    "S"
+                } else {
+                    "Spot"
+                },
+                price
+            ),
+            palette.primary.strong.color,
+        );
+    }
+    if let (Some(y), Some(price)) = (flip_y, flip) {
+        draw_reference_band(
+            frame,
+            columns,
+            y,
+            &format!(
+                "{} {:.2}",
+                if density == GexLayoutDensity::Minimal {
+                    "GF"
+                } else {
+                    "Gamma Flip"
+                },
+                price
+            ),
+            palette.warning.strong.color,
+        );
+    }
+}
+
+fn draw_reference_band(
+    frame: &mut canvas::Frame,
+    columns: &GexTableColumns,
+    y: f32,
+    label: &str,
+    color: Color,
+) {
+    frame.fill(
+        &canvas::Path::rectangle(
+            Point::new(0.0, y - 1.5),
+            Size::new(columns.call_bounds.x + columns.call_bounds.width, 3.0),
+        ),
+        color.scale_alpha(0.22),
+    );
+    frame.stroke(
+        &canvas::Path::line(
+            Point::new(0.0, y),
+            Point::new(columns.call_bounds.x + columns.call_bounds.width, y),
+        ),
+        canvas::Stroke::default()
+            .with_color(color.scale_alpha(0.8))
+            .with_width(0.8),
+    );
+    draw_cell_text(frame, label, columns.level_bounds, y, color);
+}
+
+fn hover_bounds(cursor: Point, tooltip: Size, chart: Size) -> Rectangle {
+    let gap = 12.0;
+    let mut x = cursor.x + gap;
+    if x + tooltip.width > chart.width {
+        x = cursor.x - gap - tooltip.width;
+    }
+    let mut y = cursor.y + gap;
+    if y + tooltip.height > chart.height {
+        y = cursor.y - gap - tooltip.height;
+    }
+    Rectangle::new(
+        Point::new(
+            x.clamp(0.0, (chart.width - tooltip.width).max(0.0)),
+            y.clamp(0.0, (chart.height - tooltip.height).max(0.0)),
+        ),
+        tooltip,
+    )
+}
+
+fn draw_hover(
+    frame: &mut canvas::Frame,
+    chart_size: Size,
+    cursor: Point,
+    strike: &GexStrike,
+    spot: f64,
+    palette: &iced::theme::palette::Extended,
+) {
+    let bounds = hover_bounds(cursor, Size::new(250.0, 148.0), chart_size);
+    frame.fill(
+        &canvas::Path::rectangle(bounds.position(), bounds.size()),
+        palette.background.base.color.scale_alpha(0.96),
+    );
+    let distance = strike.strike - spot;
+    let rows = [
+        ("Strike", format!("{:.2}", strike.strike)),
+        (
+            "Distance",
+            format!("{distance:+.2} ({:+.2}%)", distance / spot * 100.0),
+        ),
+        ("Call GEX", format_exposure(strike.call_gex_1pct)),
+        ("Put GEX", format_exposure(strike.put_gex_1pct)),
+        ("Net GEX", format_exposure(strike.net_gex_1pct)),
+        (
+            "Absolute Gamma",
+            format_exposure(strike.absolute_gamma_1pct),
+        ),
+        ("Call OI", format!("{:.2}", strike.call_open_interest)),
+        ("Put OI", format!("{:.2}", strike.put_open_interest)),
+        ("Expiries", strike.expiration_count.to_string()),
+    ];
+    for (index, (label, value)) in rows.into_iter().enumerate() {
+        let y = bounds.y + 10.0 + index as f32 * 15.0;
+        draw_text_at(
+            frame,
+            label,
+            bounds.x + 8.0,
+            y,
+            9.0,
+            palette.background.base.text.scale_alpha(0.7),
+            iced::alignment::Horizontal::Left,
+        );
+        draw_text_at(
+            frame,
+            &value,
+            bounds.x + bounds.width - 8.0,
+            y,
+            9.0,
+            palette.background.base.text,
+            iced::alignment::Horizontal::Right,
+        );
+    }
+}
+
+fn draw_cell_text(frame: &mut canvas::Frame, value: &str, bounds: Rectangle, y: f32, color: Color) {
+    draw_text_at(
+        frame,
+        value,
+        bounds.x + bounds.width * 0.5,
+        y,
+        9.0,
+        color,
+        iced::alignment::Horizontal::Center,
+    );
+}
+
+fn draw_text_at(
+    frame: &mut canvas::Frame,
+    value: &str,
+    x: f32,
+    y: f32,
+    size: f32,
+    color: Color,
+    align: iced::alignment::Horizontal,
+) {
     frame.fill_text(canvas::Text {
-        content: label.to_string(),
-        position: Point::new(x + 4.0, y),
-        size: iced::Pixels(8.0),
-        color: Color::WHITE,
+        content: value.to_string(),
+        position: Point::new(x, y),
+        size: iced::Pixels(size),
+        color,
+        align_x: align.into(),
         align_y: iced::alignment::Vertical::Center,
         font: style::AZERET_MONO,
         ..canvas::Text::default()
     });
 }
 
-fn profile_badge_x(plot_width: f32, badge_width: f32) -> f32 {
-    (plot_width - badge_width - 14.0).max(2.0)
+fn format_level(value: Option<f64>) -> String {
+    value.map_or_else(|| "N/A".into(), |value| format!("{value:.2}"))
 }
 
-#[derive(Clone, Copy)]
-enum MarkerColor {
-    Success,
-    Danger,
-}
-
-fn marker_row_style(theme: &iced::Theme, marker: Option<MarkerColor>) -> container::Style {
-    let Some(marker) = marker else {
-        return container::Style::default();
-    };
-    let palette = theme.extended_palette();
-    let color = match marker {
-        MarkerColor::Success => palette.success.strong.color,
-        MarkerColor::Danger => palette.danger.strong.color,
-    };
-    container::Style {
-        background: Some(color.scale_alpha(0.07).into()),
-        border: Border {
-            color: color.scale_alpha(0.55),
-            width: 1.0,
-            radius: 2.0.into(),
-        },
-        ..container::Style::default()
-    }
-}
-
-fn summary_item(label: &'static str, value: String) -> Element<'static, gex::Message> {
-    container(
-        column![
-            text(label).size(style::text_size::SMALL),
-            text(value)
-                .size(style::text_size::BODY)
-                .wrapping(iced::widget::text::Wrapping::None)
-        ]
-        .spacing(1),
-    )
-    .padding([3, 6])
-    .style(container::rounded_box)
-    .into()
-}
-
-fn portion(value: f64, max: f64) -> u16 {
-    ((value / max).clamp(0.0, 1.0) * 999.0).round() as u16 + 1
-}
-
-fn format_level_distance(value: Option<f64>, spot: f64) -> String {
-    value.map_or_else(
-        || "N/A".into(),
-        |value| {
-            let distance = value - spot;
-            format!(
-                "{value:.2} · {distance:+.2} ({:+.2}%)",
-                distance / spot * 100.0
-            )
-        },
-    )
+fn compact_abs(value: f64) -> String {
+    format_exposure(value.abs())
+        .trim_start_matches('+')
+        .to_string()
 }
 
 pub fn format_exposure(value: f64) -> String {
@@ -645,37 +765,77 @@ pub fn format_exposure(value: f64) -> String {
 mod tests {
     use super::*;
 
-    #[test]
-    fn responsive_density_uses_explicit_thresholds() {
-        assert_eq!(
-            GexLayoutDensity::for_width(719.0),
-            GexLayoutDensity::Compact
-        );
-        assert_eq!(GexLayoutDensity::for_width(720.0), GexLayoutDensity::Full);
-        assert_eq!(
-            GexLayoutDensity::for_width(519.0),
-            GexLayoutDensity::Minimal
-        );
-        assert_eq!(
-            GexLayoutDensity::for_width(520.0),
-            GexLayoutDensity::Compact
-        );
-        assert!(GexLayoutDensity::Full.show_net_column());
-        assert!(!GexLayoutDensity::Compact.show_net_column());
-        assert!(!GexLayoutDensity::Minimal.show_net_column());
+    fn strike(price: f64) -> GexStrike {
+        GexStrike {
+            strike: price,
+            call_gex_1pct: 1.0,
+            put_gex_1pct: -1.0,
+            net_gex_1pct: 0.0,
+            absolute_gamma_1pct: 2.0,
+            call_open_interest: 1.0,
+            put_open_interest: 1.0,
+            expiration_count: 1,
+        }
     }
 
     #[test]
-    fn exact_price_mapping_is_stable_and_drops_outside_levels() {
-        assert_eq!(price_to_profile_y(150.0, 100.0, 200.0, 400.0), Some(200.0));
-        assert_eq!(price_to_profile_y(150.0, 100.0, 200.0, 800.0), Some(400.0));
-        assert_eq!(price_to_profile_y(99.0, 100.0, 200.0, 400.0), None);
-        assert_eq!(price_to_profile_y(201.0, 100.0, 200.0, 400.0), None);
+    fn shared_columns_define_header_rows_and_zero() {
+        for density in [
+            GexLayoutDensity::Full,
+            GexLayoutDensity::Compact,
+            GexLayoutDensity::Minimal,
+        ] {
+            let columns = table_columns(800.0, density);
+            assert_eq!(columns.zero_x, columns.put_bounds.width);
+            assert_eq!(columns.zero_x, columns.call_bounds.x);
+            let (_, label_zero, _) = scale_label_positions(&columns);
+            assert_eq!(label_zero, columns.zero_x);
+            let (start, end) = zero_line_points(&columns, 500.0);
+            assert_eq!(start.x, columns.zero_x);
+            assert_eq!(end.x, columns.zero_x);
+            assert_eq!(start.y, 0.0);
+            assert_eq!(end.y, 500.0);
+        }
     }
 
     #[test]
-    fn profile_badge_is_anchored_to_right_edge() {
-        assert_eq!(profile_badge_x(600.0, 100.0), 486.0);
-        assert_eq!(profile_badge_x(800.0, 100.0), 686.0);
+    fn responsive_columns_are_explicit() {
+        let full = table_columns(800.0, GexLayoutDensity::Full);
+        assert!(full.net_bounds.is_some());
+        assert!(full.abs_bounds.is_some());
+        let compact = table_columns(600.0, GexLayoutDensity::Compact);
+        assert!(compact.net_bounds.is_some());
+        assert!(compact.abs_bounds.is_none());
+        let minimal = table_columns(400.0, GexLayoutDensity::Minimal);
+        assert!(minimal.net_bounds.is_none());
+        assert!(minimal.abs_bounds.is_none());
+    }
+
+    #[test]
+    fn hover_stays_inside_and_flips_left() {
+        let chart = Size::new(500.0, 300.0);
+        let right = hover_bounds(Point::new(490.0, 100.0), Size::new(250.0, 148.0), chart);
+        assert!(right.x < 490.0);
+        assert!(right.x >= 0.0 && right.x + right.width <= chart.width);
+        let bottom = hover_bounds(Point::new(200.0, 295.0), Size::new(250.0, 148.0), chart);
+        assert!(bottom.y < 295.0);
+        assert!(bottom.y >= 0.0 && bottom.y + bottom.height <= chart.height);
+    }
+
+    #[test]
+    fn references_interpolate_between_row_centers() {
+        let strikes = vec![strike(100.0), strike(120.0), strike(160.0)];
+        let centers = vec![90.0, 60.0, 30.0];
+        assert_eq!(reference_y_for_price(110.0, &strikes, &centers), Some(75.0));
+        assert_eq!(reference_y_for_price(140.0, &strikes, &centers), Some(45.0));
+        assert_eq!(reference_y_for_price(99.0, &strikes, &centers), None);
+        assert_eq!(reference_y_for_price(161.0, &strikes, &centers), None);
+    }
+
+    #[test]
+    fn compact_numeric_format_has_no_line_breaks() {
+        for value in [-7_190_000.0, 0.0, 31_000.0] {
+            assert!(!format_exposure(value).contains('\n'));
+        }
     }
 }

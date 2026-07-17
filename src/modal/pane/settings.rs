@@ -711,6 +711,33 @@ pub fn gex_cfg_view<'a>(
             .show_gamma_flip =
             v),
         toggle("Show summary", cfg.show_summary, |c, v| c.show_summary = v),
+        text("Header fields").size(crate::style::text_size::SECTION),
+        toggle("Net GEX", cfg.show_header_net_gex, |c, v| c
+            .show_header_net_gex =
+            v),
+        toggle("Absolute GEX", cfg.show_header_absolute_gex, |c, v| c
+            .show_header_absolute_gex =
+            v),
+        toggle("Gamma Flip", cfg.show_header_gamma_flip, |c, v| c
+            .show_header_gamma_flip =
+            v),
+        toggle("Call Wall", cfg.show_header_call_wall, |c, v| c
+            .show_header_call_wall =
+            v),
+        toggle("Put Wall", cfg.show_header_put_wall, |c, v| c
+            .show_header_put_wall =
+            v),
+        toggle("Expiry", cfg.show_header_expiry, |c, v| c
+            .show_header_expiry =
+            v),
+        toggle("Freshness", cfg.show_header_freshness, |c, v| c
+            .show_header_freshness =
+            v),
+        toggle("Snapshot", cfg.show_header_snapshot, |c, v| c
+            .show_header_snapshot =
+            v),
+        toggle("Model", cfg.show_header_model, |c, v| c.show_header_model =
+            v),
         row![
             space::horizontal(),
             sync_all_button(pane, VisualConfig::Gex(cfg))

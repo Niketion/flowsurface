@@ -192,6 +192,15 @@ pub struct Config {
     pub show_put_wall: bool,
     pub show_gamma_flip: bool,
     pub show_summary: bool,
+    pub show_header_net_gex: bool,
+    pub show_header_absolute_gex: bool,
+    pub show_header_gamma_flip: bool,
+    pub show_header_call_wall: bool,
+    pub show_header_put_wall: bool,
+    pub show_header_expiry: bool,
+    pub show_header_freshness: bool,
+    pub show_header_snapshot: bool,
+    pub show_header_model: bool,
 }
 
 impl Default for Config {
@@ -212,6 +221,15 @@ impl Default for Config {
             show_put_wall: true,
             show_gamma_flip: true,
             show_summary: true,
+            show_header_net_gex: true,
+            show_header_absolute_gex: false,
+            show_header_gamma_flip: true,
+            show_header_call_wall: false,
+            show_header_put_wall: false,
+            show_header_expiry: true,
+            show_header_freshness: true,
+            show_header_snapshot: false,
+            show_header_model: true,
         }
     }
 }
@@ -768,5 +786,14 @@ mod tests {
             .expect("backwards compatible");
         assert_eq!(cfg.price_range_percent, 20.0);
         assert_eq!(cfg.max_visible_strikes, 40);
+        assert!(cfg.show_header_net_gex);
+        assert!(cfg.show_header_gamma_flip);
+        assert!(cfg.show_header_expiry);
+        assert!(cfg.show_header_freshness);
+        assert!(cfg.show_header_model);
+        assert!(!cfg.show_header_absolute_gex);
+        assert!(!cfg.show_header_call_wall);
+        assert!(!cfg.show_header_put_wall);
+        assert!(!cfg.show_header_snapshot);
     }
 }
