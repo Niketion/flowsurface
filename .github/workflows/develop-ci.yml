@@ -21,6 +21,9 @@ env:
 jobs:
   quality:
     name: Quality gate
+    if: >-
+      github.event_name != 'push' ||
+      !contains(join(github.event.commits.*.message, ' '), '[skip-ci]')
     runs-on: ubuntu-latest
 
     steps:
@@ -63,28 +66,80 @@ jobs:
       - name: Run all tests
         run: cargo test --workspace --all-targets --all-features --locked
 
-  build-windows:
-    name: Windows release build
+  prepare-release:
+    name: Prepare develop prerelease
     needs:
       - quality
-
     if: github.event_name == 'push' || github.event_name == 'workflow_dispatch'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    outputs:
+      tag: ${{ steps.release.outputs.tag }}
 
-    runs-on: windows-latest
+    steps:
+      - name: Create draft prerelease
+        id: release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+        run: |
+          short_sha="${GITHUB_SHA::7}"
+          tag="develop-${short_sha}"
+          echo "tag=${tag}" >> "$GITHUB_OUTPUT"
 
-    env:
-      CARGO_TERM_COLOR: always
-      RUSTFLAGS: "-D warnings"
+          if gh release view "$tag" >/dev/null 2>&1; then
+            echo "Release ${tag} already exists; it will be updated."
+          else
+            gh release create "$tag" \
+              --target "$GITHUB_SHA" \
+              --title "Develop build ${short_sha}" \
+              --notes "Automated multi-platform prerelease from the develop branch at commit ${GITHUB_SHA}." \
+              --draft \
+              --prerelease
+          fi
+
+  build:
+    name: Build ${{ matrix.target.name }}
+    needs:
+      - prepare-release
+    runs-on: ${{ matrix.target.os }}
+    permissions:
+      contents: write
+    strategy:
+      fail-fast: false
+      matrix:
+        target:
+          - name: Windows x64
+            os: windows-latest
+            command: bash scripts/build-windows.sh x86_64
+            package: target/release/flowsurface-x86_64-windows.zip
+          - name: Linux x64
+            os: ubuntu-latest
+            command: bash scripts/package-linux.sh package x86_64
+            package: target/release/flowsurface-x86_64-linux.tar.gz
+          - name: macOS universal
+            os: macos-15-intel
+            command: bash scripts/build-macos.sh universal
+            package: target/release/flowsurface-universal-macos.tar.gz
 
     steps:
       - name: Checkout repository
         uses: actions/checkout@v4
 
-      - name: Install configured Rust toolchain
-        shell: pwsh
+      - name: Install Linux dependencies
+        if: runner.os == 'Linux'
         run: |
-          rustup show
-          rustup target add x86_64-pc-windows-msvc
+          sudo apt-get update
+          sudo apt-get install -y \
+            build-essential \
+            pkg-config \
+            libudev-dev \
+            libxkbcommon-dev \
+            libasound2-dev
+
+      - name: Install configured Rust toolchain
+        run: rustup show
 
       - name: Cache Cargo
         uses: actions/cache@v4
@@ -93,42 +148,36 @@ jobs:
             ~/.cargo/registry
             ~/.cargo/git
             target
-          key: ${{ runner.os }}-cargo-${{ hashFiles('**/Cargo.lock') }}
+          key: ${{ runner.os }}-cargo-release-${{ hashFiles('**/Cargo.lock') }}
           restore-keys: |
+            ${{ runner.os }}-cargo-release-
             ${{ runner.os }}-cargo-
 
-      - name: Build Windows release
-        shell: pwsh
-        run: |
-          cargo build `
-            --release `
-            --locked `
-            --target x86_64-pc-windows-msvc
+      - name: Build package
+        run: ${{ matrix.target.command }}
 
-      - name: Prepare distributable
-        shell: pwsh
-        run: |
-          $dist = "dist\flowsurface-windows-x64"
+      - name: Upload package to GitHub Release
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+          RELEASE_TAG: ${{ needs.prepare-release.outputs.tag }}
+          PACKAGE_PATH: ${{ matrix.target.package }}
+        run: gh release upload "$RELEASE_TAG" "$PACKAGE_PATH" --clobber
 
-          New-Item `
-            -ItemType Directory `
-            -Path $dist `
-            -Force | Out-Null
+  publish-release:
+    name: Publish develop prerelease
+    needs:
+      - prepare-release
+      - build
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
 
-          Copy-Item `
-            "target\x86_64-pc-windows-msvc\release\flowsurface.exe" `
-            "$dist\flowsurface.exe"
-
-          Copy-Item "README.md" "$dist\README.md"
-          Copy-Item "LICENSE" "$dist\LICENSE"
-
-          Write-Host "Distributable contents:"
-          Get-ChildItem -Path $dist -Recurse
-
-      - name: Upload Windows artifact
-        uses: actions/upload-artifact@v4
-        with:
-          name: flowsurface-windows-x64-${{ github.sha }}
-          path: dist/flowsurface-windows-x64
-          if-no-files-found: error
-          retention-days: 30
+    steps:
+      - name: Publish prerelease
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+          RELEASE_TAG: ${{ needs.prepare-release.outputs.tag }}
+        run: gh release edit "$RELEASE_TAG" --draft=false --prerelease
