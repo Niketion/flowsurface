@@ -2426,7 +2426,6 @@ impl canvas::Program<Message> for KlineChart {
                                 as f64,
                             region,
                             chart.scaling,
-                            bounds.width,
                             palette,
                         );
                     }
@@ -2649,7 +2648,6 @@ fn draw_gex_levels(
     latest_chart_price: f64,
     visible_region: Rectangle,
     chart_scaling: f32,
-    frame_width_px: f32,
     palette: &Extended,
 ) {
     use data::chart::gex::{GexBasisMode, GexLevelColor};
@@ -2677,12 +2675,7 @@ fn draw_gex_levels(
     } else {
         0.0
     };
-    let Some(horizontal) = gex_overlay_horizontal_bounds(
-        visible_region,
-        chart_scaling,
-        frame_width_px,
-        config.horizontal_span_percent,
-    ) else {
+    let Some(horizontal) = gex_overlay_horizontal_bounds(visible_region, chart_scaling) else {
         return;
     };
     let mut levels = Vec::new();
@@ -2790,6 +2783,7 @@ fn draw_gex_levels(
                 top.max(visible_region.y),
                 bottom.min(region_bottom),
                 level.color,
+                gex_level_label(level.kind, displayed),
             ));
         } else {
             if !gex_level_is_visible(y, visible_region) {
@@ -2800,13 +2794,16 @@ fn draw_gex_levels(
             } else {
                 config.line_width.clamp(0.5, 3.0)
             };
-            line_levels.push((y, level.color, width_px));
+            line_levels.push((
+                y,
+                level.color,
+                width_px,
+                gex_level_label(level.kind, displayed),
+            ));
         }
     }
-    for (top, bottom, color) in merge_cluster_bands(
-        cluster_bands,
-        gex_screen_width_to_world(18.0, chart_scaling),
-    ) {
+    let mut labels = Vec::new();
+    for (top, bottom, color, label) in cluster_bands {
         frame.fill(
             &Path::rectangle(
                 Point::new(horizontal.start_x, top),
@@ -2814,8 +2811,9 @@ fn draw_gex_levels(
             ),
             color.scale_alpha(config.band_opacity.clamp(0.02, 0.4)),
         );
+        labels.push(((top + bottom) * 0.5, color, label));
     }
-    for (y, color, width_px) in line_levels {
+    for (y, color, width_px, label) in line_levels {
         frame.stroke(
             &Path::line(
                 Point::new(horizontal.start_x, y),
@@ -2824,6 +2822,20 @@ fn draw_gex_levels(
             Stroke::default()
                 .with_color(color.scale_alpha(config.line_opacity.clamp(0.1, 1.0)))
                 .with_width(gex_screen_width_to_world(width_px, chart_scaling)),
+        );
+        labels.push((y, color, label));
+    }
+    for (y, color, label) in labels {
+        draw_gex_level_label(
+            frame,
+            &label,
+            Point::new(
+                horizontal.start_x + gex_screen_width_to_world(6.0, chart_scaling),
+                y,
+            ),
+            color,
+            chart_scaling,
+            palette,
         );
     }
 }
@@ -2849,46 +2861,57 @@ fn gex_screen_width_to_world(px: f32, scaling: f32) -> f32 {
 fn gex_overlay_horizontal_bounds(
     region: Rectangle,
     scaling: f32,
-    frame_width_px: f32,
-    span_percent: f32,
 ) -> Option<GexOverlayHorizontalBounds> {
-    if !scaling.is_finite()
-        || scaling <= 0.0
-        || !frame_width_px.is_finite()
-        || frame_width_px <= 0.0
-        || region.width <= 0.0
-    {
+    if !scaling.is_finite() || scaling <= 0.0 || region.width <= 0.0 {
         return None;
     }
-    let viewport_width = region.width.min(frame_width_px / scaling);
-    let right_padding = gex_screen_width_to_world(12.0, scaling);
-    let end_x = region.x + region.width - right_padding;
-    let span = viewport_width * (span_percent.clamp(15.0, 70.0) / 100.0);
-    (span > 0.0 && end_x > region.x).then_some(GexOverlayHorizontalBounds {
-        start_x: (end_x - span).max(region.x),
+    let padding = gex_screen_width_to_world(10.0, scaling);
+    let end_x = region.x + region.width - padding;
+    (end_x > region.x + padding).then_some(GexOverlayHorizontalBounds {
+        start_x: region.x + padding,
         end_x,
     })
 }
 
-fn merge_cluster_bands(
-    mut bands: Vec<(f32, f32, Color)>,
-    maximum_height: f32,
-) -> Vec<(f32, f32, Color)> {
-    bands.sort_by(|a, b| a.0.total_cmp(&b.0));
-    let mut merged: Vec<(f32, f32, Color)> = Vec::new();
-    for (top, bottom, color) in bands {
-        if let Some(last) = merged.last_mut()
-            && top <= last.1
-        {
-            let center = (last.0.min(top) + last.1.max(bottom)) * 0.5;
-            let height = (last.1.max(bottom) - last.0.min(top)).min(maximum_height);
-            last.0 = center - height * 0.5;
-            last.1 = center + height * 0.5;
-            continue;
-        }
-        merged.push((top, bottom, color));
-    }
-    merged
+fn gex_level_label(kind: GexOverlayKind, price: f64) -> String {
+    let prefix = match kind {
+        GexOverlayKind::GammaFlip => "GF",
+        GexOverlayKind::CallWall => "CW",
+        GexOverlayKind::PutWall => "PW",
+        GexOverlayKind::GammaCluster => "GC",
+    };
+    format!("{prefix} {price:.2}")
+}
+
+fn draw_gex_level_label(
+    frame: &mut canvas::Frame,
+    label: &str,
+    position: Point,
+    color: Color,
+    scaling: f32,
+    palette: &Extended,
+) {
+    let width = gex_screen_width_to_world(10.0 + label.chars().count() as f32 * 6.2, scaling);
+    let height = gex_screen_width_to_world(16.0, scaling);
+    frame.fill(
+        &Path::rectangle(
+            Point::new(position.x, position.y - height * 0.5),
+            Size::new(width, height),
+        ),
+        palette.background.base.color.scale_alpha(0.86),
+    );
+    draw_cluster_text(
+        frame,
+        label,
+        Point::new(
+            position.x + gex_screen_width_to_world(5.0, scaling),
+            position.y,
+        ),
+        gex_screen_width_to_world(10.0, scaling),
+        color,
+        Alignment::Start,
+        Alignment::Center,
+    );
 }
 
 #[cfg(test)]
@@ -2934,18 +2957,18 @@ mod gex_overlay_tests {
     }
 
     #[test]
-    fn horizontal_bounds_anchor_to_viewport_right_across_pan_and_zoom() {
+    fn horizontal_bounds_cover_the_visible_chart_across_pan_and_zoom() {
         let base = Rectangle::new(Point::new(100.0, 50.0), Size::new(1_000.0, 500.0));
         let panned = Rectangle::new(Point::new(600.0, 50.0), Size::new(1_000.0, 500.0));
-        let first = gex_overlay_horizontal_bounds(base, 1.0, 1_000.0, 35.0).expect("bounds");
-        let second = gex_overlay_horizontal_bounds(panned, 1.0, 1_000.0, 35.0).expect("bounds");
+        let first = gex_overlay_horizontal_bounds(base, 1.0).expect("bounds");
+        let second = gex_overlay_horizontal_bounds(panned, 1.0).expect("bounds");
         assert_eq!(second.start_x - first.start_x, 500.0);
         assert_eq!(second.end_x - first.end_x, 500.0);
-        assert!((first.end_x - first.start_x) <= base.width * 0.35 + f32::EPSILON);
+        assert!((first.end_x - first.start_x) > base.width * 0.95);
 
-        let zoomed = gex_overlay_horizontal_bounds(base, 2.0, 1_000.0, 35.0).expect("zoom bounds");
-        assert_eq!((zoomed.end_x - zoomed.start_x) * 2.0, 350.0);
-        assert_eq!((base.x + base.width - zoomed.end_x) * 2.0, 12.0);
+        let zoomed = gex_overlay_horizontal_bounds(base, 2.0).expect("zoom bounds");
+        assert_eq!((zoomed.start_x - base.x) * 2.0, 10.0);
+        assert_eq!((base.x + base.width - zoomed.end_x) * 2.0, 10.0);
     }
 
     #[test]
@@ -2956,11 +2979,23 @@ mod gex_overlay_tests {
     }
 
     #[test]
-    fn overlapping_cluster_bands_are_merged_and_capped() {
-        let color = Color::BLACK;
-        let merged = merge_cluster_bands(vec![(10.0, 20.0, color), (15.0, 30.0, color)], 18.0);
-        assert_eq!(merged.len(), 1);
-        assert!((merged[0].1 - merged[0].0) <= 18.0);
+    fn labels_are_compact_and_keep_the_exact_level_value() {
+        assert_eq!(
+            gex_level_label(GexOverlayKind::GammaFlip, 63_259.0),
+            "GF 63259.00"
+        );
+        assert_eq!(
+            gex_level_label(GexOverlayKind::CallWall, 66_000.0),
+            "CW 66000.00"
+        );
+        assert_eq!(
+            gex_level_label(GexOverlayKind::PutWall, 62_500.0),
+            "PW 62500.00"
+        );
+        assert_eq!(
+            gex_level_label(GexOverlayKind::GammaCluster, 64_000.0),
+            "GC 64000.00"
+        );
     }
 }
 

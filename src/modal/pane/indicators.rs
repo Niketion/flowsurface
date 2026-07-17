@@ -646,19 +646,6 @@ pub fn view_kline<'a>(
             |value| format!("{value:.1} × strike gap"),
             Some(0.1),
         );
-        let horizontal_span = labeled_slider(
-            "Horizontal span",
-            15.0..=70.0,
-            levels.horizontal_span_percent,
-            move |horizontal_span_percent| {
-                update(GexLevelsConfig {
-                    horizontal_span_percent,
-                    ..levels
-                })
-            },
-            |value| format!("{value:.0}%"),
-            Some(1.0),
-        );
         let line_width = labeled_slider(
             "Level line width",
             0.5..=3.0,
@@ -790,7 +777,6 @@ pub fn view_kline<'a>(
                     v),
                 max_clusters,
                 band_width,
-                horizontal_span,
                 line_width,
                 flip_width,
                 line_opacity,
