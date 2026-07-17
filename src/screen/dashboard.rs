@@ -39,7 +39,7 @@ use iced::{
         pane_grid::{self, Configuration},
     },
 };
-use std::{collections::HashMap, time::Instant, vec};
+use std::{collections::HashMap, sync::Arc, time::Instant, vec};
 
 #[derive(Debug, Clone)]
 pub enum Message {
@@ -139,6 +139,97 @@ pub enum Event {
 }
 
 impl Dashboard {
+    pub fn gex_consumers(&self) -> Vec<exchange::options::OptionsUnderlying> {
+        self.panes
+            .iter()
+            .map(|(_, state)| state)
+            .chain(
+                self.popout
+                    .values()
+                    .flat_map(|(panes, _)| panes.iter().map(|(_, state)| state)),
+            )
+            .filter_map(|state| match &state.content {
+                pane::Content::Gex {
+                    underlying,
+                    chart: Some(_),
+                    unsupported: false,
+                } => Some(*underlying),
+                pane::Content::Kline { indicators, .. }
+                    if indicators.contains(&data::chart::indicator::KlineIndicator::GexLevels) =>
+                {
+                    state.stream_pair().and_then(|ticker| {
+                        exchange::options::resolve_options_underlying(ticker.ticker)
+                    })
+                }
+                _ => None,
+            })
+            .collect()
+    }
+
+    pub fn sync_gex(
+        &mut self,
+        coordinator: &mut crate::connector::gex::GexDataCoordinator,
+        now: UnixMs,
+    ) {
+        let sync =
+            |state: &mut pane::State,
+             coordinator: &mut crate::connector::gex::GexDataCoordinator| {
+                let market_underlying = state.stream_pair().and_then(|ticker| {
+                    exchange::options::resolve_options_underlying(ticker.ticker)
+                });
+                match &mut state.content {
+                    pane::Content::Gex {
+                        chart,
+                        underlying,
+                        unsupported,
+                    } => {
+                        if *unsupported {
+                            return;
+                        }
+                        let Some(chart) = chart else {
+                            return;
+                        };
+                        let snapshot = coordinator.derived(*underlying, chart.config(), now);
+                        let freshness = coordinator.freshness(*underlying, now);
+                        let error = coordinator.last_error(*underlying).map(Arc::from);
+                        chart.set_snapshot(snapshot, freshness, error);
+                    }
+                    pane::Content::Kline {
+                        chart: Some(chart),
+                        indicators,
+                        ..
+                    } => {
+                        if !indicators.contains(&data::chart::indicator::KlineIndicator::GexLevels)
+                        {
+                            chart.set_gex_snapshot(None);
+                            return;
+                        }
+                        let Some(underlying) = market_underlying else {
+                            chart.set_gex_snapshot(None);
+                            return;
+                        };
+                        let levels = chart.visual_config().gex_levels;
+                        let config = data::chart::gex::Config {
+                            sign_model: levels.enabled_model,
+                            expiry_filter: levels.expiry_filter,
+                            ..data::chart::gex::Config::default()
+                        };
+                        chart.set_gex_snapshot(coordinator.derived(underlying, &config, now));
+                    }
+                    _ => {}
+                }
+            };
+
+        for (_, state) in self.panes.iter_mut() {
+            sync(state, coordinator);
+        }
+        for (panes, _) in self.popout.values_mut() {
+            for (_, state) in panes.iter_mut() {
+                sync(state, coordinator);
+            }
+        }
+    }
+
     fn default_pane_config() -> Configuration<pane::State> {
         Configuration::Split {
             axis: pane_grid::Axis::Vertical,
@@ -359,6 +450,9 @@ impl Dashboard {
                                             ) | (
                                                 data::layout::pane::VisualConfig::Comparison(_),
                                                 pane::Content::Comparison(_)
+                                            ) | (
+                                                data::layout::pane::VisualConfig::Gex(_),
+                                                pane::Content::Gex { .. }
                                             )
                                         ),
                                     };

@@ -501,6 +501,8 @@ pub struct Config {
     pub vwap: VwapConfig,
     /// Settings owned by the CVD panel indicator.
     pub cvd: CvdConfig,
+    /// Settings owned by the synthetic GEX levels overlay.
+    pub gex_levels: crate::chart::gex::GexLevelsConfig,
 }
 
 impl Default for Config {
@@ -513,6 +515,7 @@ impl Default for Config {
             session_volume_profile: SessionVolumeProfileConfig::default(),
             vwap: VwapConfig::default(),
             cvd: CvdConfig::default(),
+            gex_levels: crate::chart::gex::GexLevelsConfig::default(),
         }
     }
 }

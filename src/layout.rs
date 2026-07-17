@@ -180,6 +180,21 @@ impl From<&pane::State> for data::Pane {
                 indicators: indicators.clone(),
                 link_group: pane.link_group,
             },
+            pane::Content::Gex {
+                chart, underlying, ..
+            } => {
+                let settings = data::layout::pane::Settings {
+                    visual_config: chart
+                        .as_ref()
+                        .map(|chart| data::layout::pane::VisualConfig::Gex(*chart.config())),
+                    ..pane.settings.clone()
+                };
+                data::Pane::GexChart {
+                    underlying: *underlying,
+                    settings,
+                    link_group: pane.link_group,
+                }
+            }
             pane::Content::TimeAndSales(_) => data::Pane::TimeAndSales {
                 stream_type: streams,
                 settings: pane.settings.clone(),
@@ -285,6 +300,27 @@ pub fn configuration(pane: data::Pane) -> Configuration<pane::State> {
             Configuration::Pane(pane::State::from_config(
                 content,
                 stream_type,
+                settings,
+                link_group,
+            ))
+        }
+        data::Pane::GexChart {
+            underlying,
+            settings,
+            link_group,
+        } => {
+            let config = settings
+                .visual_config
+                .as_ref()
+                .and_then(data::layout::pane::VisualConfig::gex);
+            let content = pane::Content::Gex {
+                chart: Some(crate::chart::gex::GexChart::new(underlying, config)),
+                underlying,
+                unsupported: false,
+            };
+            Configuration::Pane(pane::State::from_config(
+                content,
+                vec![],
                 settings,
                 link_group,
             ))

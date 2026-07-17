@@ -598,6 +598,128 @@ pub fn comparison_cfg_view<'a>(
     cfg_view_container(320, content)
 }
 
+pub fn gex_cfg_view<'a>(
+    cfg: data::chart::gex::Config,
+    pane: pane_grid::Pane,
+) -> Element<'a, Message> {
+    use data::chart::gex::{GexExpiryFilter, GexSignModel};
+
+    let model = pick_list(GexSignModel::ALL, Some(cfg.sign_model), move |sign_model| {
+        Message::VisualConfigChanged(
+            pane,
+            VisualConfig::Gex(data::chart::gex::Config { sign_model, ..cfg }),
+            false,
+        )
+    });
+    let expiry = pick_list(
+        GexExpiryFilter::ALL,
+        Some(cfg.expiry_filter),
+        move |expiry_filter| {
+            Message::VisualConfigChanged(
+                pane,
+                VisualConfig::Gex(data::chart::gex::Config {
+                    expiry_filter,
+                    ..cfg
+                }),
+                false,
+            )
+        },
+    );
+    let max_strikes = slider(5..=100, cfg.max_visible_strikes as u32, move |value| {
+        Message::VisualConfigChanged(
+            pane,
+            VisualConfig::Gex(data::chart::gex::Config {
+                max_visible_strikes: value as usize,
+                ..cfg
+            }),
+            false,
+        )
+    });
+    let price_range = slider(5.0..=50.0, cfg.price_range_percent, move |value| {
+        Message::VisualConfigChanged(
+            pane,
+            VisualConfig::Gex(data::chart::gex::Config {
+                price_range_percent: value,
+                ..cfg
+            }),
+            false,
+        )
+    });
+    let min_oi = slider(0.0..=1_000.0, cfg.min_open_interest, move |value| {
+        Message::VisualConfigChanged(
+            pane,
+            VisualConfig::Gex(data::chart::gex::Config {
+                min_open_interest: value,
+                ..cfg
+            }),
+            false,
+        )
+    });
+    let min_gex = slider(0.0..=10_000_000.0, cfg.min_absolute_gex, move |value| {
+        Message::VisualConfigChanged(
+            pane,
+            VisualConfig::Gex(data::chart::gex::Config {
+                min_absolute_gex: value,
+                ..cfg
+            }),
+            false,
+        )
+    });
+    let toggle =
+        |label: &'static str, current: bool, update: fn(&mut data::chart::gex::Config, bool)| {
+            checkbox(current).label(label).on_toggle(move |value| {
+                let mut next = cfg;
+                update(&mut next, value);
+                Message::VisualConfigChanged(pane, VisualConfig::Gex(next), false)
+            })
+        };
+    let content = column![
+        text("GEX model").size(crate::style::text_size::SECTION),
+        model,
+        text("Expiry filter").size(crate::style::text_size::SECTION),
+        expiry,
+        text(format!("Visible strikes: {}", cfg.max_visible_strikes)),
+        max_strikes,
+        text(format!("Price range: ±{:.0}%", cfg.price_range_percent)),
+        price_range,
+        text(format!(
+            "Minimum OI: {:.1} {}",
+            cfg.min_open_interest, "BTC/ETH"
+        )),
+        min_oi,
+        text(format!(
+            "Minimum absolute GEX: {}",
+            crate::widget::chart::gex::format_exposure(cfg.min_absolute_gex)
+        )),
+        min_gex,
+        toggle("Show call GEX", cfg.show_call_gex, |c, v| c.show_call_gex =
+            v),
+        toggle("Show put GEX", cfg.show_put_gex, |c, v| c.show_put_gex = v),
+        toggle("Show net GEX", cfg.show_net_gex, |c, v| c.show_net_gex = v),
+        toggle("Show absolute gamma", cfg.show_absolute_gamma, |c, v| c
+            .show_absolute_gamma =
+            v),
+        toggle("Show source spot", cfg.show_current_price, |c, v| c
+            .show_current_price =
+            v),
+        toggle("Show Call Wall", cfg.show_call_wall, |c, v| c
+            .show_call_wall =
+            v),
+        toggle("Show Put Wall", cfg.show_put_wall, |c, v| c.show_put_wall =
+            v),
+        toggle("Show Gamma Flip", cfg.show_gamma_flip, |c, v| c
+            .show_gamma_flip =
+            v),
+        toggle("Show summary", cfg.show_summary, |c, v| c.show_summary = v),
+        row![
+            space::horizontal(),
+            sync_all_button(pane, VisualConfig::Gex(cfg))
+        ]
+    ]
+    .spacing(8);
+    cfg_view_container(360, content)
+}
+
 pub fn kline_cfg_view<'a>(
     study_config: &'a study::Configurator<FootprintStudy>,
     cfg: data::chart::kline::Config,
@@ -1027,8 +1149,118 @@ pub fn kline_cfg_view<'a>(
             // old serialized configs remain readable without presenting a
             // second settings surface.
             let _legacy_overlay_sections = (session_volume_profile_section, volume_bubbles_section);
+            let gex_levels_section = {
+                use data::chart::gex::{GexBasisMode, GexExpiryFilter, GexSignModel};
+                let levels = cfg.gex_levels;
+                let model = pick_list(
+                    GexSignModel::ALL,
+                    Some(levels.enabled_model),
+                    move |enabled_model| {
+                        Message::VisualConfigChanged(
+                            pane,
+                            VisualConfig::Kline(data::chart::kline::Config {
+                                gex_levels: data::chart::gex::GexLevelsConfig {
+                                    enabled_model,
+                                    ..levels
+                                },
+                                ..cfg
+                            }),
+                            false,
+                        )
+                    },
+                );
+                let expiry = pick_list(
+                    GexExpiryFilter::ALL,
+                    Some(levels.expiry_filter),
+                    move |expiry_filter| {
+                        Message::VisualConfigChanged(
+                            pane,
+                            VisualConfig::Kline(data::chart::kline::Config {
+                                gex_levels: data::chart::gex::GexLevelsConfig {
+                                    expiry_filter,
+                                    ..levels
+                                },
+                                ..cfg
+                            }),
+                            false,
+                        )
+                    },
+                );
+                let basis = pick_list(
+                    GexBasisMode::ALL,
+                    Some(levels.basis_mode),
+                    move |basis_mode| {
+                        Message::VisualConfigChanged(
+                            pane,
+                            VisualConfig::Kline(data::chart::kline::Config {
+                                gex_levels: data::chart::gex::GexLevelsConfig {
+                                    basis_mode,
+                                    ..levels
+                                },
+                                ..cfg
+                            }),
+                            false,
+                        )
+                    },
+                );
+                let clusters = slider(0..=10, levels.max_clusters as u32, move |value| {
+                    Message::VisualConfigChanged(
+                        pane,
+                        VisualConfig::Kline(data::chart::kline::Config {
+                            gex_levels: data::chart::gex::GexLevelsConfig {
+                                max_clusters: value as usize,
+                                ..levels
+                            },
+                            ..cfg
+                        }),
+                        false,
+                    )
+                });
+                let toggle =
+                    |label: &'static str,
+                     current: bool,
+                     update: fn(&mut data::chart::gex::GexLevelsConfig, bool)| {
+                        checkbox(current).label(label).on_toggle(move |value| {
+                            let mut next = levels;
+                            update(&mut next, value);
+                            Message::VisualConfigChanged(
+                                pane,
+                                VisualConfig::Kline(data::chart::kline::Config {
+                                    gex_levels: next,
+                                    ..cfg
+                                }),
+                                false,
+                            )
+                        })
+                    };
+                column![
+                    text("GEX Levels overlay").size(crate::style::text_size::SECTION),
+                    text("Uses the shared Deribit options cache; no pane-level fetch."),
+                    model,
+                    expiry,
+                    basis,
+                    toggle("Show Gamma Flip", levels.show_gamma_flip, |c, v| c
+                        .show_gamma_flip =
+                        v),
+                    toggle("Show Call Wall", levels.show_call_wall, |c, v| c
+                        .show_call_wall =
+                        v),
+                    toggle("Show Put Wall", levels.show_put_wall, |c, v| c
+                        .show_put_wall =
+                        v),
+                    toggle(
+                        "Show top gamma clusters",
+                        levels.show_top_clusters,
+                        |c, v| c.show_top_clusters = v
+                    ),
+                    text(format!("Maximum clusters: {}", levels.max_clusters)),
+                    clusters,
+                ]
+                .spacing(8)
+            };
             split_column![
                 display_readout_section,
+                gex_levels_section,
                 row![
                     space::horizontal(),
                     sync_all_button(pane, VisualConfig::Kline(cfg))

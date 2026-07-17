@@ -31,7 +31,7 @@ use iced::{Alignment, Color, Element, Point, Rectangle, Renderer, Size, Theme, V
 use chrono::{Datelike, TimeZone, Timelike};
 use enum_map::EnumMap;
 use rustc_hash::{FxHashMap, FxHashSet};
-use std::time::Instant;
+use std::{sync::Arc, time::Instant};
 
 /// Maximum number of raw trades to retain in memory.
 /// Older trades are pruned FIFO when this cap is exceeded.
@@ -199,6 +199,7 @@ pub struct KlineChart {
     study_configurator: study::Configurator<FootprintStudy>,
     last_tick: Instant,
     visual_config: Config,
+    gex_snapshot: Option<Arc<data::chart::gex::GexSnapshot>>,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -310,6 +311,7 @@ impl KlineChart {
                     kind: kind.clone(),
                     study_configurator: study::Configurator::new(),
                     last_tick: Instant::now(),
+                    gex_snapshot: None,
                 }
             }
             Basis::Tick(interval) => {
@@ -373,6 +375,7 @@ impl KlineChart {
                     kind: kind.clone(),
                     study_configurator: study::Configurator::new(),
                     last_tick: Instant::now(),
+                    gex_snapshot: None,
                 }
             }
         }
@@ -1324,6 +1327,18 @@ impl KlineChart {
 
     pub fn indicator_enabled(&self, indicator: KlineIndicator) -> bool {
         self.indicators[indicator].is_some()
+    }
+
+    pub fn set_gex_snapshot(&mut self, snapshot: Option<Arc<data::chart::gex::GexSnapshot>>) {
+        if self.gex_snapshot.as_ref().map(|value| value.observed_at)
+            == snapshot.as_ref().map(|value| value.observed_at)
+            && self.gex_snapshot.as_ref().map(|value| value.underlying)
+                == snapshot.as_ref().map(|value| value.underlying)
+        {
+            return;
+        }
+        self.gex_snapshot = snapshot;
+        self.chart.cache.clear_all();
     }
 
     pub fn volume_bubble_qty_scale(&self) -> VolumeBubbleQtyScale {
@@ -2395,6 +2410,20 @@ impl canvas::Program<Message> for KlineChart {
                             palette,
                         );
                     }
+                    if self.indicator_enabled(KlineIndicator::GexLevels)
+                        && let Some(snapshot) = &self.gex_snapshot
+                    {
+                        draw_gex_levels(
+                            frame,
+                            price_to_y,
+                            snapshot,
+                            &self.visual_config.gex_levels,
+                            self.data_source
+                                .latest_y_midpoint(|kline| kline.close.to_f32_lossy())
+                                as f64,
+                            palette,
+                        );
+                    }
                     let volume_bubbles = self.visual_config.volume_bubbles;
                     let bubbles_enabled = self.indicator_enabled(KlineIndicator::VolumeBubbles);
                     let volume_bubble_range = bubbles_enabled
@@ -2580,6 +2609,82 @@ fn build_vwap_sessions(
     }
     sessions.retain(|points| !points.is_empty());
     sessions
+}
+
+fn draw_gex_levels(
+    frame: &mut canvas::Frame,
+    price_to_y: impl Fn(Price) -> f32,
+    snapshot: &data::chart::gex::GexSnapshot,
+    config: &data::chart::gex::GexLevelsConfig,
+    latest_chart_price: f64,
+    palette: &Extended,
+) {
+    use data::chart::gex::GexBasisMode;
+
+    let basis = if config.basis_mode == GexBasisMode::ShiftToChartPrice
+        && latest_chart_price.is_finite()
+        && latest_chart_price > 0.0
+    {
+        latest_chart_price - snapshot.source_spot
+    } else {
+        0.0
+    };
+    let suffix = if config.basis_mode == GexBasisMode::ShiftToChartPrice {
+        " · shifted"
+    } else {
+        ""
+    };
+    let mut levels = Vec::new();
+    if config.show_gamma_flip
+        && let Some(value) = snapshot.gamma_flip
+    {
+        levels.push(("Gamma Flip", value, palette.warning.strong.color));
+    }
+    if config.show_call_wall
+        && let Some(value) = snapshot.call_wall
+    {
+        levels.push(("Call Wall", value, palette.success.strong.color));
+    }
+    if config.show_put_wall
+        && let Some(value) = snapshot.put_wall
+    {
+        levels.push(("Put Wall", value, palette.danger.strong.color));
+    }
+    if config.show_top_clusters {
+        let mut clusters = snapshot.strikes.iter().collect::<Vec<_>>();
+        clusters.sort_by(|a, b| b.absolute_gamma_1pct.total_cmp(&a.absolute_gamma_1pct));
+        for strike in clusters.into_iter().take(config.max_clusters.min(10)) {
+            levels.push((
+                "Gamma Cluster",
+                strike.strike,
+                palette.secondary.strong.color,
+            ));
+        }
+    }
+
+    for (label, raw, color) in levels {
+        let displayed = raw + basis;
+        if !displayed.is_finite() || displayed <= 0.0 {
+            continue;
+        }
+        let y = price_to_y(Price::from_f64(displayed));
+        let path = Path::line(Point::new(0.0, y), Point::new(frame.width(), y));
+        frame.stroke(
+            &path,
+            Stroke::default()
+                .with_color(color.scale_alpha(0.78))
+                .with_width(1.0),
+        );
+        draw_cluster_text(
+            frame,
+            &format!("{label}{suffix}"),
+            Point::new(4.0, y - 2.0),
+            7.0,
+            color,
+            Alignment::Start,
+            Alignment::End,
+        );
+    }
 }
 
 fn draw_vwap_overlay(

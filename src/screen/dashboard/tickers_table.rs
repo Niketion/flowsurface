@@ -1115,6 +1115,7 @@ impl TickersTable {
                 init_content_btn(ContentKind::FootprintChart, *ticker, 180.0),
                 init_content_btn(ContentKind::CandlestickChart, *ticker, 180.0),
                 init_content_btn(ContentKind::ComparisonChart, *ticker, 180.0),
+                init_content_btn(ContentKind::GexChart, *ticker, 180.0),
                 init_content_btn(ContentKind::TimeAndSales, *ticker, 160.0),
                 init_content_btn(ContentKind::Ladder, *ticker, 160.0),
             ]

@@ -1,5 +1,7 @@
 use crate::{
-    chart::{self, comparison::ComparisonChart, heatmap::HeatmapChart, kline::KlineChart},
+    chart::{
+        self, comparison::ComparisonChart, gex::GexChart, heatmap::HeatmapChart, kline::KlineChart,
+    },
     connector::{
         ResolvedStream,
         fetcher::{self, FetchSpec, InfoKind},
@@ -10,7 +12,8 @@ use crate::{
             Modal,
             mini_tickers_list::MiniPanel,
             settings::{
-                comparison_cfg_view, heatmap_cfg_view, heatmap_shader_cfg_view, kline_cfg_view,
+                comparison_cfg_view, gex_cfg_view, heatmap_cfg_view, heatmap_shader_cfg_view,
+                kline_cfg_view,
             },
             stack_modal,
         },
@@ -112,6 +115,7 @@ pub enum Event {
     StudyConfigurator(modal::pane::settings::study::StudyMessage),
     StreamModifierChanged(modal::stream::Message),
     ComparisonChartInteraction(super::chart::comparison::Message),
+    GexChartInteraction(crate::chart::gex::Message),
     HeatmapShaderInteraction(crate::widget::chart::heatmap::Message),
     MiniTickersListInteraction(modal::pane::mini_tickers_list::Message),
 }
@@ -214,6 +218,28 @@ impl State {
         }
 
         let base_ticker = tickers[0];
+        if kind == ContentKind::GexChart {
+            let resolved = exchange::options::resolve_options_underlying(base_ticker.ticker);
+            if resolved.is_none() {
+                log::warn!(
+                    "GEX UnsupportedUnderlying symbol={}",
+                    base_ticker.ticker.display_symbol_and_type().0
+                );
+            }
+            let underlying = resolved.unwrap_or(exchange::options::OptionsUnderlying::Btc);
+            let config = self
+                .settings
+                .visual_config
+                .as_ref()
+                .and_then(VisualConfig::gex);
+            self.content = Content::Gex {
+                chart: resolved.map(|value| GexChart::new(value, config)),
+                underlying,
+                unsupported: resolved.is_none(),
+            };
+            self.streams = ResolvedStream::Ready(Vec::new());
+            return Vec::new();
+        }
         let prev_base_ticker = self.stream_pair();
 
         let derived_plan = PaneSetup::new(
@@ -457,6 +483,7 @@ impl State {
                     (content, streams)
                 }
                 ContentKind::Starter => unreachable!(),
+                ContentKind::GexChart => unreachable!("handled before stream planning"),
             }
         };
 
@@ -683,7 +710,20 @@ impl State {
             })]
         };
 
-        if let Some(kind) = self.stream_pair_kind() {
+        if let Content::Gex { underlying, .. } = &self.content {
+            let content = text(format!("{underlying} GEX · Deribit"))
+                .size(crate::style::text_size::SECTION)
+                .align_y(Alignment::Center);
+            top_left_buttons = top_left_buttons.push(
+                button(content)
+                    .on_press(Message::PaneEvent(
+                        id,
+                        Event::ShowModal(Modal::MiniTickersList(MiniPanel::new())),
+                    ))
+                    .style(|theme, status| style::button::modifier(theme, status, true))
+                    .height(widget::PANE_CONTROL_BTN_HEIGHT),
+            );
+        } else if let Some(kind) = self.stream_pair_kind() {
             let (base_ti, extra) = match kind {
                 StreamPairKind::MultiSource(list) => (list[0], list.len().saturating_sub(1)),
                 StreamPairKind::SingleSource(ti) => (ti, 0),
@@ -886,6 +926,50 @@ impl State {
                     )
                 } else {
                     let base = uninitialized_base(ContentKind::ComparisonChart);
+                    self.compose_stack_view(
+                        base,
+                        id,
+                        None,
+                        compact_controls,
+                        || column![].into(),
+                        None,
+                        tickers_table,
+                    )
+                }
+            }
+            Content::Gex {
+                chart, unsupported, ..
+            } => {
+                if *unsupported {
+                    let base = center(text(
+                        "GEX options data is currently available only for BTC and ETH.",
+                    ))
+                    .into();
+                    self.compose_stack_view(
+                        base,
+                        id,
+                        None,
+                        compact_controls,
+                        || column![].into(),
+                        None,
+                        tickers_table,
+                    )
+                } else if let Some(chart) = chart {
+                    let base = chart.view().map(move |message| {
+                        Message::PaneEvent(id, Event::GexChartInteraction(message))
+                    });
+                    let settings_modal = || gex_cfg_view(*chart.config(), id);
+                    self.compose_stack_view(
+                        base,
+                        id,
+                        None,
+                        compact_controls,
+                        settings_modal,
+                        None,
+                        tickers_table,
+                    )
+                } else {
+                    let base = uninitialized_base(ContentKind::GexChart);
                     self.compose_stack_view(
                         base,
                         id,
@@ -1396,6 +1480,14 @@ impl State {
                 }
                 _ => {}
             },
+            Event::GexChartInteraction(message) => {
+                if let Content::Gex {
+                    chart: Some(chart), ..
+                } = &mut self.content
+                {
+                    chart.update(message);
+                }
+            }
             Event::PanelInteraction(msg) => match &mut self.content {
                 Content::Ladder(Some(p)) => super::panel::update(p, msg),
                 Content::TimeAndSales(Some(p)) => super::panel::update(p, msg),
@@ -2032,6 +2124,7 @@ impl State {
             Content::ShaderHeatmap { chart, .. } => chart
                 .as_mut()
                 .and_then(|c| c.invalidate(Some(now)).map(Action::Chart)),
+            Content::Gex { .. } => None,
         }
     }
 
@@ -2044,7 +2137,7 @@ impl State {
 
     pub fn update_interval(&self) -> Option<u64> {
         match &self.content {
-            Content::Kline { .. } | Content::Comparison(_) => Some(1000),
+            Content::Kline { .. } | Content::Comparison(_) | Content::Gex { .. } => Some(1000),
             Content::Heatmap { chart, .. } => {
                 if let Some(chart) = chart {
                     chart.basis_interval()
@@ -2163,6 +2256,11 @@ pub enum Content {
     TimeAndSales(Option<TimeAndSales>),
     Ladder(Option<Ladder>),
     Comparison(Option<ComparisonChart>),
+    Gex {
+        chart: Option<GexChart>,
+        underlying: exchange::options::OptionsUnderlying,
+        unsupported: bool,
+    },
 }
 
 impl Content {
@@ -2370,6 +2468,11 @@ impl Content {
                 },
             },
             ContentKind::ComparisonChart => Content::Comparison(None),
+            ContentKind::GexChart => Content::Gex {
+                chart: None,
+                underlying: exchange::options::OptionsUnderlying::Btc,
+                unsupported: false,
+            },
             ContentKind::TimeAndSales => Content::TimeAndSales(None),
             ContentKind::Ladder => Content::Ladder(None),
         }
@@ -2382,6 +2485,7 @@ impl Content {
             Content::TimeAndSales(panel) => Some(panel.as_ref()?.last_update()),
             Content::Ladder(panel) => Some(panel.as_ref()?.last_update()),
             Content::Comparison(chart) => Some(chart.as_ref()?.last_update()),
+            Content::Gex { chart, .. } => Some(chart.as_ref()?.last_tick()),
             Content::Starter => None,
             Content::ShaderHeatmap { chart, .. } => Some(chart.as_ref()?.last_tick?),
         }
@@ -2465,6 +2569,7 @@ impl Content {
             | Content::Ladder(_)
             | Content::Starter
             | Content::Comparison(_)
+            | Content::Gex { .. }
             | Content::ShaderHeatmap { .. } => {
                 panic!("indicator reorder on {} pane", self)
             }
@@ -2487,6 +2592,15 @@ impl Content {
             }
             (Content::Comparison(Some(chart)), VisualConfig::Comparison(cfg)) => {
                 chart.config = cfg;
+                false
+            }
+            (
+                Content::Gex {
+                    chart: Some(chart), ..
+                },
+                VisualConfig::Gex(cfg),
+            ) => {
+                chart.set_config(cfg);
                 false
             }
             (Content::TimeAndSales(Some(panel)), VisualConfig::TimeAndSales(cfg)) => {
@@ -2518,6 +2632,7 @@ impl Content {
             | Content::Ladder(_)
             | Content::Starter
             | Content::Comparison(_) => None,
+            Content::Gex { .. } => None,
         }
     }
 
@@ -2575,6 +2690,7 @@ impl Content {
             Content::TimeAndSales(_) => ContentKind::TimeAndSales,
             Content::Ladder(_) => ContentKind::Ladder,
             Content::Comparison(_) => ContentKind::ComparisonChart,
+            Content::Gex { .. } => ContentKind::GexChart,
             Content::Starter => ContentKind::Starter,
             Content::ShaderHeatmap { .. } => ContentKind::ShaderHeatmap,
         }
@@ -2594,6 +2710,9 @@ impl Content {
             Content::TimeAndSales(panel) => panel.is_some(),
             Content::Ladder(panel) => panel.is_some(),
             Content::Comparison(chart) => chart.is_some(),
+            Content::Gex {
+                chart, unsupported, ..
+            } => chart.is_some() || *unsupported,
             Content::Starter => true,
         }
     }
@@ -2626,6 +2745,7 @@ impl PartialEq for Content {
                 | (Content::Kline { .. }, Content::Kline { .. })
                 | (Content::TimeAndSales(_), Content::TimeAndSales(_))
                 | (Content::Ladder(_), Content::Ladder(_))
+                | (Content::Gex { .. }, Content::Gex { .. })
         )
     }
 }

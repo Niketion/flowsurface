@@ -1,7 +1,7 @@
 use exchange::{TickMultiplier, TickerInfo, Timeframe};
 use serde::{Deserialize, Serialize};
 
-use crate::chart::{comparison, heatmap, kline};
+use crate::chart::{comparison, gex, heatmap, kline};
 use crate::panel::{ladder, timeandsales};
 use crate::stream::PersistStreamKind;
 use crate::util::ok_or_default;
@@ -65,6 +65,13 @@ pub enum Pane {
         settings: Settings,
         #[serde(deserialize_with = "ok_or_default", default)]
         indicators: Vec<KlineIndicator>,
+        #[serde(deserialize_with = "ok_or_default", default)]
+        link_group: Option<LinkGroup>,
+    },
+    GexChart {
+        underlying: exchange::options::OptionsUnderlying,
+        #[serde(deserialize_with = "ok_or_default")]
+        settings: Settings,
         #[serde(deserialize_with = "ok_or_default", default)]
         link_group: Option<LinkGroup>,
     },
@@ -155,6 +162,7 @@ pub enum VisualConfig {
     Kline(kline::Config),
     Ladder(ladder::Config),
     Comparison(comparison::Config),
+    Gex(gex::Config),
 }
 
 impl VisualConfig {
@@ -192,6 +200,13 @@ impl VisualConfig {
             _ => None,
         }
     }
+
+    pub fn gex(&self) -> Option<gex::Config> {
+        match self {
+            Self::Gex(cfg) => Some(*cfg),
+            _ => None,
+        }
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -202,18 +217,20 @@ pub enum ContentKind {
     FootprintChart,
     CandlestickChart,
     ComparisonChart,
+    GexChart,
     TimeAndSales,
     Ladder,
 }
 
 impl ContentKind {
-    pub const ALL: [ContentKind; 8] = [
+    pub const ALL: [ContentKind; 9] = [
         ContentKind::Starter,
         ContentKind::HeatmapChart,
         ContentKind::ShaderHeatmap,
         ContentKind::FootprintChart,
         ContentKind::CandlestickChart,
         ContentKind::ComparisonChart,
+        ContentKind::GexChart,
         ContentKind::TimeAndSales,
         ContentKind::Ladder,
     ];
@@ -228,6 +245,7 @@ impl std::fmt::Display for ContentKind {
             ContentKind::FootprintChart => "Footprint Chart",
             ContentKind::CandlestickChart => "Candlestick Chart",
             ContentKind::ComparisonChart => "Comparison Chart",
+            ContentKind::GexChart => "GEX Options Chart",
             ContentKind::TimeAndSales => "Time&Sales",
             ContentKind::Ladder => "DOM/Ladder",
         };
@@ -294,7 +312,7 @@ impl PaneSetup {
                         Basis::default_kline_time(Some(base_ticker), Timeframe::M15)
                     }))
                 }
-                ContentKind::Starter | ContentKind::TimeAndSales => None,
+                ContentKind::Starter | ContentKind::TimeAndSales | ContentKind::GexChart => None,
             };
 
         let tick_multiplier = match content_kind {
@@ -315,6 +333,7 @@ impl PaneSetup {
             }
             ContentKind::CandlestickChart
             | ContentKind::ComparisonChart
+            | ContentKind::GexChart
             | ContentKind::TimeAndSales
             | ContentKind::Starter => current_tick_multiplier,
         };
