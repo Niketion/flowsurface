@@ -2,7 +2,9 @@ use crate::{chart::gex, style};
 use data::chart::gex::{GexFreshness, GexSignModel, GexStrike};
 use iced::{
     Alignment, Color, Element, Length, Point, Rectangle, Renderer, Size, Theme, mouse,
-    widget::{button, canvas, column, container, mouse_area, responsive, row, space, text},
+    widget::{
+        button, canvas, column, container, mouse_area, responsive, row, space, svg, text, tooltip,
+    },
 };
 
 pub fn view(chart: &gex::GexChart) -> Element<'_, gex::Message> {
@@ -42,19 +44,21 @@ fn view_sized(chart: &gex::GexChart, density: GexLayoutDensity) -> Element<'_, g
         return iced::widget::center(text("No strikes in the configured range.")).into();
     }
 
-    let mut zoom_in = button("Zoom +")
-        .padding([3, 7])
-        .style(iced::widget::button::secondary);
-    if chart.can_zoom_in() {
-        zoom_in = zoom_in.on_press(gex::Message::ZoomIn);
-    }
-    let mut zoom_out = button("Zoom −")
-        .padding([3, 7])
-        .style(iced::widget::button::secondary);
-    if chart.can_zoom_out() {
-        zoom_out = zoom_out.on_press(gex::Message::ZoomOut);
-    }
-    let controls = row![zoom_in, zoom_out].spacing(4);
+    let controls = row![
+        zoom_button(
+            include_bytes!("../../../assets/ui/zoom-in.svg"),
+            "Zoom in",
+            chart.can_zoom_in(),
+            gex::Message::ZoomIn,
+        ),
+        zoom_button(
+            include_bytes!("../../../assets/ui/zoom-out.svg"),
+            "Zoom out",
+            chart.can_zoom_out(),
+            gex::Message::ZoomOut,
+        )
+    ]
+    .spacing(3);
     let header = header_view(chart, snapshot, density);
     let table = canvas(GexProfileTable {
         snapshot,
@@ -84,6 +88,37 @@ fn view_sized(chart: &gex::GexChart, density: GexLayoutDensity) -> Element<'_, g
         .spacing(4)
         .padding(padding)
         .into()
+}
+
+fn zoom_button<'a>(
+    bytes: &'static [u8],
+    label: &'static str,
+    enabled: bool,
+    message: gex::Message,
+) -> Element<'a, gex::Message> {
+    let icon = svg(svg::Handle::from_memory(bytes))
+        .width(15)
+        .height(15)
+        .opacity(if enabled { 1.0 } else { 0.38 })
+        .style(|theme: &Theme, _| svg::Style {
+            color: Some(theme.palette().text),
+        });
+    let mut control = button(icon)
+        .width(24)
+        .height(24)
+        .padding(4)
+        .style(iced::widget::button::secondary);
+    if enabled {
+        control = control.on_press(message);
+    }
+    tooltip(
+        control,
+        container(text(label).size(style::text_size::SMALL))
+            .padding(4)
+            .style(container::rounded_box),
+        tooltip::Position::Bottom,
+    )
+    .into()
 }
 
 fn header_view<'a>(
@@ -184,6 +219,33 @@ struct GexTableColumns {
     level_bounds: Rectangle,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq)]
+struct GexTableMetrics {
+    header_height: f32,
+    row_height: f32,
+    bar_height: f32,
+    text_size: f32,
+    table_bottom: f32,
+}
+
+fn table_metrics(height: f32, visible_count: usize) -> GexTableMetrics {
+    let height = height.max(1.0);
+    let header_height = 22.0_f32.min(height * 0.25);
+    let available_height = (height - header_height).max(0.0);
+    let row_height = if visible_count == 0 {
+        0.0
+    } else {
+        (available_height / visible_count as f32).max(1.0)
+    };
+    GexTableMetrics {
+        header_height,
+        row_height,
+        bar_height: (row_height * 0.38).clamp(2.0, 16.0),
+        text_size: (7.0 + row_height * 0.08).clamp(7.0, 11.0),
+        table_bottom: height,
+    }
+}
+
 fn table_columns(width: f32, density: GexLayoutDensity) -> GexTableColumns {
     let usable = (width - 10.0).max(120.0);
     let (bars, strike, net, abs) = match density {
@@ -253,9 +315,7 @@ impl canvas::Program<gex::Message> for GexProfileTable<'_> {
         let palette = theme.extended_palette();
         let mut frame = canvas::Frame::new(renderer, bounds.size());
         let columns = table_columns(bounds.width, self.density);
-        let header_h = 22.0;
-        let row_h = ((bounds.height - header_h) / self.strikes.len() as f32).clamp(10.0, 22.0);
-        let table_bottom = (header_h + row_h * self.strikes.len() as f32).min(bounds.height);
+        let metrics = table_metrics(bounds.height, self.strikes.len());
         let max_gex = self
             .strikes
             .iter()
@@ -268,11 +328,14 @@ impl canvas::Program<gex::Message> for GexProfileTable<'_> {
             })
             .fold(f64::EPSILON, f64::max);
         let row_centers = (0..self.strikes.len())
-            .map(|index| header_h + (self.strikes.len() - index) as f32 * row_h - row_h * 0.5)
+            .map(|index| {
+                metrics.header_height + (self.strikes.len() - index) as f32 * metrics.row_height
+                    - metrics.row_height * 0.5
+            })
             .collect::<Vec<_>>();
         let hovered = cursor.position_in(bounds).and_then(|point| {
-            (point.y >= header_h && point.y < table_bottom)
-                .then(|| ((point.y - header_h) / row_h) as usize)
+            (point.y >= metrics.header_height && point.y < metrics.table_bottom)
+                .then(|| ((point.y - metrics.header_height) / metrics.row_height) as usize)
                 .filter(|index| *index < self.strikes.len())
                 .map(|visual| self.strikes.len() - 1 - visual)
         });
@@ -280,7 +343,7 @@ impl canvas::Program<gex::Message> for GexProfileTable<'_> {
         draw_table_header(&mut frame, &columns, max_gex, palette.background.base.text);
         for (index, strike) in self.strikes.iter().enumerate().rev() {
             let y = row_centers[index];
-            let top = y - row_h * 0.5;
+            let top = y - metrics.row_height * 0.5;
             let is_call = self.snapshot.call_wall == Some(strike.strike);
             let is_put = self.snapshot.put_wall == Some(strike.strike);
             if hovered == Some(index) || is_call || is_put {
@@ -294,9 +357,12 @@ impl canvas::Program<gex::Message> for GexProfileTable<'_> {
                 frame.fill(
                     &canvas::Path::rectangle(
                         Point::new(0.0, top),
-                        Size::new(columns.level_bounds.x + columns.level_bounds.width, row_h),
+                        Size::new(
+                            columns.level_bounds.x + columns.level_bounds.width,
+                            metrics.row_height,
+                        ),
                     ),
-                    color.scale_alpha(if hovered == Some(index) { 0.09 } else { 0.06 }),
+                    color.scale_alpha(if hovered == Some(index) { 0.15 } else { 0.06 }),
                 );
             }
             draw_strike_row(
@@ -304,7 +370,7 @@ impl canvas::Program<gex::Message> for GexProfileTable<'_> {
                 &columns,
                 strike,
                 y,
-                row_h,
+                &metrics,
                 max_gex,
                 self.density,
                 is_call,
@@ -326,9 +392,19 @@ impl canvas::Program<gex::Message> for GexProfileTable<'_> {
                 .then_some(self.snapshot.gamma_flip)
                 .flatten(),
             self.density,
+            metrics.bar_height.clamp(2.0, 4.0),
             palette,
         );
-        let (zero_start, zero_end) = zero_line_points(&columns, table_bottom);
+        frame.stroke(
+            &canvas::Path::line(
+                Point::new(0.0, metrics.header_height),
+                Point::new(bounds.width, metrics.header_height),
+            ),
+            canvas::Stroke::default()
+                .with_color(palette.background.base.text.scale_alpha(0.2))
+                .with_width(1.0),
+        );
+        let (zero_start, zero_end) = zero_line_points(&columns, &metrics);
         frame.stroke(
             &canvas::Path::line(zero_start, zero_end),
             canvas::Stroke::default()
@@ -349,10 +425,10 @@ impl canvas::Program<gex::Message> for GexProfileTable<'_> {
     }
 }
 
-fn zero_line_points(columns: &GexTableColumns, table_bottom: f32) -> (Point, Point) {
+fn zero_line_points(columns: &GexTableColumns, metrics: &GexTableMetrics) -> (Point, Point) {
     (
-        Point::new(columns.zero_x, 0.0),
-        Point::new(columns.zero_x, table_bottom),
+        Point::new(columns.zero_x, metrics.header_height),
+        Point::new(columns.zero_x, metrics.table_bottom),
     )
 }
 
@@ -414,7 +490,7 @@ fn draw_strike_row(
     columns: &GexTableColumns,
     strike: &GexStrike,
     y: f32,
-    row_h: f32,
+    metrics: &GexTableMetrics,
     max_gex: f64,
     density: GexLayoutDensity,
     call_wall: bool,
@@ -433,7 +509,7 @@ fn draw_strike_row(
         strike.call_gex_1pct.abs()
     } / max_gex) as f32
         * columns.call_bounds.width;
-    let bar_h = (row_h * 0.38).clamp(3.0, 7.0);
+    let bar_h = metrics.bar_height;
     frame.fill(
         &canvas::Path::rectangle(
             Point::new(columns.zero_x - put_width, y - bar_h * 0.5),
@@ -448,28 +524,31 @@ fn draw_strike_row(
         ),
         palette.success.strong.color,
     );
-    draw_cell_text(
+    draw_cell_text_sized(
         frame,
         &format!("{:.2}", strike.strike),
         columns.strike_bounds,
         y,
+        metrics.text_size,
         palette.background.base.text,
     );
     if let Some(bounds) = columns.net_bounds {
-        draw_cell_text(
+        draw_cell_text_sized(
             frame,
             &format_exposure(strike.net_gex_1pct),
             bounds,
             y,
+            metrics.text_size,
             palette.background.base.text,
         );
     }
     if let Some(bounds) = columns.abs_bounds {
-        draw_cell_text(
+        draw_cell_text_sized(
             frame,
             &format_exposure(strike.absolute_gamma_1pct),
             bounds,
             y,
+            metrics.text_size,
             palette.background.base.text,
         );
     }
@@ -497,11 +576,12 @@ fn draw_strike_row(
         }
         _ => "",
     };
-    draw_cell_text(
+    draw_cell_text_sized(
         frame,
         level,
         columns.level_bounds,
         y,
+        metrics.text_size,
         palette.background.base.text,
     );
 }
@@ -539,6 +619,7 @@ fn draw_references(
     spot: Option<f64>,
     flip: Option<f64>,
     density: GexLayoutDensity,
+    band_height: f32,
     palette: &iced::theme::palette::Extended,
 ) {
     let spot_y = spot.and_then(|price| reference_y_for_price(price, strikes, centers));
@@ -566,6 +647,7 @@ fn draw_references(
                 flip
             ),
             palette.warning.strong.color,
+            band_height,
         );
         return;
     }
@@ -584,6 +666,7 @@ fn draw_references(
                 price
             ),
             palette.primary.strong.color,
+            band_height,
         );
     }
     if let (Some(y), Some(price)) = (flip_y, flip) {
@@ -601,6 +684,7 @@ fn draw_references(
                 price
             ),
             palette.warning.strong.color,
+            band_height,
         );
     }
 }
@@ -611,11 +695,15 @@ fn draw_reference_band(
     y: f32,
     label: &str,
     color: Color,
+    band_height: f32,
 ) {
     frame.fill(
         &canvas::Path::rectangle(
-            Point::new(0.0, y - 1.5),
-            Size::new(columns.call_bounds.x + columns.call_bounds.width, 3.0),
+            Point::new(0.0, y - band_height * 0.5),
+            Size::new(
+                columns.call_bounds.x + columns.call_bounds.width,
+                band_height,
+            ),
         ),
         color.scale_alpha(0.22),
     );
@@ -660,8 +748,19 @@ fn draw_hover(
 ) {
     let bounds = hover_bounds(cursor, Size::new(250.0, 148.0), chart_size);
     frame.fill(
+        &canvas::Path::rectangle(Point::new(bounds.x + 2.0, bounds.y + 2.0), bounds.size()),
+        Color::BLACK.scale_alpha(0.24),
+    );
+    let background = opaque_color(palette.background.base.color);
+    frame.fill(
         &canvas::Path::rectangle(bounds.position(), bounds.size()),
-        palette.background.base.color.scale_alpha(0.96),
+        background,
+    );
+    frame.stroke(
+        &canvas::Path::rectangle(bounds.position(), bounds.size()),
+        canvas::Stroke::default()
+            .with_color(palette.background.base.text.scale_alpha(0.35))
+            .with_width(1.0),
     );
     let distance = strike.strike - spot;
     let rows = [
@@ -689,7 +788,7 @@ fn draw_hover(
             bounds.x + 8.0,
             y,
             9.0,
-            palette.background.base.text.scale_alpha(0.7),
+            opaque_color(palette.background.base.text).scale_alpha(0.78),
             iced::alignment::Horizontal::Left,
         );
         draw_text_at(
@@ -698,19 +797,34 @@ fn draw_hover(
             bounds.x + bounds.width - 8.0,
             y,
             9.0,
-            palette.background.base.text,
+            opaque_color(palette.background.base.text),
             iced::alignment::Horizontal::Right,
         );
     }
 }
 
+fn opaque_color(color: Color) -> Color {
+    Color { a: 1.0, ..color }
+}
+
 fn draw_cell_text(frame: &mut canvas::Frame, value: &str, bounds: Rectangle, y: f32, color: Color) {
+    draw_cell_text_sized(frame, value, bounds, y, 9.0, color);
+}
+
+fn draw_cell_text_sized(
+    frame: &mut canvas::Frame,
+    value: &str,
+    bounds: Rectangle,
+    y: f32,
+    size: f32,
+    color: Color,
+) {
     draw_text_at(
         frame,
         value,
         bounds.x + bounds.width * 0.5,
         y,
-        9.0,
+        size,
         color,
         iced::alignment::Horizontal::Center,
     );
@@ -790,10 +904,11 @@ mod tests {
             assert_eq!(columns.zero_x, columns.call_bounds.x);
             let (_, label_zero, _) = scale_label_positions(&columns);
             assert_eq!(label_zero, columns.zero_x);
-            let (start, end) = zero_line_points(&columns, 500.0);
+            let metrics = table_metrics(500.0, 20);
+            let (start, end) = zero_line_points(&columns, &metrics);
             assert_eq!(start.x, columns.zero_x);
             assert_eq!(end.x, columns.zero_x);
-            assert_eq!(start.y, 0.0);
+            assert_eq!(start.y, metrics.header_height);
             assert_eq!(end.y, 500.0);
         }
     }
@@ -837,5 +952,32 @@ mod tests {
         for value in [-7_190_000.0, 0.0, 31_000.0] {
             assert!(!format_exposure(value).contains('\n'));
         }
+    }
+
+    #[test]
+    fn metrics_fill_height_and_resize_rows() {
+        let normal = table_metrics(500.0, 20);
+        let fullscreen = table_metrics(1_000.0, 20);
+        assert_eq!(normal.table_bottom, 500.0);
+        assert_eq!(fullscreen.table_bottom, 1_000.0);
+        assert!(fullscreen.row_height > normal.row_height);
+        assert!(
+            (normal.header_height + normal.row_height * 20.0 - normal.table_bottom).abs()
+                < f32::EPSILON
+        );
+    }
+
+    #[test]
+    fn zoomed_strike_count_changes_visual_row_height() {
+        let zoomed_out = table_metrics(600.0, 20);
+        let zoomed_in = table_metrics(600.0, 10);
+        assert!(zoomed_in.row_height > zoomed_out.row_height);
+        assert!(zoomed_in.bar_height >= zoomed_out.bar_height);
+        assert!(zoomed_in.text_size >= zoomed_out.text_size);
+    }
+
+    #[test]
+    fn hover_background_is_fully_opaque() {
+        assert_eq!(opaque_color(Color::from_rgba(0.1, 0.2, 0.3, 0.2)).a, 1.0);
     }
 }
