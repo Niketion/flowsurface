@@ -756,12 +756,6 @@ fn draw_hover(
         &canvas::Path::rectangle(bounds.position(), bounds.size()),
         background,
     );
-    frame.stroke(
-        &canvas::Path::rectangle(bounds.position(), bounds.size()),
-        canvas::Stroke::default()
-            .with_color(palette.background.base.text.scale_alpha(0.35))
-            .with_width(1.0),
-    );
     let distance = strike.strike - spot;
     let rows = [
         ("Strike", format!("{:.2}", strike.strike)),
