@@ -89,6 +89,38 @@ impl std::fmt::Display for GexBasisMode {
     }
 }
 
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq, Hash, Deserialize, Serialize)]
+pub enum GexLevelColor {
+    Primary,
+    Success,
+    Danger,
+    #[default]
+    Warning,
+    Secondary,
+}
+
+impl GexLevelColor {
+    pub const ALL: [Self; 5] = [
+        Self::Primary,
+        Self::Success,
+        Self::Danger,
+        Self::Warning,
+        Self::Secondary,
+    ];
+}
+
+impl std::fmt::Display for GexLevelColor {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(match self {
+            Self::Primary => "Primary",
+            Self::Success => "Success",
+            Self::Danger => "Danger",
+            Self::Warning => "Warning",
+            Self::Secondary => "Secondary",
+        })
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Deserialize, Serialize)]
 #[serde(default)]
 pub struct GexLevelsConfig {
@@ -99,7 +131,20 @@ pub struct GexLevelsConfig {
     pub show_put_wall: bool,
     pub show_top_clusters: bool,
     pub max_clusters: usize,
+    pub clusters_as_bands: bool,
+    /// Half-width of a cluster band as a fraction of the adjacent strike gap.
+    pub cluster_band_width: f32,
+    pub show_value: bool,
+    pub show_distance_percent: bool,
     pub basis_mode: GexBasisMode,
+    pub line_width: f32,
+    pub gamma_flip_width: f32,
+    pub line_opacity: f32,
+    pub band_opacity: f32,
+    pub gamma_flip_color: GexLevelColor,
+    pub call_wall_color: GexLevelColor,
+    pub put_wall_color: GexLevelColor,
+    pub cluster_color: GexLevelColor,
 }
 
 impl Default for GexLevelsConfig {
@@ -112,7 +157,19 @@ impl Default for GexLevelsConfig {
             show_put_wall: true,
             show_top_clusters: true,
             max_clusters: 3,
+            clusters_as_bands: true,
+            cluster_band_width: 0.5,
+            show_value: true,
+            show_distance_percent: true,
             basis_mode: GexBasisMode::RawStrike,
+            line_width: 1.0,
+            gamma_flip_width: 1.8,
+            line_opacity: 0.78,
+            band_opacity: 0.12,
+            gamma_flip_color: GexLevelColor::Warning,
+            call_wall_color: GexLevelColor::Success,
+            put_wall_color: GexLevelColor::Danger,
+            cluster_color: GexLevelColor::Secondary,
         }
     }
 }

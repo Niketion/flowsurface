@@ -501,8 +501,11 @@ pub struct Config {
     pub vwap: VwapConfig,
     /// Settings owned by the CVD panel indicator.
     pub cvd: CvdConfig,
-    /// Settings owned by the synthetic GEX levels overlay.
-    pub gex_levels: crate::chart::gex::GexLevelsConfig,
+    /// Visual settings owned by configurable indicators.
+    pub indicator_configs: IndicatorConfigs,
+    /// Compatibility input for states saved before `indicator_configs`.
+    #[serde(default, rename = "gex_levels", skip_serializing)]
+    pub legacy_gex_levels: Option<crate::chart::gex::GexLevelsConfig>,
 }
 
 impl Default for Config {
@@ -515,9 +518,35 @@ impl Default for Config {
             session_volume_profile: SessionVolumeProfileConfig::default(),
             vwap: VwapConfig::default(),
             cvd: CvdConfig::default(),
-            gex_levels: crate::chart::gex::GexLevelsConfig::default(),
+            indicator_configs: IndicatorConfigs::default(),
+            legacy_gex_levels: None,
         }
     }
+}
+
+impl Config {
+    pub fn gex_levels(&self) -> crate::chart::gex::GexLevelsConfig {
+        self.legacy_gex_levels
+            .unwrap_or(self.indicator_configs.gex_levels)
+    }
+
+    pub fn with_gex_levels(mut self, config: crate::chart::gex::GexLevelsConfig) -> Self {
+        self.indicator_configs.gex_levels = config;
+        self.legacy_gex_levels = None;
+        self
+    }
+
+    pub fn migrate_legacy_indicator_configs(&mut self) {
+        if let Some(legacy) = self.legacy_gex_levels.take() {
+            self.indicator_configs.gex_levels = legacy;
+        }
+    }
+}
+
+#[derive(Debug, Default, Copy, Clone, PartialEq, Deserialize, Serialize)]
+#[serde(default)]
+pub struct IndicatorConfigs {
+    pub gex_levels: crate::chart::gex::GexLevelsConfig,
 }
 
 #[derive(Debug, Copy, Clone, PartialEq, Deserialize, Serialize)]

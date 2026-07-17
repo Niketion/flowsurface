@@ -221,7 +221,8 @@ impl KlineChart {
         kind: &KlineChartKind,
         visual_config: Option<Config>,
     ) -> Self {
-        let visual_config = visual_config.unwrap_or_default();
+        let mut visual_config = visual_config.unwrap_or_default();
+        visual_config.migrate_legacy_indicator_configs();
         let kind = Self::sanitized_kind(kind.clone());
         let raw_trades = deduplicate_incoming_trades(&[], &raw_trades);
 
@@ -1364,7 +1365,8 @@ impl KlineChart {
         ))
     }
 
-    pub fn set_visual_config(&mut self, visual_config: Config) {
+    pub fn set_visual_config(&mut self, mut visual_config: Config) {
+        visual_config.migrate_legacy_indicator_configs();
         let old_bubbles = self.visual_config.volume_bubbles;
         let new_bubbles = visual_config.volume_bubbles;
         let old_svp = self.visual_config.session_volume_profile;
@@ -2417,7 +2419,8 @@ impl canvas::Program<Message> for KlineChart {
                             frame,
                             price_to_y,
                             snapshot,
-                            &self.visual_config.gex_levels,
+                            &self.visual_config.gex_levels(),
+                            chart.tick_size,
                             self.data_source
                                 .latest_y_midpoint(|kline| kline.close.to_f32_lossy())
                                 as f64,
@@ -2616,10 +2619,35 @@ fn draw_gex_levels(
     price_to_y: impl Fn(Price) -> f32,
     snapshot: &data::chart::gex::GexSnapshot,
     config: &data::chart::gex::GexLevelsConfig,
+    tick_size: PriceStep,
     latest_chart_price: f64,
     palette: &Extended,
 ) {
-    use data::chart::gex::GexBasisMode;
+    use data::chart::gex::{GexBasisMode, GexLevelColor};
+
+    #[derive(Clone, Copy, PartialEq, Eq)]
+    enum Kind {
+        Flip,
+        CallWall,
+        PutWall,
+        Cluster,
+    }
+
+    struct Level {
+        kind: Kind,
+        label: &'static str,
+        raw: f64,
+        half_band: f64,
+        color: Color,
+    }
+
+    let resolve_color = |role| match role {
+        GexLevelColor::Primary => palette.primary.strong.color,
+        GexLevelColor::Success => palette.success.strong.color,
+        GexLevelColor::Danger => palette.danger.strong.color,
+        GexLevelColor::Warning => palette.warning.strong.color,
+        GexLevelColor::Secondary => palette.secondary.strong.color,
+    };
 
     let basis = if config.basis_mode == GexBasisMode::ShiftToChartPrice
         && latest_chart_price.is_finite()
@@ -2629,60 +2657,168 @@ fn draw_gex_levels(
     } else {
         0.0
     };
-    let suffix = if config.basis_mode == GexBasisMode::ShiftToChartPrice {
-        " · shifted"
-    } else {
-        ""
-    };
     let mut levels = Vec::new();
     if config.show_gamma_flip
         && let Some(value) = snapshot.gamma_flip
     {
-        levels.push(("Gamma Flip", value, palette.warning.strong.color));
+        levels.push(Level {
+            kind: Kind::Flip,
+            label: "Gamma Flip",
+            raw: value,
+            half_band: 0.0,
+            color: resolve_color(config.gamma_flip_color),
+        });
     }
     if config.show_call_wall
         && let Some(value) = snapshot.call_wall
     {
-        levels.push(("Call Wall", value, palette.success.strong.color));
+        levels.push(Level {
+            kind: Kind::CallWall,
+            label: "Call Wall",
+            raw: value,
+            half_band: 0.0,
+            color: resolve_color(config.call_wall_color),
+        });
     }
     if config.show_put_wall
         && let Some(value) = snapshot.put_wall
     {
-        levels.push(("Put Wall", value, palette.danger.strong.color));
+        levels.push(Level {
+            kind: Kind::PutWall,
+            label: "Put Wall",
+            raw: value,
+            half_band: 0.0,
+            color: resolve_color(config.put_wall_color),
+        });
     }
     if config.show_top_clusters {
-        let mut clusters = snapshot.strikes.iter().collect::<Vec<_>>();
-        clusters.sort_by(|a, b| b.absolute_gamma_1pct.total_cmp(&a.absolute_gamma_1pct));
-        for strike in clusters.into_iter().take(config.max_clusters.min(10)) {
-            levels.push((
-                "Gamma Cluster",
-                strike.strike,
-                palette.secondary.strong.color,
-            ));
+        let mut clusters = snapshot.strikes.iter().enumerate().collect::<Vec<_>>();
+        clusters.sort_by(|a, b| b.1.absolute_gamma_1pct.total_cmp(&a.1.absolute_gamma_1pct));
+        for (index, strike) in clusters.into_iter().take(config.max_clusters.min(10)) {
+            let previous_gap = index
+                .checked_sub(1)
+                .map(|previous| strike.strike - snapshot.strikes[previous].strike);
+            let next_gap = snapshot
+                .strikes
+                .get(index + 1)
+                .map(|next| next.strike - strike.strike);
+            let adjacent_gap = previous_gap
+                .into_iter()
+                .chain(next_gap)
+                .filter(|gap| gap.is_finite() && *gap > 0.0)
+                .fold(f64::INFINITY, f64::min);
+            let minimum = tick_size.to_f64_lossy().abs().max(f64::EPSILON);
+            let half_band = if adjacent_gap.is_finite() {
+                adjacent_gap * f64::from(config.cluster_band_width.clamp(0.1, 1.5))
+            } else {
+                minimum
+            }
+            .max(minimum);
+            levels.push(Level {
+                kind: Kind::Cluster,
+                label: "Gamma Cluster",
+                raw: strike.strike,
+                half_band,
+                color: resolve_color(config.cluster_color),
+            });
         }
     }
 
-    for (label, raw, color) in levels {
-        let displayed = raw + basis;
+    let mut labels = Vec::new();
+    for level in levels {
+        let displayed = level.raw + basis;
         if !displayed.is_finite() || displayed <= 0.0 {
             continue;
         }
         let y = price_to_y(Price::from_f64(displayed));
-        let path = Path::line(Point::new(0.0, y), Point::new(frame.width(), y));
-        frame.stroke(
-            &path,
-            Stroke::default()
-                .with_color(color.scale_alpha(0.78))
-                .with_width(1.0),
+        if !y.is_finite() || y < 0.0 || y > frame.height() {
+            continue;
+        }
+        if level.kind == Kind::Cluster && config.clusters_as_bands {
+            let upper_y = price_to_y(Price::from_f64(displayed + level.half_band));
+            let lower_y = price_to_y(Price::from_f64(
+                (displayed - level.half_band).max(f64::EPSILON),
+            ));
+            let top = upper_y.min(lower_y);
+            let height = (upper_y - lower_y).abs().max(1.0);
+            frame.fill(
+                &Path::rectangle(Point::new(0.0, top), Size::new(frame.width(), height)),
+                level
+                    .color
+                    .scale_alpha(config.band_opacity.clamp(0.02, 0.4)),
+            );
+        } else {
+            let path = Path::line(Point::new(0.0, y), Point::new(frame.width(), y));
+            let width = if level.kind == Kind::Flip {
+                config.gamma_flip_width.clamp(1.0, 4.0)
+            } else {
+                config.line_width.clamp(0.5, 3.0)
+            };
+            frame.stroke(
+                &path,
+                Stroke::default()
+                    .with_color(level.color.scale_alpha(config.line_opacity.clamp(0.1, 1.0)))
+                    .with_width(width),
+            );
+        }
+
+        let mut label = level.label.to_string();
+        if config.show_value {
+            label.push_str(&format!(" {displayed:.2}"));
+        }
+        if config.show_distance_percent
+            && latest_chart_price.is_finite()
+            && latest_chart_price > 0.0
+        {
+            label.push_str(&format!(
+                " {:+.2}%",
+                (displayed - latest_chart_price) / latest_chart_price * 100.0
+            ));
+        }
+        if config.basis_mode == GexBasisMode::ShiftToChartPrice {
+            label.push_str(&format!(" · SHIFT {basis:+.2}"));
+        }
+        let near_spot = level.kind == Kind::Flip
+            && latest_chart_price.is_finite()
+            && (displayed - latest_chart_price).abs()
+                <= (tick_size.to_f64_lossy().abs() * 2.0).max(latest_chart_price.abs() * 0.001);
+        if near_spot {
+            label.push_str(&format!(" · Spot {latest_chart_price:.2}"));
+        }
+        labels.push((y, label, level.color));
+    }
+
+    labels.sort_by(|a, b| a.0.total_cmp(&b.0));
+    let mut occupied = Vec::<f32>::new();
+    for (line_y, label, color) in labels {
+        let top = 8.0;
+        let bottom = (frame.height() - 8.0).max(top);
+        let label_y = (0..24)
+            .flat_map(|distance| {
+                let offset = distance as f32 * 13.0;
+                [line_y + offset, line_y - offset]
+            })
+            .map(|candidate| candidate.clamp(top, bottom))
+            .find(|candidate| {
+                occupied
+                    .iter()
+                    .all(|other| (candidate - other).abs() >= 13.0)
+            })
+            .unwrap_or_else(|| line_y.clamp(top, bottom));
+        occupied.push(label_y);
+        let width = (label.chars().count() as f32 * 5.2 + 10.0).min(frame.width() * 0.58);
+        frame.fill(
+            &Path::rectangle(Point::new(4.0, label_y - 7.0), Size::new(width, 13.0)),
+            palette.background.base.color.scale_alpha(0.86),
         );
         draw_cluster_text(
             frame,
-            &format!("{label}{suffix}"),
-            Point::new(4.0, y - 2.0),
+            &label,
+            Point::new(8.0, label_y),
             7.0,
             color,
             Alignment::Start,
-            Alignment::End,
+            Alignment::Center,
         );
     }
 }

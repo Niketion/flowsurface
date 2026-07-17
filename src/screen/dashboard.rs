@@ -208,7 +208,7 @@ impl Dashboard {
                             chart.set_gex_snapshot(None);
                             return;
                         };
-                        let levels = chart.visual_config().gex_levels;
+                        let levels = chart.visual_config().gex_levels();
                         let config = data::chart::gex::Config {
                             sign_model: levels.enabled_model,
                             expiry_filter: levels.expiry_filter,

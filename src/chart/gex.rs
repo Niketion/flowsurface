@@ -4,12 +4,11 @@ use std::{sync::Arc, time::Instant};
 
 #[derive(Debug, Clone, Copy)]
 pub enum Message {
-    ZoomIn,
-    ZoomOut,
-    PanUp,
-    PanDown,
     AutoFit,
     Scrolled(iced::mouse::ScrollDelta),
+    DragStarted,
+    Dragged(iced::Point),
+    DragEnded,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -24,6 +23,9 @@ pub struct GexChart {
     config: Config,
     visible_fraction: f64,
     center_offset: isize,
+    dragging: bool,
+    last_drag_y: Option<f32>,
+    drag_remainder: f32,
     last_tick: Instant,
     error: Option<Arc<str>>,
 }
@@ -37,6 +39,9 @@ impl GexChart {
             config: config.unwrap_or_default(),
             visible_fraction: 1.0,
             center_offset: 0,
+            dragging: false,
+            last_drag_y: None,
+            drag_remainder: 0.0,
             last_tick: Instant::now(),
             error: None,
         }
@@ -101,10 +106,6 @@ impl GexChart {
 
     pub fn update(&mut self, message: Message) -> Action {
         match message {
-            Message::ZoomIn => self.visible_fraction = (self.visible_fraction * 0.8).max(0.1),
-            Message::ZoomOut => self.visible_fraction = (self.visible_fraction * 1.25).min(1.0),
-            Message::PanUp => self.center_offset = self.center_offset.saturating_add(1),
-            Message::PanDown => self.center_offset = self.center_offset.saturating_sub(1),
             Message::AutoFit => self.auto_fit(),
             Message::Scrolled(delta) => {
                 let y = match delta {
@@ -117,6 +118,28 @@ impl GexChart {
                     self.visible_fraction = (self.visible_fraction * 1.25).min(1.0);
                 }
             }
+            Message::DragStarted => {
+                self.dragging = true;
+                self.last_drag_y = None;
+                self.drag_remainder = 0.0;
+            }
+            Message::Dragged(point) if self.dragging => {
+                if let Some(previous) = self.last_drag_y {
+                    self.drag_remainder += point.y - previous;
+                    let rows = (self.drag_remainder / 12.0).trunc() as isize;
+                    if rows != 0 {
+                        self.center_offset = self.center_offset.saturating_add(rows);
+                        self.drag_remainder -= rows as f32 * 12.0;
+                    }
+                }
+                self.last_drag_y = Some(point.y);
+            }
+            Message::Dragged(_) => {}
+            Message::DragEnded => {
+                self.dragging = false;
+                self.last_drag_y = None;
+                self.drag_remainder = 0.0;
+            }
         }
         self.last_tick = Instant::now();
         Action::ViewChanged
@@ -125,6 +148,9 @@ impl GexChart {
     fn auto_fit(&mut self) {
         self.visible_fraction = 1.0;
         self.center_offset = 0;
+        self.dragging = false;
+        self.last_drag_y = None;
+        self.drag_remainder = 0.0;
     }
 
     pub fn visible_strikes(&self) -> &[data::chart::gex::GexStrike] {

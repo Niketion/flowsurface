@@ -687,6 +687,23 @@ fn sanitize_settings(value: &mut serde_json::Value, warnings: &mut Vec<String>) 
         settings.remove("visual_config");
         warnings.push("unknown visual config dropped".to_string());
     }
+
+    if let Some(kline) = settings
+        .get_mut("visual_config")
+        .and_then(serde_json::Value::as_object_mut)
+        .and_then(|config| config.get_mut("Kline"))
+        .and_then(serde_json::Value::as_object_mut)
+        && let Some(legacy) = kline.remove("gex_levels")
+    {
+        let indicator_configs = kline
+            .entry("indicator_configs")
+            .or_insert_with(|| serde_json::json!({}));
+        if let Some(indicator_configs) = indicator_configs.as_object_mut() {
+            indicator_configs.entry("gex_levels").or_insert(legacy);
+            warnings
+                .push("legacy Kline gex_levels settings migrated to indicator_configs".to_string());
+        }
+    }
 }
 
 fn sanitize_kline_kind(value: &mut serde_json::Value, warnings: &mut Vec<String>) {
@@ -1171,6 +1188,84 @@ mod tests {
                 assert_eq!(config.max_visible_strikes, 40);
             }
             _ => panic!("expected Loaded outcome"),
+        }
+    }
+
+    #[test]
+    fn legacy_kline_gex_levels_are_migrated_to_indicator_config() {
+        let path = temp_state_path("saved-state.json");
+        let value = serde_json::json!({
+            "saved_state_version": CURRENT_SAVED_STATE_VERSION,
+            "layout_manager": {
+                "layouts": [{
+                    "name": "Default",
+                    "dashboard": {
+                        "pane": {
+                            "KlineChart": {
+                                "layout": { "splits": [], "autoscale": null },
+                                "kind": "Candles",
+                                "stream_type": [],
+                                "settings": {
+                                    "visual_config": {
+                                        "Kline": {
+                                            "gex_levels": {
+                                                "expiry_filter": "ThirtyDays",
+                                                "max_clusters": 7,
+                                                "basis_mode": "ShiftToChartPrice"
+                                            }
+                                        }
+                                    }
+                                },
+                                "indicators": ["GexLevels"],
+                                "link_group": null
+                            }
+                        },
+                        "popout": []
+                    }
+                }],
+                "active_layout": "Default"
+            }
+        });
+        std::fs::write(&path, serde_json::to_string(&value).unwrap()).unwrap();
+
+        match load_saved_state_from_path(&path) {
+            StateLoadOutcome::Recovered {
+                state, warnings, ..
+            } => {
+                assert!(
+                    warnings
+                        .iter()
+                        .any(|warning| warning.contains("gex_levels"))
+                );
+                let crate::Pane::KlineChart { settings, .. } =
+                    &state.layout_manager.layouts[0].dashboard.pane
+                else {
+                    panic!("expected KlineChart pane");
+                };
+                let config = settings
+                    .visual_config
+                    .as_ref()
+                    .and_then(crate::layout::pane::VisualConfig::kline)
+                    .expect("Kline visual config");
+                let levels = config.gex_levels();
+                assert_eq!(
+                    levels.expiry_filter,
+                    crate::chart::gex::GexExpiryFilter::ThirtyDays
+                );
+                assert_eq!(levels.max_clusters, 7);
+                assert_eq!(
+                    levels.basis_mode,
+                    crate::chart::gex::GexBasisMode::ShiftToChartPrice
+                );
+
+                let serialized = serde_json::to_value(config).unwrap();
+                assert!(serialized.get("gex_levels").is_none());
+                assert_eq!(
+                    serialized["indicator_configs"]["gex_levels"]["max_clusters"],
+                    7
+                );
+            }
+            _ => panic!("expected recovered state with migration warning"),
         }
     }
 
