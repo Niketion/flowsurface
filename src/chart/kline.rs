@@ -2631,6 +2631,7 @@ fn draw_gex_levels(
         CallWall,
         PutWall,
         Cluster,
+        Spot,
     }
 
     struct Level {
@@ -2713,7 +2714,12 @@ fn draw_gex_levels(
             } else {
                 minimum
             }
-            .max(minimum);
+            .max(minimum)
+            .min(if adjacent_gap.is_finite() {
+                adjacent_gap * 0.25
+            } else {
+                minimum * 4.0
+            });
             levels.push(Level {
                 kind: Kind::Cluster,
                 label: "Gamma Cluster",
@@ -2723,7 +2729,22 @@ fn draw_gex_levels(
             });
         }
     }
+    if latest_chart_price.is_finite() && latest_chart_price > 0.0 {
+        levels.push(Level {
+            kind: Kind::Spot,
+            label: "Spot",
+            raw: latest_chart_price - basis,
+            half_band: 0.0,
+            color: resolve_color(GexLevelColor::Primary),
+        });
+    }
 
+    levels.sort_by_key(|level| match level.kind {
+        Kind::Cluster => 0,
+        Kind::CallWall | Kind::PutWall => 1,
+        Kind::Flip => 2,
+        Kind::Spot => 3,
+    });
     let mut labels = Vec::new();
     for level in levels {
         let displayed = level.raw + basis;
@@ -2739,13 +2760,20 @@ fn draw_gex_levels(
             let lower_y = price_to_y(Price::from_f64(
                 (displayed - level.half_band).max(f64::EPSILON),
             ));
-            let top = upper_y.min(lower_y);
-            let height = (upper_y - lower_y).abs().max(1.0);
+            let height = cluster_band_pixel_height(upper_y, lower_y);
+            let top = y - height * 0.5;
             frame.fill(
                 &Path::rectangle(Point::new(0.0, top), Size::new(frame.width(), height)),
                 level
                     .color
                     .scale_alpha(config.band_opacity.clamp(0.02, 0.4)),
+            );
+            let center = Path::line(Point::new(0.0, y), Point::new(frame.width(), y));
+            frame.stroke(
+                &center,
+                Stroke::default()
+                    .with_color(level.color.scale_alpha(config.line_opacity.clamp(0.1, 1.0)))
+                    .with_width(config.line_width.clamp(0.5, 3.0)),
             );
         } else {
             let path = Path::line(Point::new(0.0, y), Point::new(frame.width(), y));
@@ -2762,7 +2790,19 @@ fn draw_gex_levels(
             );
         }
 
-        let mut label = level.label.to_string();
+        let short = frame.width() < 520.0;
+        let mut label = if short {
+            match level.kind {
+                Kind::Flip => "GF",
+                Kind::CallWall => "CW",
+                Kind::PutWall => "PW",
+                Kind::Cluster => "GC",
+                Kind::Spot => "S",
+            }
+            .to_string()
+        } else {
+            level.label.to_string()
+        };
         if config.show_value {
             label.push_str(&format!(" {displayed:.2}"));
         }
@@ -2775,51 +2815,123 @@ fn draw_gex_levels(
                 (displayed - latest_chart_price) / latest_chart_price * 100.0
             ));
         }
-        if config.basis_mode == GexBasisMode::ShiftToChartPrice {
+        if config.basis_mode == GexBasisMode::ShiftToChartPrice && level.kind != Kind::Spot {
             label.push_str(&format!(" · SHIFT {basis:+.2}"));
-        }
-        let near_spot = level.kind == Kind::Flip
-            && latest_chart_price.is_finite()
-            && (displayed - latest_chart_price).abs()
-                <= (tick_size.to_f64_lossy().abs() * 2.0).max(latest_chart_price.abs() * 0.001);
-        if near_spot {
-            label.push_str(&format!(" · Spot {latest_chart_price:.2}"));
         }
         labels.push((y, label, level.color));
     }
 
-    labels.sort_by(|a, b| a.0.total_cmp(&b.0));
-    let mut occupied = Vec::<f32>::new();
-    for (line_y, label, color) in labels {
-        let top = 8.0;
-        let bottom = (frame.height() - 8.0).max(top);
-        let label_y = (0..24)
-            .flat_map(|distance| {
-                let offset = distance as f32 * 13.0;
-                [line_y + offset, line_y - offset]
-            })
-            .map(|candidate| candidate.clamp(top, bottom))
-            .find(|candidate| {
-                occupied
-                    .iter()
-                    .all(|other| (candidate - other).abs() >= 13.0)
-            })
-            .unwrap_or_else(|| line_y.clamp(top, bottom));
-        occupied.push(label_y);
-        let width = (label.chars().count() as f32 * 5.2 + 10.0).min(frame.width() * 0.58);
+    let positions = layout_gex_badges(
+        &labels.iter().map(|(y, _, _)| *y).collect::<Vec<_>>(),
+        frame.height(),
+        13.0,
+        20.0,
+    );
+    for ((line_y, label, color), position) in labels.into_iter().zip(positions) {
+        let label_y = position.label_y;
+        let width = (label.chars().count() as f32 * 5.2 + 10.0)
+            .min(220.0)
+            .min(frame.width() * 0.45);
+        let x = (frame.width() - width - 6.0).max(2.0);
+        if position.connector {
+            frame.stroke(
+                &Path::line(Point::new(x - 7.0, line_y), Point::new(x, label_y)),
+                Stroke::default()
+                    .with_color(color.scale_alpha(0.7))
+                    .with_width(0.8),
+            );
+        }
         frame.fill(
-            &Path::rectangle(Point::new(4.0, label_y - 7.0), Size::new(width, 13.0)),
+            &Path::rectangle(Point::new(x, label_y - 7.0), Size::new(width, 13.0)),
             palette.background.base.color.scale_alpha(0.86),
         );
         draw_cluster_text(
             frame,
             &label,
-            Point::new(8.0, label_y),
+            Point::new(x + 4.0, label_y),
             7.0,
             color,
             Alignment::Start,
             Alignment::Center,
         );
+    }
+}
+
+fn cluster_band_pixel_height(upper_y: f32, lower_y: f32) -> f32 {
+    (upper_y - lower_y).abs().clamp(1.0, 18.0)
+}
+
+#[derive(Debug, Clone, Copy, PartialEq)]
+struct GexBadgePosition {
+    real_y: f32,
+    label_y: f32,
+    connector: bool,
+}
+
+fn layout_gex_badges(
+    real_y: &[f32],
+    viewport_height: f32,
+    minimum_gap: f32,
+    maximum_shift: f32,
+) -> Vec<GexBadgePosition> {
+    let mut indexed = real_y
+        .iter()
+        .copied()
+        .enumerate()
+        .filter(|(_, y)| y.is_finite() && *y >= 0.0 && *y <= viewport_height)
+        .collect::<Vec<_>>();
+    indexed.sort_by(|a, b| a.1.total_cmp(&b.1));
+    let mut result = vec![None; real_y.len()];
+    let mut previous = f32::NEG_INFINITY;
+    for (index, y) in indexed {
+        let desired = (previous + minimum_gap).max(y);
+        let label_y = desired
+            .min(y + maximum_shift)
+            .min((viewport_height - 7.0).max(7.0));
+        previous = label_y;
+        result[index] = Some(GexBadgePosition {
+            real_y: y,
+            label_y,
+            connector: (label_y - y).abs() > 0.5,
+        });
+    }
+    result.into_iter().flatten().collect()
+}
+
+#[cfg(test)]
+mod gex_layout_tests {
+    use super::*;
+
+    #[test]
+    fn nearby_badges_are_separated_with_bounded_connectors() {
+        let positions = layout_gex_badges(&[100.0, 104.0, 220.0], 300.0, 13.0, 20.0);
+        assert_eq!(positions[0].label_y, 100.0);
+        assert_eq!(positions[1].label_y, 113.0);
+        assert!(positions[1].connector);
+        assert!((positions[1].label_y - positions[1].real_y).abs() <= 20.0);
+        assert!(!positions[2].connector);
+    }
+
+    #[test]
+    fn offscreen_badges_are_not_clamped_to_edges() {
+        let positions = layout_gex_badges(&[-1.0, 50.0, 301.0], 300.0, 13.0, 20.0);
+        assert_eq!(positions.len(), 1);
+        assert_eq!(positions[0].real_y, 50.0);
+    }
+
+    #[test]
+    fn resize_recomputes_from_real_y_without_time_coordinates() {
+        let small = layout_gex_badges(&[30.0, 35.0], 100.0, 13.0, 20.0);
+        let large = layout_gex_badges(&[60.0, 70.0], 200.0, 13.0, 20.0);
+        assert_eq!(small[0].real_y, 30.0);
+        assert_eq!(large[0].real_y, 60.0);
+        assert_eq!(large[1].label_y, 73.0);
+    }
+
+    #[test]
+    fn gamma_cluster_band_has_a_hard_pixel_cap() {
+        assert_eq!(cluster_band_pixel_height(10.0, 100.0), 18.0);
+        assert_eq!(cluster_band_pixel_height(10.0, 20.0), 10.0);
     }
 }
 
