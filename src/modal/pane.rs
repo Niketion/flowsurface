@@ -12,6 +12,7 @@ pub mod stream;
 pub enum Modal {
     StreamModifier(super::stream::Modifier),
     MiniTickersList(mini_tickers_list::MiniPanel),
+    GexLiquidityReference(mini_tickers_list::MiniPanel),
     Settings,
     Indicators,
     LinkGroup,

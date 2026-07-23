@@ -25,6 +25,7 @@ pub enum KlineIndicator {
     VolumeBubbles,
     SessionVolumeProfile,
     Vwap,
+    GexLevels,
 }
 
 impl Indicator for KlineIndicator {
@@ -40,16 +41,17 @@ impl KlineIndicator {
     // Indicator togglers on UI menus depend on these arrays.
     // Every variant needs to be in either SPOT, PERPS or both.
     /// Indicators that can be used with spot market tickers
-    const FOR_SPOT: [KlineIndicator; 6] = [
+    const FOR_SPOT: [KlineIndicator; 7] = [
         KlineIndicator::Volume,
         KlineIndicator::BarAnalysis,
         KlineIndicator::CumulativeDelta,
         KlineIndicator::VolumeBubbles,
         KlineIndicator::SessionVolumeProfile,
         KlineIndicator::Vwap,
+        KlineIndicator::GexLevels,
     ];
     /// Indicators that can be used with perpetual swap market tickers
-    const FOR_PERPS: [KlineIndicator; 7] = [
+    const FOR_PERPS: [KlineIndicator; 8] = [
         KlineIndicator::Volume,
         KlineIndicator::BarAnalysis,
         KlineIndicator::CumulativeDelta,
@@ -57,12 +59,13 @@ impl KlineIndicator {
         KlineIndicator::VolumeBubbles,
         KlineIndicator::SessionVolumeProfile,
         KlineIndicator::Vwap,
+        KlineIndicator::GexLevels,
     ];
 
     pub fn placement(self) -> IndicatorPlacement {
         if matches!(
             self,
-            Self::VolumeBubbles | Self::SessionVolumeProfile | Self::Vwap
+            Self::VolumeBubbles | Self::SessionVolumeProfile | Self::Vwap | Self::GexLevels
         ) {
             IndicatorPlacement::Overlay
         } else {
@@ -96,6 +99,7 @@ impl Display for KlineIndicator {
             KlineIndicator::VolumeBubbles => write!(f, "Volume Bubbles"),
             KlineIndicator::SessionVolumeProfile => write!(f, "Session Volume Profile"),
             KlineIndicator::Vwap => write!(f, "VWAP"),
+            KlineIndicator::GexLevels => write!(f, "GEX Levels"),
         }
     }
 }

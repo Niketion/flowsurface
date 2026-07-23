@@ -583,6 +583,211 @@ pub fn view_kline<'a>(
         ));
     }
 
+    if selected.contains(&KlineIndicator::GexLevels) {
+        use data::chart::gex::{
+            GexBasisMode, GexExpiryFilter, GexLevelColor, GexLevelsConfig, GexSignModel,
+        };
+
+        let levels = cfg.gex_levels();
+        let update = move |next: GexLevelsConfig| config_message(pane, cfg.with_gex_levels(next));
+        let model = pick_list(
+            GexSignModel::ALL,
+            Some(levels.enabled_model),
+            move |enabled_model| {
+                update(GexLevelsConfig {
+                    enabled_model,
+                    ..levels
+                })
+            },
+        );
+        let expiry = pick_list(
+            GexExpiryFilter::ALL,
+            Some(levels.expiry_filter),
+            move |expiry_filter| {
+                update(GexLevelsConfig {
+                    expiry_filter,
+                    ..levels
+                })
+            },
+        );
+        let basis = pick_list(
+            GexBasisMode::ALL,
+            Some(levels.basis_mode),
+            move |basis_mode| {
+                update(GexLevelsConfig {
+                    basis_mode,
+                    ..levels
+                })
+            },
+        );
+        let max_clusters = labeled_slider(
+            "Maximum clusters",
+            0.0..=10.0,
+            levels.max_clusters as f32,
+            move |value| {
+                update(GexLevelsConfig {
+                    max_clusters: value as usize,
+                    ..levels
+                })
+            },
+            |value| format!("{value:.0}"),
+            Some(1.0),
+        );
+        let band_width = labeled_slider(
+            "Band half-width",
+            0.1..=1.5,
+            levels.cluster_band_width,
+            move |cluster_band_width| {
+                update(GexLevelsConfig {
+                    cluster_band_width,
+                    ..levels
+                })
+            },
+            |value| format!("{value:.1} × strike gap"),
+            Some(0.1),
+        );
+        let line_width = labeled_slider(
+            "Level line width",
+            0.5..=3.0,
+            levels.line_width,
+            move |line_width| {
+                update(GexLevelsConfig {
+                    line_width,
+                    ..levels
+                })
+            },
+            |value| format!("{value:.1}px"),
+            Some(0.1),
+        );
+        let flip_width = labeled_slider(
+            "Gamma Flip width",
+            1.0..=4.0,
+            levels.gamma_flip_width,
+            move |gamma_flip_width| {
+                update(GexLevelsConfig {
+                    gamma_flip_width,
+                    ..levels
+                })
+            },
+            |value| format!("{value:.1}px"),
+            Some(0.1),
+        );
+        let line_opacity = labeled_slider(
+            "Line opacity",
+            0.1..=1.0,
+            levels.line_opacity,
+            move |line_opacity| {
+                update(GexLevelsConfig {
+                    line_opacity,
+                    ..levels
+                })
+            },
+            |value| format!("{:.0}%", value * 100.0),
+            Some(0.05),
+        );
+        let band_opacity = labeled_slider(
+            "Band opacity",
+            0.02..=0.4,
+            levels.band_opacity,
+            move |band_opacity| {
+                update(GexLevelsConfig {
+                    band_opacity,
+                    ..levels
+                })
+            },
+            |value| format!("{:.0}%", value * 100.0),
+            Some(0.02),
+        );
+        let toggle =
+            |label: &'static str, current: bool, change: fn(&mut GexLevelsConfig, bool)| {
+                checkbox(current).label(label).on_toggle(move |value| {
+                    let mut next = levels;
+                    change(&mut next, value);
+                    update(next)
+                })
+            };
+        let colors = column![
+            row![
+                text("Gamma Flip"),
+                pick_list(
+                    GexLevelColor::ALL,
+                    Some(levels.gamma_flip_color),
+                    move |gamma_flip_color| update(GexLevelsConfig {
+                        gamma_flip_color,
+                        ..levels
+                    })
+                )
+            ]
+            .spacing(8),
+            row![
+                text("Call / Put Walls"),
+                pick_list(
+                    GexLevelColor::ALL,
+                    Some(levels.call_wall_color),
+                    move |call_wall_color| update(GexLevelsConfig {
+                        call_wall_color,
+                        ..levels
+                    })
+                ),
+                pick_list(
+                    GexLevelColor::ALL,
+                    Some(levels.put_wall_color),
+                    move |put_wall_color| update(GexLevelsConfig {
+                        put_wall_color,
+                        ..levels
+                    })
+                )
+            ]
+            .spacing(8),
+            row![
+                text("Clusters"),
+                pick_list(
+                    GexLevelColor::ALL,
+                    Some(levels.cluster_color),
+                    move |cluster_color| update(GexLevelsConfig {
+                        cluster_color,
+                        cluster_color_customized: true,
+                        ..levels
+                    })
+                )
+            ]
+            .spacing(8),
+        ]
+        .spacing(4);
+        sections = sections.push(indicator_card(
+            "GEX Levels",
+            column![
+                text("Uses the shared options snapshot; settings never trigger a chain fetch.")
+                    .size(crate::style::text_size::SMALL),
+                text("Model"),
+                model,
+                text("Expiry filter"),
+                expiry,
+                text("Price basis"),
+                basis,
+                toggle("Gamma Flip", levels.show_gamma_flip, |c, v| c
+                    .show_gamma_flip =
+                    v),
+                toggle("Call Wall", levels.show_call_wall, |c, v| c
+                    .show_call_wall =
+                    v),
+                toggle("Put Wall", levels.show_put_wall, |c, v| c.show_put_wall = v),
+                toggle("Gamma Clusters", levels.show_top_clusters, |c, v| c
+                    .show_top_clusters =
+                    v),
+                max_clusters,
+                band_width,
+                line_width,
+                flip_width,
+                line_opacity,
+                band_opacity,
+                text("Palette roles"),
+                colors,
+            ]
+            .spacing(6),
+        ));
+    }
+
     container(crate::widget::scrollable_content(sections))
         .max_width(340)
         .padding(16)

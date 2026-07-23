@@ -149,7 +149,8 @@ pub fn make_empty(which: KlineIndicator) -> Box<dyn KlineIndicatorImpl> {
         }
         KlineIndicator::VolumeBubbles
         | KlineIndicator::SessionVolumeProfile
-        | KlineIndicator::Vwap => Box::new(OverlayIndicator),
+        | KlineIndicator::Vwap
+        | KlineIndicator::GexLevels => Box::new(OverlayIndicator),
     }
 }
 

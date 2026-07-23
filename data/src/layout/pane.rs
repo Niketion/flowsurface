@@ -1,7 +1,7 @@
 use exchange::{TickMultiplier, TickerInfo, Timeframe};
 use serde::{Deserialize, Serialize};
 
-use crate::chart::{comparison, heatmap, kline};
+use crate::chart::{comparison, gex, heatmap, kline};
 use crate::panel::{ladder, timeandsales};
 use crate::stream::PersistStreamKind;
 use crate::util::ok_or_default;
@@ -65,6 +65,15 @@ pub enum Pane {
         settings: Settings,
         #[serde(deserialize_with = "ok_or_default", default)]
         indicators: Vec<KlineIndicator>,
+        #[serde(deserialize_with = "ok_or_default", default)]
+        link_group: Option<LinkGroup>,
+    },
+    GexChart {
+        underlying: exchange::options::OptionsUnderlying,
+        #[serde(default)]
+        liquidity_reference: Option<TickerInfo>,
+        #[serde(deserialize_with = "ok_or_default")]
+        settings: Settings,
         #[serde(deserialize_with = "ok_or_default", default)]
         link_group: Option<LinkGroup>,
     },
@@ -155,6 +164,7 @@ pub enum VisualConfig {
     Kline(kline::Config),
     Ladder(ladder::Config),
     Comparison(comparison::Config),
+    Gex(gex::Config),
 }
 
 impl VisualConfig {
@@ -192,6 +202,13 @@ impl VisualConfig {
             _ => None,
         }
     }
+
+    pub fn gex(&self) -> Option<gex::Config> {
+        match self {
+            Self::Gex(cfg) => Some(*cfg),
+            _ => None,
+        }
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -202,18 +219,20 @@ pub enum ContentKind {
     FootprintChart,
     CandlestickChart,
     ComparisonChart,
+    GexChart,
     TimeAndSales,
     Ladder,
 }
 
 impl ContentKind {
-    pub const ALL: [ContentKind; 8] = [
+    pub const ALL: [ContentKind; 9] = [
         ContentKind::Starter,
         ContentKind::HeatmapChart,
         ContentKind::ShaderHeatmap,
         ContentKind::FootprintChart,
         ContentKind::CandlestickChart,
         ContentKind::ComparisonChart,
+        ContentKind::GexChart,
         ContentKind::TimeAndSales,
         ContentKind::Ladder,
     ];
@@ -228,6 +247,7 @@ impl std::fmt::Display for ContentKind {
             ContentKind::FootprintChart => "Footprint Chart",
             ContentKind::CandlestickChart => "Candlestick Chart",
             ContentKind::ComparisonChart => "Comparison Chart",
+            ContentKind::GexChart => "GEX Options Chart",
             ContentKind::TimeAndSales => "Time&Sales",
             ContentKind::Ladder => "DOM/Ladder",
         };
@@ -294,7 +314,7 @@ impl PaneSetup {
                         Basis::default_kline_time(Some(base_ticker), Timeframe::M15)
                     }))
                 }
-                ContentKind::Starter | ContentKind::TimeAndSales => None,
+                ContentKind::Starter | ContentKind::TimeAndSales | ContentKind::GexChart => None,
             };
 
         let tick_multiplier = match content_kind {
@@ -315,6 +335,7 @@ impl PaneSetup {
             }
             ContentKind::CandlestickChart
             | ContentKind::ComparisonChart
+            | ContentKind::GexChart
             | ContentKind::TimeAndSales
             | ContentKind::Starter => current_tick_multiplier,
         };
@@ -344,5 +365,51 @@ impl PaneSetup {
             depth_aggr,
             push_freq,
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use exchange::{Ticker, adapter::Exchange};
+
+    #[test]
+    fn legacy_gex_pane_without_liquidity_reference_still_loads() {
+        let pane: Pane = serde_json::from_str(
+            r#"{"GexChart":{"underlying":"Btc","settings":{},"link_group":null}}"#,
+        )
+        .expect("legacy GEX pane");
+        assert!(matches!(
+            pane,
+            Pane::GexChart {
+                liquidity_reference: None,
+                ..
+            }
+        ));
+    }
+
+    #[test]
+    fn gex_liquidity_reference_round_trips() {
+        let reference = TickerInfo::new(
+            Ticker::new("BTCUSDT", Exchange::BinanceLinear),
+            0.01,
+            0.001,
+            None,
+        );
+        let encoded = serde_json::to_string(&Pane::GexChart {
+            underlying: exchange::options::OptionsUnderlying::Btc,
+            liquidity_reference: Some(reference),
+            settings: Settings::default(),
+            link_group: Some(LinkGroup::A),
+        })
+        .expect("serialize");
+        let decoded: Pane = serde_json::from_str(&encoded).expect("deserialize");
+        assert!(matches!(
+            decoded,
+            Pane::GexChart {
+                liquidity_reference: Some(value),
+                ..
+            } if value == reference
+        ));
     }
 }

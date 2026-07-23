@@ -1,4 +1,5 @@
 pub mod comparison;
+pub mod gex;
 pub mod heatmap;
 
 use chrono::{TimeZone, Utc};

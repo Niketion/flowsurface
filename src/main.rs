@@ -125,6 +125,8 @@ struct Flowsurface {
     debug_terminal_auto_scroll: bool,
     debug_terminal_app_only: bool,
     debug_terminal_compact_mode: bool,
+    gex_coordinator: connector::gex::GexDataCoordinator,
+    deribit_options_client: Option<exchange::options::deribit::DeribitOptionsClient>,
 }
 
 #[derive(Debug, Clone)]
@@ -155,6 +157,7 @@ enum Message {
         event: dashboard::Message,
     },
     Tick(std::time::Instant),
+    GexFetchCompleted(connector::gex::GexFetchResult),
     WindowEvent(window::Event),
     ExitRequested(HashMap<window::Id, WindowSpec>),
     RestartRequested(Option<HashMap<window::Id, WindowSpec>>),
@@ -577,6 +580,13 @@ impl Flowsurface {
             exchange::adapter::Venue::ALL,
             saved_state.proxy_cfg.as_ref(),
         );
+        let deribit_options_client =
+            exchange::options::deribit::DeribitOptionsClient::new(saved_state.proxy_cfg.as_ref())
+                .map_err(|error| {
+                    log::error!("GEX client initialization failed: {error}");
+                    error
+                })
+                .ok();
 
         let (sidebar, launch_sidebar) = dashboard::Sidebar::new(&saved_state, handles.clone());
 
@@ -629,6 +639,8 @@ impl Flowsurface {
             debug_terminal_auto_scroll: true,
             debug_terminal_app_only: true,
             debug_terminal_compact_mode: true,
+            gex_coordinator: connector::gex::GexDataCoordinator::default(),
+            deribit_options_client,
         };
 
         if let Some(err) = audio_init_err {
@@ -729,6 +741,7 @@ impl Flowsurface {
                     self.market_connectivity.expected_count()
                 );
                 self.dirty_flag.mark_dirty();
+                self.gex_coordinator.reconnect();
 
                 let handles = self.handles.clone();
                 let main_window_id = self.main_window.id;
@@ -905,12 +918,33 @@ impl Flowsurface {
                 };
                 let connectivity_task = self.apply_connectivity_transition(transition);
 
+                let consumers = self.active_dashboard().gex_consumers();
+                self.gex_coordinator.set_consumers(consumers);
+                self.sync_gex_dashboard(exchange::UnixMs::now());
+
                 // Keep WS subscriptions alive so their reconnect loop can run,
                 // but freeze chart timers/fetch scheduling while offline. The
                 // reconnect transition performs the missing-range backfill.
                 if self.market_connectivity.overlay_visible() {
                     return connectivity_task;
                 }
+
+                let gex_now = exchange::UnixMs::now();
+                let gex_tasks = if let Some(client) = self.deribit_options_client.clone() {
+                    self.gex_coordinator
+                        .due_fetches(gex_now, true)
+                        .into_iter()
+                        .map(|request| {
+                            let instruments = self.gex_coordinator.instruments_for(request.key());
+                            Task::perform(
+                                connector::gex::execute_fetch(client.clone(), request, instruments),
+                                Message::GexFetchCompleted,
+                            )
+                        })
+                        .collect::<Vec<_>>()
+                } else {
+                    Vec::new()
+                };
 
                 let main_window_id = self.main_window.id;
                 let handles = self.handles.clone();
@@ -923,7 +957,19 @@ impl Flowsurface {
                         event: msg,
                     });
 
-                return Task::batch([connectivity_task, chart_tick]);
+                return Task::batch(
+                    [connectivity_task, chart_tick]
+                        .into_iter()
+                        .chain(gex_tasks)
+                        .collect::<Vec<_>>(),
+                );
+            }
+            Message::GexFetchCompleted(completion) => {
+                let now = exchange::UnixMs::now();
+                self.gex_coordinator.complete(completion, now);
+                self.sync_gex_dashboard(now);
+                self.dirty_flag.mark_dirty();
+                return Task::none();
             }
             Message::WindowEvent(event) => match event {
                 window::Event::CloseRequested(window) => {
@@ -1189,8 +1235,12 @@ impl Flowsurface {
                 let result = connector::persistent_cache::market_cache()
                     .ok_or_else(|| "Market-data cache is unavailable".to_string())
                     .and_then(|cache| cache.clear_all());
+                let gex_result = self
+                    .gex_coordinator
+                    .invalidate_persistent()
+                    .map_err(|error| error.to_string());
 
-                match result {
+                match result.and(gex_result) {
                     Ok(()) => {
                         self.layout_manager
                             .iter_dashboards_mut()
@@ -2043,6 +2093,16 @@ impl Flowsurface {
             .get_mut(active_layout.unique)
             .map(|layout| &mut layout.dashboard)
             .expect("No active dashboard")
+    }
+
+    fn sync_gex_dashboard(&mut self, now: exchange::UnixMs) {
+        let Some(active) = self.layout_manager.active_layout_id().map(|id| id.unique) else {
+            return;
+        };
+        let coordinator = &mut self.gex_coordinator;
+        if let Some(layout) = self.layout_manager.get_mut(active) {
+            layout.dashboard.sync_gex(coordinator, now);
+        }
     }
 
     fn load_layout(&mut self, layout_uid: uuid::Uuid, main_window: window::Id) -> Task<Message> {

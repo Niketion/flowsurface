@@ -598,6 +598,189 @@ pub fn comparison_cfg_view<'a>(
     cfg_view_container(320, content)
 }
 
+pub fn gex_cfg_view<'a>(
+    cfg: data::chart::gex::Config,
+    pane: pane_grid::Pane,
+) -> Element<'a, Message> {
+    use data::chart::gex::{GexExpiryFilter, GexSignModel};
+
+    let model = pick_list(GexSignModel::ALL, Some(cfg.sign_model), move |sign_model| {
+        Message::VisualConfigChanged(
+            pane,
+            VisualConfig::Gex(data::chart::gex::Config { sign_model, ..cfg }),
+            false,
+        )
+    });
+    let expiry = pick_list(
+        GexExpiryFilter::ALL,
+        Some(cfg.expiry_filter),
+        move |expiry_filter| {
+            Message::VisualConfigChanged(
+                pane,
+                VisualConfig::Gex(data::chart::gex::Config {
+                    expiry_filter,
+                    ..cfg
+                }),
+                false,
+            )
+        },
+    );
+    let max_strikes = slider(5..=100, cfg.max_visible_strikes as u32, move |value| {
+        Message::VisualConfigChanged(
+            pane,
+            VisualConfig::Gex(data::chart::gex::Config {
+                max_visible_strikes: value as usize,
+                ..cfg
+            }),
+            false,
+        )
+    });
+    let price_range = slider(5.0..=50.0, cfg.price_range_percent, move |value| {
+        Message::VisualConfigChanged(
+            pane,
+            VisualConfig::Gex(data::chart::gex::Config {
+                price_range_percent: value,
+                ..cfg
+            }),
+            false,
+        )
+    });
+    let min_oi = slider(0.0..=1_000.0, cfg.min_open_interest, move |value| {
+        Message::VisualConfigChanged(
+            pane,
+            VisualConfig::Gex(data::chart::gex::Config {
+                min_open_interest: value,
+                ..cfg
+            }),
+            false,
+        )
+    });
+    let min_gex = slider(0.0..=10_000_000.0, cfg.min_absolute_gex, move |value| {
+        Message::VisualConfigChanged(
+            pane,
+            VisualConfig::Gex(data::chart::gex::Config {
+                min_absolute_gex: value,
+                ..cfg
+            }),
+            false,
+        )
+    });
+    let liquidity_depth = slider(5.0..=100.0, cfg.liquidity_depth_bps, move |value| {
+        Message::VisualConfigChanged(
+            pane,
+            VisualConfig::Gex(data::chart::gex::Config {
+                liquidity_depth_bps: value,
+                ..cfg
+            }),
+            false,
+        )
+    });
+    let toggle =
+        |label: &'static str, current: bool, update: fn(&mut data::chart::gex::Config, bool)| {
+            checkbox(current).label(label).on_toggle(move |value| {
+                let mut next = cfg;
+                update(&mut next, value);
+                Message::VisualConfigChanged(pane, VisualConfig::Gex(next), false)
+            })
+        };
+    let content = column![
+        text("GEX model").size(crate::style::text_size::SECTION),
+        model,
+        text("Expiry filter").size(crate::style::text_size::SECTION),
+        expiry,
+        text(format!("Visible strikes: {}", cfg.max_visible_strikes)),
+        max_strikes,
+        text(format!("Price range: ±{:.0}%", cfg.price_range_percent)),
+        price_range,
+        text(format!(
+            "Minimum OI: {:.1} {}",
+            cfg.min_open_interest, "BTC/ETH"
+        )),
+        min_oi,
+        text(format!(
+            "Minimum absolute GEX: {}",
+            crate::widget::chart::gex::format_exposure(cfg.min_absolute_gex)
+        )),
+        min_gex,
+        text("Analytics panels").size(crate::style::text_size::SECTION),
+        toggle(
+            "Intrinsic pressure",
+            cfg.show_intrinsic_stress_panel,
+            |c, v| c.show_intrinsic_stress_panel = v
+        ),
+        toggle("Gamma vs Vega", cfg.show_gamma_vega_panel, |c, v| {
+            c.show_gamma_vega_panel = v
+        }),
+        toggle(
+            "Liquidity impact",
+            cfg.show_gamma_liquidity_panel,
+            |c, v| c.show_gamma_liquidity_panel = v
+        ),
+        text(format!(
+            "Liquidity depth range: ±{:.0} bps",
+            cfg.liquidity_depth_bps
+        )),
+        liquidity_depth,
+        toggle(
+            "Follow selected/link-group ticker",
+            cfg.liquidity_reference_follow_link_group,
+            |c, v| c.liquidity_reference_follow_link_group = v
+        ),
+        toggle("Show call GEX", cfg.show_call_gex, |c, v| c.show_call_gex =
+            v),
+        toggle("Show put GEX", cfg.show_put_gex, |c, v| c.show_put_gex = v),
+        toggle("Show net GEX", cfg.show_net_gex, |c, v| c.show_net_gex = v),
+        toggle("Show absolute gamma", cfg.show_absolute_gamma, |c, v| c
+            .show_absolute_gamma =
+            v),
+        toggle("Show source spot", cfg.show_current_price, |c, v| c
+            .show_current_price =
+            v),
+        toggle("Show Call Wall", cfg.show_call_wall, |c, v| c
+            .show_call_wall =
+            v),
+        toggle("Show Put Wall", cfg.show_put_wall, |c, v| c.show_put_wall =
+            v),
+        toggle("Show Gamma Flip", cfg.show_gamma_flip, |c, v| c
+            .show_gamma_flip =
+            v),
+        toggle("Show summary", cfg.show_summary, |c, v| c.show_summary = v),
+        text("Header fields").size(crate::style::text_size::SECTION),
+        toggle("Net GEX", cfg.show_header_net_gex, |c, v| c
+            .show_header_net_gex =
+            v),
+        toggle("Absolute GEX", cfg.show_header_absolute_gex, |c, v| c
+            .show_header_absolute_gex =
+            v),
+        toggle("Gamma Flip", cfg.show_header_gamma_flip, |c, v| c
+            .show_header_gamma_flip =
+            v),
+        toggle("Call Wall", cfg.show_header_call_wall, |c, v| c
+            .show_header_call_wall =
+            v),
+        toggle("Put Wall", cfg.show_header_put_wall, |c, v| c
+            .show_header_put_wall =
+            v),
+        toggle("Expiry", cfg.show_header_expiry, |c, v| c
+            .show_header_expiry =
+            v),
+        toggle("Freshness", cfg.show_header_freshness, |c, v| c
+            .show_header_freshness =
+            v),
+        toggle("Snapshot", cfg.show_header_snapshot, |c, v| c
+            .show_header_snapshot =
+            v),
+        toggle("Model", cfg.show_header_model, |c, v| c.show_header_model =
+            v),
+        row![
+            space::horizontal(),
+            sync_all_button(pane, VisualConfig::Gex(cfg))
+        ]
+    ]
+    .spacing(8);
+    cfg_view_container(360, content)
+}
+
 pub fn kline_cfg_view<'a>(
     study_config: &'a study::Configurator<FootprintStudy>,
     cfg: data::chart::kline::Config,

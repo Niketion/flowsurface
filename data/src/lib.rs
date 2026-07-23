@@ -601,6 +601,7 @@ fn sanitize_pane(value: &mut serde_json::Value, warnings: &mut Vec<String>) {
                         "VolumeBubbles",
                         "SessionVolumeProfile",
                         "Vwap",
+                        "GexLevels",
                     ],
                     warnings,
                     "kline indicator",
@@ -616,6 +617,18 @@ fn sanitize_pane(value: &mut serde_json::Value, warnings: &mut Vec<String>) {
                         .or_insert_with(|| serde_json::json!("Candles")),
                     warnings,
                 );
+                sanitize_settings(
+                    pane.entry("settings")
+                        .or_insert_with(|| serde_json::json!({})),
+                    warnings,
+                );
+            }
+        }
+        "GexChart" => {
+            if let Some(pane) = object
+                .get_mut("GexChart")
+                .and_then(serde_json::Value::as_object_mut)
+            {
                 sanitize_settings(
                     pane.entry("settings")
                         .or_insert_with(|| serde_json::json!({})),
@@ -661,11 +674,35 @@ fn sanitize_settings(value: &mut serde_json::Value, warnings: &mut Vec<String>) 
         && !visual_config.is_null()
         && !is_known_tagged_enum(
             visual_config,
-            &["Heatmap", "TimeAndSales", "Kline", "Ladder", "Comparison"],
+            &[
+                "Heatmap",
+                "TimeAndSales",
+                "Kline",
+                "Ladder",
+                "Comparison",
+                "Gex",
+            ],
         )
     {
         settings.remove("visual_config");
         warnings.push("unknown visual config dropped".to_string());
+    }
+
+    if let Some(kline) = settings
+        .get_mut("visual_config")
+        .and_then(serde_json::Value::as_object_mut)
+        .and_then(|config| config.get_mut("Kline"))
+        .and_then(serde_json::Value::as_object_mut)
+        && let Some(legacy) = kline.remove("gex_levels")
+    {
+        let indicator_configs = kline
+            .entry("indicator_configs")
+            .or_insert_with(|| serde_json::json!({}));
+        if let Some(indicator_configs) = indicator_configs.as_object_mut() {
+            indicator_configs.entry("gex_levels").or_insert(legacy);
+            warnings
+                .push("legacy Kline gex_levels settings migrated to indicator_configs".to_string());
+        }
     }
 }
 
@@ -1058,7 +1095,7 @@ mod tests {
                                 "kind": "Candles",
                                 "stream_type": [],
                                 "settings": {},
-                                "indicators": ["Volume", "VolumeBubbles", "SessionVolumeProfile", "Vwap", "CumulativeDelta"],
+                                "indicators": ["Volume", "VolumeBubbles", "SessionVolumeProfile", "Vwap", "GexLevels", "CumulativeDelta"],
                                 "link_group": null
                             }
                         },
@@ -1074,7 +1111,11 @@ mod tests {
             StateLoadOutcome::Loaded(state) => {
                 let pane = &state.layout_manager.layouts[0].dashboard.pane;
                 if let crate::Pane::KlineChart { indicators, .. } = pane {
-                    assert_eq!(indicators.len(), 5, "all 5 indicators should be preserved");
+                    assert_eq!(
+                        indicators.len(),
+                        6,
+                        "all overlay indicators should be preserved"
+                    );
                     assert!(indicators.contains(&crate::chart::indicator::KlineIndicator::Volume));
                     assert!(
                         indicators
@@ -1087,6 +1128,9 @@ mod tests {
                     );
                     assert!(indicators.contains(&crate::chart::indicator::KlineIndicator::Vwap));
                     assert!(
+                        indicators.contains(&crate::chart::indicator::KlineIndicator::GexLevels)
+                    );
+                    assert!(
                         indicators
                             .contains(&crate::chart::indicator::KlineIndicator::CumulativeDelta)
                     );
@@ -1095,6 +1139,133 @@ mod tests {
                 }
             }
             _ => panic!("expected Loaded outcome"),
+        }
+    }
+
+    #[test]
+    fn gex_pane_and_visual_config_are_preserved_through_sanitize() {
+        let path = temp_state_path("saved-state.json");
+        let value = serde_json::json!({
+            "saved_state_version": CURRENT_SAVED_STATE_VERSION,
+            "layout_manager": {
+                "layouts": [{
+                    "name": "Default",
+                    "dashboard": {
+                        "pane": {
+                            "GexChart": {
+                                "underlying": "Btc",
+                                "settings": {
+                                    "visual_config": {
+                                        "Gex": {
+                                            "expiry_filter": "SevenDays",
+                                            "price_range_percent": 20.0
+                                        }
+                                    }
+                                },
+                                "link_group": null
+                            }
+                        },
+                        "popout": []
+                    }
+                }],
+                "active_layout": "Default"
+            }
+        });
+        std::fs::write(&path, serde_json::to_string(&value).unwrap()).unwrap();
+
+        match load_saved_state_from_path(&path) {
+            StateLoadOutcome::Loaded(state) => {
+                let pane = &state.layout_manager.layouts[0].dashboard.pane;
+                let crate::Pane::GexChart { settings, .. } = pane else {
+                    panic!("expected GexChart pane");
+                };
+                let config = settings
+                    .visual_config
+                    .as_ref()
+                    .and_then(crate::layout::pane::VisualConfig::gex)
+                    .expect("GEX visual config");
+                assert_eq!(config.price_range_percent, 20.0);
+                assert_eq!(config.max_visible_strikes, 40);
+            }
+            _ => panic!("expected Loaded outcome"),
+        }
+    }
+
+    #[test]
+    fn legacy_kline_gex_levels_are_migrated_to_indicator_config() {
+        let path = temp_state_path("saved-state.json");
+        let value = serde_json::json!({
+            "saved_state_version": CURRENT_SAVED_STATE_VERSION,
+            "layout_manager": {
+                "layouts": [{
+                    "name": "Default",
+                    "dashboard": {
+                        "pane": {
+                            "KlineChart": {
+                                "layout": { "splits": [], "autoscale": null },
+                                "kind": "Candles",
+                                "stream_type": [],
+                                "settings": {
+                                    "visual_config": {
+                                        "Kline": {
+                                            "gex_levels": {
+                                                "expiry_filter": "ThirtyDays",
+                                                "max_clusters": 7,
+                                                "basis_mode": "ShiftToChartPrice"
+                                            }
+                                        }
+                                    }
+                                },
+                                "indicators": ["GexLevels"],
+                                "link_group": null
+                            }
+                        },
+                        "popout": []
+                    }
+                }],
+                "active_layout": "Default"
+            }
+        });
+        std::fs::write(&path, serde_json::to_string(&value).unwrap()).unwrap();
+
+        match load_saved_state_from_path(&path) {
+            StateLoadOutcome::Recovered {
+                state, warnings, ..
+            } => {
+                assert!(
+                    warnings
+                        .iter()
+                        .any(|warning| warning.contains("gex_levels"))
+                );
+                let crate::Pane::KlineChart { settings, .. } =
+                    &state.layout_manager.layouts[0].dashboard.pane
+                else {
+                    panic!("expected KlineChart pane");
+                };
+                let config = settings
+                    .visual_config
+                    .as_ref()
+                    .and_then(crate::layout::pane::VisualConfig::kline)
+                    .expect("Kline visual config");
+                let levels = config.gex_levels();
+                assert_eq!(
+                    levels.expiry_filter,
+                    crate::chart::gex::GexExpiryFilter::ThirtyDays
+                );
+                assert_eq!(levels.max_clusters, 7);
+                assert_eq!(
+                    levels.basis_mode,
+                    crate::chart::gex::GexBasisMode::ShiftToChartPrice
+                );
+
+                let serialized = serde_json::to_value(config).unwrap();
+                assert!(serialized.get("gex_levels").is_none());
+                assert_eq!(
+                    serialized["indicator_configs"]["gex_levels"]["max_clusters"],
+                    7
+                );
+            }
+            _ => panic!("expected recovered state with migration warning"),
         }
     }
 

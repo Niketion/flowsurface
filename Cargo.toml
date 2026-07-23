@@ -42,6 +42,7 @@ iced = { version = "0.14.0", default-features = false, features = [
     "tokio",
     "canvas",
     "image",
+    "svg",
     "sipper",
     "advanced",
     "unconditional-rendering",

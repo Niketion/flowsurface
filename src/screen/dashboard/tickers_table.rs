@@ -57,6 +57,18 @@ const COMPACT_ROW_HEIGHT: f32 = 28.0;
 
 const EXCHANGE_UNAVAILABLE_TOOLTIP: &str = "Metadata unavailable.\nCheck logs for details.";
 
+fn matches_options_filter(
+    ticker: Ticker,
+    underlying_filter: Option<exchange::options::OptionsUnderlying>,
+    supported_options_only: bool,
+) -> bool {
+    let resolved = exchange::options::resolve_options_underlying(ticker);
+    underlying_filter.map_or_else(
+        || !supported_options_only || resolved.is_some(),
+        |underlying| resolved == Some(underlying),
+    )
+}
+
 fn available_markets(venue: Venue) -> &'static [MarketKind] {
     match venue {
         Venue::Binance | Venue::Bybit | Venue::Okex => &MarketKind::ALL,
@@ -1115,6 +1127,7 @@ impl TickersTable {
                 init_content_btn(ContentKind::FootprintChart, *ticker, 180.0),
                 init_content_btn(ContentKind::CandlestickChart, *ticker, 180.0),
                 init_content_btn(ContentKind::ComparisonChart, *ticker, 180.0),
+                init_content_btn(ContentKind::GexChart, *ticker, 180.0),
                 init_content_btn(ContentKind::TimeAndSales, *ticker, 160.0),
                 init_content_btn(ContentKind::Ladder, *ticker, 160.0),
             ]
@@ -1143,6 +1156,8 @@ impl TickersTable {
         on_scroll: FScroll,
         selected_tickers: Option<&'a [TickerInfo]>,
         base_ticker: Option<TickerInfo>,
+        underlying_filter: Option<exchange::options::OptionsUnderlying>,
+        supported_options_only: bool,
     ) -> Element<'a, M>
     where
         M: 'a + Clone,
@@ -1161,7 +1176,12 @@ impl TickersTable {
             selected_set.insert(bt.ticker);
         }
 
-        let (fav_rows, rest_rows) = self.filtered_rows_compact(&injected_q, &selected_set);
+        let (mut fav_rows, mut rest_rows) = self.filtered_rows_compact(&injected_q, &selected_set);
+        let compatible = |row: &&TickerRowData| {
+            matches_options_filter(row.ticker, underlying_filter, supported_options_only)
+        };
+        fav_rows.retain(compatible);
+        rest_rows.retain(compatible);
 
         let base_ticker_id = base_ticker.map(|bt| bt.ticker);
         let selected_list: Vec<TickerInfo> = selected_tickers
@@ -1822,5 +1842,32 @@ impl StatsFetchState {
             1 => "..",
             _ => "...",
         }
+    }
+}
+
+#[cfg(test)]
+mod options_filter_tests {
+    use super::*;
+    use exchange::options::OptionsUnderlying;
+
+    fn ticker(symbol: &str) -> Ticker {
+        Ticker::new(symbol, Exchange::BinanceLinear)
+    }
+
+    #[test]
+    fn gex_selector_only_accepts_supported_underlyings() {
+        assert!(matches_options_filter(ticker("BTCUSDT"), None, true));
+        assert!(matches_options_filter(ticker("ETHUSDT"), None, true));
+        assert!(!matches_options_filter(ticker("SOLUSDT"), None, true));
+        assert!(matches_options_filter(
+            ticker("BTCUSDT"),
+            Some(OptionsUnderlying::Btc),
+            false
+        ));
+        assert!(!matches_options_filter(
+            ticker("ETHUSDT"),
+            Some(OptionsUnderlying::Btc),
+            false
+        ));
     }
 }
