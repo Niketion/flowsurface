@@ -19,6 +19,7 @@ The `develop` branch currently adds the following features and behavior on top o
 -   **Candlestick order-flow overlays:** configurable volume bubbles backed by fetched trades, session filtering, delta/dominant-side coloring, labels and size/quantity controls.
 -   **Session volume profile:** volume or delta profiles with configurable session interval, side, width, value area, row size, POC, VAH/VAL, session VWAP, and session high/low.
 -   **Cumulative volume delta:** optional candlestick rendering in addition to the line view, with daily or continuous reset behavior.
+-   **GEX options chart:** BTC and ETH gamma-exposure profiles sourced from Deribit, with call/put walls, gamma flip, intrinsic-pressure, gamma-versus-vega, and liquidity-impact analytics.
 -   **Persistent market-data cache:** local `redb` storage for klines, open interest, trades, and derived bubble summaries, including gap detection, deduplication, invalidation, and shared data requirements across panes.
 -   **Connection recovery:** automatic historical gap backfill after WebSocket disconnects, deferred recovery until the real offline range is known, reconnect-backoff reset, request generations, stale/orphaned request cancellation, timeouts, bounded retries, no-progress protection, and raw-trade/history limits.
 -   **Fetch visibility and feedback:** loading indicators, data-coverage state, richer fetch/stream/window diagnostics, and a filterable in-app debug terminal with multiple log levels.
@@ -48,6 +49,7 @@ See the complete source comparison: [`upstream/main...origin/develop`](https://g
     -   **Heatmap (Historical DOM):** Uses live trades and L2 orderbook to create a time-series heatmap chart. Supports customizable price grouping, different time aggregations, fixed or visible range volume profiles.
     -   **Candlestick:** Traditional kline chart supporting both time-based and custom tick-based intervals.
     -   **Footprint:** Price grouped and interval aggregated views for trades on top of a candlestick chart. Supports different clustering methods, configurable imbalance and naked-POC studies.
+    -   **GEX Options Chart:** Gamma-exposure profiles and analytics for the supported BTC and ETH option markets, using Deribit option-chain data.
     -   **Time & Sales:** Scrollable list of live trades.
     -   **DOM (Depth of Market) / Ladder:** Displays current L2 orderbook alongside recent trade volumes on grouped price levels.
     -   **Comparison:** Line graph for comparing multiple data sources, normalized by kline `close` prices on a percentage scale
