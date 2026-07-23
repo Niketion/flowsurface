@@ -1,0 +1,15 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 180 108" fill="none">
+  <path d="M34 99A58 58 0 1 1 146 99" stroke="currentColor" stroke-width="9" stroke-linecap="round" opacity=".09"/>
+  <path d="M34 99A58 58 0 0 1 72.9 28.6" stroke="currentColor" stroke-width="6" stroke-linecap="round" opacity=".42"/>
+  <path d="M72.9 28.6A58 58 0 0 1 107.1 28.6" stroke="currentColor" stroke-width="6" stroke-linecap="round" opacity=".72"/>
+  <path d="M107.1 28.6A58 58 0 0 1 146 99" stroke="currentColor" stroke-width="6" stroke-linecap="round" opacity=".42"/>
+  <path d="M44.6 96.2A47 47 0 1 1 135.4 96.2" stroke="currentColor" stroke-width="1" opacity=".14"/>
+  <path d="M29.1 100.3l10.7-2.8M30.8 62.5l10.3 3.7M53.9 32.4l6.3 9M126.1 32.4l-6.3 9M149.2 62.5l-10.3 3.7M150.9 100.3l-10.7-2.8" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" opacity=".58"/>
+  <path d="M90 19v16" stroke="currentColor" stroke-width="2.5" stroke-linecap="round" opacity=".9"/>
+  <circle cx="90" cy="27" r="3" fill="currentColor" opacity=".34"/>
+  <g fill="currentColor" font-family="sans-serif" font-size="13" font-weight="700" letter-spacing=".2" opacity=".72">
+    <text x="15" y="88">VEGA</text>
+    <text x="90" y="11" text-anchor="middle">BALANCED</text>
+    <text x="165" y="88" text-anchor="end">GAMMA</text>
+  </g>
+</svg>

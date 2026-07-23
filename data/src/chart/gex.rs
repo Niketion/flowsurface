@@ -1,5 +1,5 @@
 use exchange::{
-    UnixMs,
+    TickerInfo, UnixMs,
     options::{
         OptionRight, OptionsProvider, OptionsUnderlying, RawOptionChainSnapshot,
         RawOptionContractSnapshot,
@@ -214,6 +214,11 @@ pub struct Config {
     pub show_header_freshness: bool,
     pub show_header_snapshot: bool,
     pub show_header_model: bool,
+    pub show_intrinsic_stress_panel: bool,
+    pub show_gamma_vega_panel: bool,
+    pub show_gamma_liquidity_panel: bool,
+    pub liquidity_depth_bps: f32,
+    pub liquidity_reference_follow_link_group: bool,
 }
 
 impl Default for Config {
@@ -243,7 +248,144 @@ impl Default for Config {
             show_header_freshness: true,
             show_header_snapshot: false,
             show_header_model: true,
+            show_intrinsic_stress_panel: true,
+            show_gamma_vega_panel: true,
+            show_gamma_liquidity_panel: true,
+            liquidity_depth_bps: 25.0,
+            liquidity_reference_follow_link_group: true,
         }
+    }
+}
+
+pub const INTRINSIC_STRESS_MILD_RATIO: f64 = 0.02;
+pub const INTRINSIC_STRESS_ELEVATED_RATIO: f64 = 0.05;
+pub const INTRINSIC_STRESS_HIGH_RATIO: f64 = 0.10;
+pub const GAMMA_VEGA_BALANCED_LOW: f64 = 0.80;
+pub const GAMMA_VEGA_BALANCED_HIGH: f64 = 1.25;
+pub const GAMMA_LIQUIDITY_MODERATE_RATIO: f64 = 0.25;
+pub const GAMMA_LIQUIDITY_ELEVATED_RATIO: f64 = 0.75;
+pub const GAMMA_LIQUIDITY_HIGH_RATIO: f64 = 1.50;
+pub const GEX_PROXY_BALANCED_SHARE: f64 = 0.05;
+
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq, Deserialize, Serialize)]
+pub enum IntrinsicStressLevel {
+    Low,
+    #[default]
+    Mild,
+    Elevated,
+    High,
+}
+
+impl std::fmt::Display for IntrinsicStressLevel {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(match self {
+            Self::Low => "Low",
+            Self::Mild => "Mild",
+            Self::Elevated => "Elevated",
+            Self::High => "High",
+        })
+    }
+}
+
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq, Deserialize, Serialize)]
+pub enum GammaVegaRegime {
+    VegaDominant,
+    #[default]
+    Balanced,
+    GammaDominant,
+    Unavailable,
+}
+
+impl std::fmt::Display for GammaVegaRegime {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(match self {
+            Self::VegaDominant => "Vega dominant",
+            Self::Balanced => "Balanced",
+            Self::GammaDominant => "Gamma dominant",
+            Self::Unavailable => "Unavailable",
+        })
+    }
+}
+
+#[derive(Debug, Default, Clone, PartialEq, Deserialize, Serialize)]
+pub struct IntrinsicStressMetrics {
+    pub gross_intrinsic_usd: f64,
+    pub total_oi_notional_usd: f64,
+    pub intrinsic_ratio: f64,
+    pub itm_contracts: usize,
+    pub total_contracts: usize,
+    pub level: IntrinsicStressLevel,
+}
+
+#[derive(Debug, Default, Clone, PartialEq, Deserialize, Serialize)]
+pub struct GammaVegaMetrics {
+    pub gamma_shock_1pct_usd: f64,
+    pub vega_shock_1vol_usd: f64,
+    pub gamma_vega_ratio: Option<f64>,
+    pub regime: GammaVegaRegime,
+    pub top_gamma_expiry: Option<UnixMs>,
+    pub top_vega_expiry: Option<UnixMs>,
+    pub valid_contracts: usize,
+}
+
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+pub enum GammaLiquidityRegime {
+    LowImpact,
+    Moderate,
+    Elevated,
+    HighImpact,
+    #[default]
+    Unavailable,
+}
+
+impl std::fmt::Display for GammaLiquidityRegime {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(match self {
+            Self::LowImpact => "Low impact",
+            Self::Moderate => "Moderate",
+            Self::Elevated => "Elevated",
+            Self::HighImpact => "High impact",
+            Self::Unavailable => "Unavailable",
+        })
+    }
+}
+
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+pub enum GexProxyDirection {
+    Positive,
+    Negative,
+    Balanced,
+    #[default]
+    NotApplicable,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct GexLiquidityMetrics {
+    pub reference_ticker: TickerInfo,
+    pub observed_at: UnixMs,
+    pub mid_price: f64,
+    pub spread_bps: f64,
+    pub bid_depth_usd: f64,
+    pub ask_depth_usd: f64,
+    pub effective_liquidity_usd: f64,
+    pub gamma_exposure_usd: f64,
+    pub impact_ratio: f64,
+    pub regime: GammaLiquidityRegime,
+    pub proxy_direction: GexProxyDirection,
+    pub depth_range_bps: f64,
+}
+
+pub fn gamma_liquidity_regime(ratio: f64) -> GammaLiquidityRegime {
+    if !ratio.is_finite() || ratio < 0.0 {
+        GammaLiquidityRegime::Unavailable
+    } else if ratio < GAMMA_LIQUIDITY_MODERATE_RATIO {
+        GammaLiquidityRegime::LowImpact
+    } else if ratio < GAMMA_LIQUIDITY_ELEVATED_RATIO {
+        GammaLiquidityRegime::Moderate
+    } else if ratio < GAMMA_LIQUIDITY_HIGH_RATIO {
+        GammaLiquidityRegime::Elevated
+    } else {
+        GammaLiquidityRegime::HighImpact
     }
 }
 
@@ -272,6 +414,10 @@ pub struct GexSnapshot {
     pub call_wall: Option<f64>,
     pub put_wall: Option<f64>,
     pub gamma_flip: Option<f64>,
+    #[serde(default)]
+    pub intrinsic_stress: IntrinsicStressMetrics,
+    #[serde(default)]
+    pub gamma_vega: GammaVegaMetrics,
     pub strikes: Arc<[GexStrike]>,
 }
 
@@ -336,6 +482,36 @@ pub fn black_scholes_gamma(
     (gamma.is_finite() && gamma >= 0.0).then_some(gamma)
 }
 
+pub fn black_scholes_vega(
+    spot: f64,
+    strike: f64,
+    years_to_expiry: f64,
+    interest_rate: f64,
+    volatility: f64,
+) -> Option<f64> {
+    if ![spot, strike, years_to_expiry, interest_rate, volatility]
+        .iter()
+        .all(|value| value.is_finite())
+        || spot <= 0.0
+        || strike <= 0.0
+        || years_to_expiry <= 0.0
+        || volatility <= 0.0
+        || volatility > MAX_VOLATILITY
+    {
+        return None;
+    }
+    let sqrt_time = years_to_expiry.sqrt();
+    let denominator = volatility * sqrt_time;
+    if denominator <= MIN_DENOMINATOR {
+        return None;
+    }
+    let d1 = ((spot / strike).ln()
+        + (interest_rate + 0.5 * volatility * volatility) * years_to_expiry)
+        / denominator;
+    let vega = spot * normal_pdf(d1)? * sqrt_time;
+    (vega.is_finite() && vega >= 0.0).then_some(vega)
+}
+
 pub fn years_to_expiry(expiration: UnixMs, now: UnixMs) -> Option<f64> {
     expiration
         .as_u64()
@@ -359,14 +535,16 @@ pub fn calculate_gex_at(
     config: &Config,
     calculated_at: UnixMs,
 ) -> GexSnapshot {
-    let selected = select_contracts(chain, config.expiry_filter, calculated_at);
+    let selected = select_contracts(
+        chain,
+        config.expiry_filter,
+        config.min_open_interest,
+        calculated_at,
+    );
     let mut by_strike: FxHashMap<u64, StrikeAccumulator> = FxHashMap::default();
 
     for contract in selected.iter().copied() {
         let oi = contract.market.open_interest_underlying;
-        if !oi.is_finite() || oi < config.min_open_interest || oi < 0.0 {
-            continue;
-        }
         let Some(gex) = contract_gex(contract, chain.source_spot, calculated_at) else {
             continue;
         };
@@ -447,6 +625,13 @@ pub fn calculate_gex_at(
             )
         })
         .flatten();
+    let intrinsic_stress = calculate_intrinsic_stress(&selected, chain.source_spot);
+    let gamma_vega = calculate_gamma_vega(
+        &selected,
+        chain.source_spot,
+        calculated_at,
+        absolute_gex_1pct,
+    );
 
     GexSnapshot {
         provider: chain.provider,
@@ -460,6 +645,8 @@ pub fn calculate_gex_at(
         call_wall,
         put_wall,
         gamma_flip,
+        intrinsic_stress,
+        gamma_vega,
         strikes: strikes.into(),
     }
 }
@@ -467,6 +654,7 @@ pub fn calculate_gex_at(
 fn select_contracts(
     chain: &RawOptionChainSnapshot,
     filter: GexExpiryFilter,
+    min_open_interest: f64,
     now: UnixMs,
 ) -> Vec<&RawOptionContractSnapshot> {
     let next_expiry = chain
@@ -486,7 +674,14 @@ fn select_contracts(
         .iter()
         .filter(|contract| {
             let expiration = contract.instrument.expiration_timestamp;
-            if expiration <= now {
+            let oi = contract.market.open_interest_underlying;
+            if expiration <= now
+                || !contract.instrument.strike.is_finite()
+                || contract.instrument.strike <= 0.0
+                || !oi.is_finite()
+                || oi < 0.0
+                || oi < min_open_interest.max(0.0)
+            {
                 return false;
             }
             match filter {
@@ -496,6 +691,144 @@ fn select_contracts(
             }
         })
         .collect()
+}
+
+pub fn intrinsic_stress_level(ratio: f64) -> IntrinsicStressLevel {
+    if !ratio.is_finite() || ratio < INTRINSIC_STRESS_MILD_RATIO {
+        IntrinsicStressLevel::Low
+    } else if ratio < INTRINSIC_STRESS_ELEVATED_RATIO {
+        IntrinsicStressLevel::Mild
+    } else if ratio < INTRINSIC_STRESS_HIGH_RATIO {
+        IntrinsicStressLevel::Elevated
+    } else {
+        IntrinsicStressLevel::High
+    }
+}
+
+fn calculate_intrinsic_stress(
+    contracts: &[&RawOptionContractSnapshot],
+    spot: f64,
+) -> IntrinsicStressMetrics {
+    if !spot.is_finite() || spot <= 0.0 {
+        return IntrinsicStressMetrics {
+            level: IntrinsicStressLevel::Low,
+            ..IntrinsicStressMetrics::default()
+        };
+    }
+    let mut gross_intrinsic_usd = 0.0;
+    let mut total_oi_notional_usd = 0.0;
+    let mut itm_contracts = 0;
+    for contract in contracts {
+        let oi = contract.market.open_interest_underlying;
+        let intrinsic_per_unit = match contract.instrument.right {
+            OptionRight::Call => (spot - contract.instrument.strike).max(0.0),
+            OptionRight::Put => (contract.instrument.strike - spot).max(0.0),
+        };
+        if intrinsic_per_unit > 0.0 {
+            itm_contracts += 1;
+        }
+        gross_intrinsic_usd += intrinsic_per_unit * oi;
+        total_oi_notional_usd += oi * spot;
+    }
+    let gross_intrinsic_usd = finite_non_negative(gross_intrinsic_usd);
+    let total_oi_notional_usd = finite_non_negative(total_oi_notional_usd);
+    let intrinsic_ratio = if total_oi_notional_usd > MIN_DENOMINATOR {
+        finite_non_negative(gross_intrinsic_usd / total_oi_notional_usd)
+    } else {
+        0.0
+    };
+    IntrinsicStressMetrics {
+        gross_intrinsic_usd,
+        total_oi_notional_usd,
+        intrinsic_ratio,
+        itm_contracts,
+        total_contracts: contracts.len(),
+        level: intrinsic_stress_level(intrinsic_ratio),
+    }
+}
+
+pub fn gamma_vega_regime(ratio: Option<f64>) -> GammaVegaRegime {
+    match ratio.filter(|value| value.is_finite() && *value >= 0.0) {
+        Some(value) if value < GAMMA_VEGA_BALANCED_LOW => GammaVegaRegime::VegaDominant,
+        Some(value) if value <= GAMMA_VEGA_BALANCED_HIGH => GammaVegaRegime::Balanced,
+        Some(_) => GammaVegaRegime::GammaDominant,
+        None => GammaVegaRegime::Unavailable,
+    }
+}
+
+fn calculate_gamma_vega(
+    contracts: &[&RawOptionContractSnapshot],
+    spot: f64,
+    now: UnixMs,
+    gamma_shock_1pct_usd: f64,
+) -> GammaVegaMetrics {
+    let mut gamma_by_expiry: FxHashMap<UnixMs, f64> = FxHashMap::default();
+    let mut vega_by_expiry: FxHashMap<UnixMs, f64> = FxHashMap::default();
+    let mut vega_shock_1vol_usd = 0.0;
+    let mut valid_contracts = 0;
+    for contract in contracts {
+        let Some(years) = years_to_expiry(contract.instrument.expiration_timestamp, now) else {
+            continue;
+        };
+        let Some(volatility) = iv_percent_to_decimal(contract.market.mark_iv_percent) else {
+            continue;
+        };
+        let Some(vega) = black_scholes_vega(
+            spot,
+            contract.instrument.strike,
+            years,
+            contract.market.interest_rate,
+            volatility,
+        ) else {
+            continue;
+        };
+        let Some(gamma) = contract_gex(contract, spot, now) else {
+            continue;
+        };
+        let vega_shock = vega * contract.market.open_interest_underlying * 0.01;
+        if !vega_shock.is_finite() || vega_shock < 0.0 {
+            continue;
+        }
+        let expiry = contract.instrument.expiration_timestamp;
+        *gamma_by_expiry.entry(expiry).or_default() += gamma;
+        *vega_by_expiry.entry(expiry).or_default() += vega_shock;
+        vega_shock_1vol_usd += vega_shock;
+        valid_contracts += 1;
+    }
+    let gamma_shock_1pct_usd = finite_non_negative(gamma_shock_1pct_usd);
+    let vega_shock_1vol_usd = finite_non_negative(vega_shock_1vol_usd);
+    let gamma_vega_ratio = (vega_shock_1vol_usd > MIN_DENOMINATOR)
+        .then(|| gamma_shock_1pct_usd / vega_shock_1vol_usd)
+        .filter(|value| value.is_finite() && *value >= 0.0);
+    GammaVegaMetrics {
+        gamma_shock_1pct_usd,
+        vega_shock_1vol_usd,
+        gamma_vega_ratio,
+        regime: gamma_vega_regime(gamma_vega_ratio),
+        top_gamma_expiry: largest_expiry_bucket(&gamma_by_expiry),
+        top_vega_expiry: largest_expiry_bucket(&vega_by_expiry),
+        valid_contracts,
+    }
+}
+
+fn largest_expiry_bucket(values: &FxHashMap<UnixMs, f64>) -> Option<UnixMs> {
+    values
+        .iter()
+        .filter(|(_, value)| value.is_finite())
+        .max_by(|(expiry_a, value_a), (expiry_b, value_b)| {
+            value_a
+                .total_cmp(value_b)
+                .then_with(|| expiry_b.cmp(expiry_a))
+        })
+        .map(|(expiry, _)| *expiry)
+}
+
+fn finite_non_negative(value: f64) -> f64 {
+    if value.is_finite() {
+        value.max(0.0)
+    } else {
+        0.0
+    }
 }
 
 fn contract_gex(
@@ -653,6 +986,121 @@ mod tests {
     }
 
     #[test]
+    fn known_black_scholes_vega_and_one_vol_point_conversion() {
+        let vega = black_scholes_vega(100.0, 100.0, 1.0, 0.05, 0.2).expect("vega");
+        assert!((vega - 37.524_034_69).abs() < 1.0e-6);
+        assert!((vega * 10.0 * 0.01 - 3.752_403_469).abs() < 1.0e-6);
+        assert_eq!(iv_percent_to_decimal(20.0), Some(0.2));
+        assert!(black_scholes_vega(100.0, 100.0, 0.0, 0.0, 0.2).is_none());
+        assert!(black_scholes_vega(100.0, 0.0, 1.0, 0.0, 0.2).is_none());
+    }
+
+    #[test]
+    fn intrinsic_stress_covers_itm_otm_calls_and_puts() {
+        let source = chain(vec![
+            contract(90.0, OptionRight::Call, 7, 2.0, 1.0),
+            contract(110.0, OptionRight::Call, 7, 3.0, 1.0),
+            contract(110.0, OptionRight::Put, 7, 4.0, 1.0),
+            contract(90.0, OptionRight::Put, 7, 5.0, 1.0),
+        ]);
+        let metrics = calculate_gex_at(&source, &Config::default(), NOW).intrinsic_stress;
+        assert_eq!(metrics.gross_intrinsic_usd, 60.0);
+        assert_eq!(metrics.total_oi_notional_usd, 1_400.0);
+        assert!((metrics.intrinsic_ratio - 60.0 / 1_400.0).abs() < 1.0e-12);
+        assert_eq!(metrics.itm_contracts, 2);
+        assert_eq!(metrics.total_contracts, 4);
+        assert_eq!(metrics.level, IntrinsicStressLevel::Mild);
+    }
+
+    #[test]
+    fn intrinsic_zero_notional_is_safe_and_min_gex_independent() {
+        let source = chain(vec![contract(90.0, OptionRight::Call, 7, 0.0, 1.0)]);
+        let base = calculate_gex_at(&source, &Config::default(), NOW);
+        let hidden_profile = calculate_gex_at(
+            &source,
+            &Config {
+                min_absolute_gex: f64::MAX,
+                ..Config::default()
+            },
+            NOW,
+        );
+        assert_eq!(base.intrinsic_stress, hidden_profile.intrinsic_stress);
+        assert_eq!(base.intrinsic_stress.intrinsic_ratio, 0.0);
+        assert!(base.intrinsic_stress.intrinsic_ratio.is_finite());
+    }
+
+    #[test]
+    fn intrinsic_and_gamma_vega_classifications_use_named_boundaries() {
+        assert_eq!(intrinsic_stress_level(0.019), IntrinsicStressLevel::Low);
+        assert_eq!(intrinsic_stress_level(0.02), IntrinsicStressLevel::Mild);
+        assert_eq!(intrinsic_stress_level(0.05), IntrinsicStressLevel::Elevated);
+        assert_eq!(intrinsic_stress_level(0.10), IntrinsicStressLevel::High);
+        assert_eq!(gamma_vega_regime(Some(0.79)), GammaVegaRegime::VegaDominant);
+        assert_eq!(gamma_vega_regime(Some(0.80)), GammaVegaRegime::Balanced);
+        assert_eq!(gamma_vega_regime(Some(1.25)), GammaVegaRegime::Balanced);
+        assert_eq!(
+            gamma_vega_regime(Some(1.26)),
+            GammaVegaRegime::GammaDominant
+        );
+        assert_eq!(gamma_vega_regime(None), GammaVegaRegime::Unavailable);
+        assert_eq!(
+            gamma_liquidity_regime(0.24),
+            GammaLiquidityRegime::LowImpact
+        );
+        assert_eq!(gamma_liquidity_regime(0.25), GammaLiquidityRegime::Moderate);
+        assert_eq!(gamma_liquidity_regime(0.75), GammaLiquidityRegime::Elevated);
+        assert_eq!(
+            gamma_liquidity_regime(1.50),
+            GammaLiquidityRegime::HighImpact
+        );
+    }
+
+    #[test]
+    fn gamma_vega_aggregates_calls_puts_and_expiry_leaders() {
+        let source = chain(vec![
+            contract(100.0, OptionRight::Call, 1, 10.0, 1.0),
+            contract(100.0, OptionRight::Put, 1, 10.0, 1.0),
+            contract(100.0, OptionRight::Call, 30, 10.0, 1.0),
+            contract(100.0, OptionRight::Put, 30, 10.0, 1.0),
+        ]);
+        let snapshot = calculate_gex_at(
+            &source,
+            &Config {
+                expiry_filter: GexExpiryFilter::All,
+                ..Config::default()
+            },
+            NOW,
+        );
+        let metrics = snapshot.gamma_vega;
+        assert_eq!(metrics.valid_contracts, 4);
+        assert!(metrics.vega_shock_1vol_usd > 0.0);
+        assert!(metrics.gamma_shock_1pct_usd > 0.0);
+        assert!(metrics.gamma_vega_ratio.is_some());
+        assert_eq!(
+            metrics.top_gamma_expiry,
+            Some(NOW.saturating_add(MILLIS_PER_DAY))
+        );
+        assert_eq!(
+            metrics.top_vega_expiry,
+            Some(NOW.saturating_add(30 * MILLIS_PER_DAY))
+        );
+    }
+
+    #[test]
+    fn gamma_vega_excludes_invalid_iv_and_expired_contracts() {
+        let mut expired = contract(100.0, OptionRight::Call, 1, 5.0, 1.0);
+        expired.instrument.expiration_timestamp = NOW;
+        let mut invalid = contract(100.0, OptionRight::Put, 7, 5.0, 1.0);
+        invalid.market.mark_iv_percent = f64::NAN;
+        let metrics =
+            calculate_gex_at(&chain(vec![expired, invalid]), &Config::default(), NOW).gamma_vega;
+        assert_eq!(metrics.valid_contracts, 0);
+        assert_eq!(metrics.vega_shock_1vol_usd, 0.0);
+        assert_eq!(metrics.gamma_vega_ratio, None);
+        assert_eq!(metrics.regime, GammaVegaRegime::Unavailable);
+    }
+
+    #[test]
     fn expiry_filters_use_real_timestamps() {
         let source = chain(vec![
             contract(90.0, OptionRight::Put, 1, 1.0, 1.0),
@@ -660,19 +1108,19 @@ mod tests {
             contract(110.0, OptionRight::Call, 30, 1.0, 1.0),
         ]);
         assert_eq!(
-            select_contracts(&source, GexExpiryFilter::NextExpiry, NOW).len(),
+            select_contracts(&source, GexExpiryFilter::NextExpiry, 0.0, NOW).len(),
             1
         );
         assert_eq!(
-            select_contracts(&source, GexExpiryFilter::OneDay, NOW).len(),
+            select_contracts(&source, GexExpiryFilter::OneDay, 0.0, NOW).len(),
             1
         );
         assert_eq!(
-            select_contracts(&source, GexExpiryFilter::SevenDays, NOW).len(),
+            select_contracts(&source, GexExpiryFilter::SevenDays, 0.0, NOW).len(),
             2
         );
         assert_eq!(
-            select_contracts(&source, GexExpiryFilter::ThirtyDays, NOW).len(),
+            select_contracts(&source, GexExpiryFilter::ThirtyDays, 0.0, NOW).len(),
             3
         );
     }
@@ -766,7 +1214,7 @@ mod tests {
             contract(110.0, OptionRight::Call, 7, 30.0, 1.0),
             contract(125.0, OptionRight::Put, 7, 30.0, 1.0),
         ]);
-        let selected = select_contracts(&source, GexExpiryFilter::SevenDays, NOW);
+        let selected = select_contracts(&source, GexExpiryFilter::SevenDays, 0.0, NOW);
         let mut crossings = Vec::new();
         let mut previous_price = 70.0;
         let mut previous = proxy_total_at_price(&selected, previous_price, NOW).expect("proxy");
@@ -808,6 +1256,11 @@ mod tests {
         assert!(!cfg.show_header_call_wall);
         assert!(!cfg.show_header_put_wall);
         assert!(!cfg.show_header_snapshot);
+        assert!(cfg.show_intrinsic_stress_panel);
+        assert!(cfg.show_gamma_vega_panel);
+        assert!(cfg.show_gamma_liquidity_panel);
+        assert_eq!(cfg.liquidity_depth_bps, 25.0);
+        assert!(cfg.liquidity_reference_follow_link_group);
     }
 
     #[test]

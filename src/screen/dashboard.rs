@@ -138,7 +138,133 @@ pub enum Event {
     RequestPalette,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum GexReferenceMissingReason {
+    NoCompatibleTicker,
+    AmbiguousTickers,
+}
+
+fn resolve_gex_liquidity_reference(
+    underlying: exchange::options::OptionsUnderlying,
+    follow_link_group: bool,
+    link_group: Option<data::layout::pane::LinkGroup>,
+    current: Option<TickerInfo>,
+    current_source: Option<pane::GexLiquidityReferenceSource>,
+    candidates: &[(Option<data::layout::pane::LinkGroup>, TickerInfo)],
+) -> Result<(TickerInfo, pane::GexLiquidityReferenceSource), GexReferenceMissingReason> {
+    let compatible = |ticker: TickerInfo| {
+        exchange::options::resolve_options_underlying(ticker.ticker) == Some(underlying)
+    };
+    let unique = |tickers: Vec<TickerInfo>| {
+        let mut compatible_tickers = Vec::new();
+        for ticker in tickers.into_iter().filter(|ticker| compatible(*ticker)) {
+            if !compatible_tickers.contains(&ticker) {
+                compatible_tickers.push(ticker);
+            }
+        }
+        (compatible_tickers.len() == 1).then(|| compatible_tickers[0])
+    };
+
+    if follow_link_group
+        && let Some(group) = link_group
+        && let Some(ticker) = unique(
+            candidates
+                .iter()
+                .filter_map(|(candidate_group, ticker)| {
+                    (*candidate_group == Some(group)).then_some(*ticker)
+                })
+                .collect(),
+        )
+    {
+        return Ok((ticker, pane::GexLiquidityReferenceSource::LinkGroup));
+    }
+    if let Some(ticker) = current.filter(|ticker| {
+        matches!(
+            current_source,
+            None | Some(pane::GexLiquidityReferenceSource::Persisted)
+                | Some(pane::GexLiquidityReferenceSource::Manual)
+        ) && compatible(*ticker)
+    }) {
+        return Ok((
+            ticker,
+            current_source.unwrap_or(pane::GexLiquidityReferenceSource::Persisted),
+        ));
+    }
+    let all_compatible = candidates
+        .iter()
+        .map(|(_, ticker)| *ticker)
+        .filter(|ticker| compatible(*ticker))
+        .collect::<Vec<_>>();
+    if let Some(ticker) = unique(all_compatible.clone()) {
+        return Ok((ticker, pane::GexLiquidityReferenceSource::SingleCompatible));
+    }
+    Err(if all_compatible.is_empty() {
+        GexReferenceMissingReason::NoCompatibleTicker
+    } else {
+        GexReferenceMissingReason::AmbiguousTickers
+    })
+}
+
 impl Dashboard {
+    fn reconcile_gex_liquidity_references(&mut self, main_window: window::Id) -> bool {
+        let candidates = self
+            .iter_all_panes(main_window)
+            .filter_map(|(_, _, state)| {
+                state.stream_pair().map(|ticker| (state.link_group, ticker))
+            })
+            .collect::<Vec<_>>();
+        let mut changed = false;
+
+        for (_, _, state) in self.iter_all_panes_mut(main_window) {
+            let Some((underlying, follow_link_group, current, current_source)) =
+                state.gex_liquidity_resolution()
+            else {
+                continue;
+            };
+            let resolution = resolve_gex_liquidity_reference(
+                underlying,
+                follow_link_group,
+                state.link_group,
+                current,
+                current_source,
+                &candidates,
+            );
+            let (reference, source) = resolution
+                .as_ref()
+                .map_or((None, None), |(ticker, source)| {
+                    (Some(*ticker), Some(*source))
+                });
+
+            if state.set_gex_liquidity_reference(reference, source) {
+                changed = true;
+                if let (Some(ticker), Some(source)) = (reference, source) {
+                    let (symbol, _) = ticker.ticker.display_symbol_and_type();
+                    log::info!(
+                        "GEX LiquidityReferenceResolved underlying={} ticker={} exchange={} source={}",
+                        underlying,
+                        symbol,
+                        ticker.exchange(),
+                        match source {
+                            pane::GexLiquidityReferenceSource::Persisted => "persisted",
+                            pane::GexLiquidityReferenceSource::LinkGroup => "link_group",
+                            pane::GexLiquidityReferenceSource::SingleCompatible =>
+                                "single_compatible",
+                            pane::GexLiquidityReferenceSource::Manual => "manual",
+                        }
+                    );
+                }
+            }
+            if reference.is_none() {
+                state.log_gex_liquidity_missing_once(match resolution {
+                    Err(GexReferenceMissingReason::NoCompatibleTicker) => "no_compatible_ticker",
+                    Err(GexReferenceMissingReason::AmbiguousTickers) => "ambiguous_tickers",
+                    Ok(_) => unreachable!(),
+                });
+            }
+        }
+        changed
+    }
+
     pub fn gex_consumers(&self) -> Vec<exchange::options::OptionsUnderlying> {
         self.panes
             .iter()
@@ -153,6 +279,7 @@ impl Dashboard {
                     underlying,
                     chart: Some(_),
                     unsupported: false,
+                    ..
                 } => Some(*underlying),
                 pane::Content::Kline { indicators, .. }
                     if indicators.contains(&data::chart::indicator::KlineIndicator::GexLevels) =>
@@ -182,6 +309,7 @@ impl Dashboard {
                         chart,
                         underlying,
                         unsupported,
+                        ..
                     } => {
                         if *unsupported {
                             return;
@@ -338,6 +466,7 @@ impl Dashboard {
             }
         }
 
+        self.reconcile_gex_liquidity_references(main_window);
         Task::batch(open_popouts_tasks).chain(self.refresh_streams(main_window))
     }
 
@@ -462,6 +591,7 @@ impl Dashboard {
                                         refresh_streams |=
                                             state.content.change_visual_config(cfg.clone());
                                         state.reconcile_candlestick_trade_stream();
+                                        state.reconcile_gex_liquidity_stream();
 
                                         if let Some(studies) = &studies_cfg {
                                             state.content.update_studies(studies.clone());
@@ -481,8 +611,10 @@ impl Dashboard {
                         state.settings.visual_config = Some(cfg.clone());
                         refresh_streams = state.content.change_visual_config(cfg);
                         state.reconcile_candlestick_trade_stream();
+                        state.reconcile_gex_liquidity_stream();
                     }
 
+                    refresh_streams |= self.reconcile_gex_liquidity_references(main_window.id);
                     if refresh_streams {
                         return (self.refresh_streams(main_window.id), None);
                     }
@@ -492,7 +624,8 @@ impl Dashboard {
                         if let Some(state) = self.get_mut_pane(main_window.id, window, pane) {
                             state.link_group = None;
                         }
-                        return (Task::none(), None);
+                        self.reconcile_gex_liquidity_references(main_window.id);
+                        return (self.refresh_streams(main_window.id), None);
                     }
 
                     let maybe_ticker_info = self
@@ -506,6 +639,7 @@ impl Dashboard {
                             }
                         });
 
+                    let mut link_task = Task::none();
                     if let Some(state) = self.get_mut_pane(main_window.id, window, pane) {
                         state.link_group = group;
                         state.modal = None;
@@ -522,22 +656,22 @@ impl Dashboard {
 
                             for stream in &streams {
                                 if let StreamKind::Kline { .. } = stream {
-                                    return (
-                                        fetcher::kline_fetch_task(
-                                            handles.clone(),
-                                            *layout_id,
-                                            pane_id,
-                                            *stream,
-                                            None,
-                                            None,
-                                        )
-                                        .map(Message::from),
+                                    link_task = fetcher::kline_fetch_task(
+                                        handles.clone(),
+                                        *layout_id,
+                                        pane_id,
+                                        *stream,
                                         None,
-                                    );
+                                        None,
+                                    )
+                                    .map(Message::from);
+                                    break;
                                 }
                             }
                         }
                     }
+                    self.reconcile_gex_liquidity_references(main_window.id);
+                    return (link_task.chain(self.refresh_streams(main_window.id)), None);
                 }
                 pane::Message::Popout => {
                     return (self.popout_pane(main_window, windowing_mode), None);
@@ -1020,33 +1154,37 @@ impl Dashboard {
             self.focus = Some((main_window, *pane_id));
         }
 
-        if let Some((window, selected_pane)) = self.focus
-            && let Some(state) = self.get_mut_pane(main_window, window, selected_pane)
-        {
-            let previous_ticker = state.stream_pair();
-            if previous_ticker.is_some() && previous_ticker != Some(ticker_info) {
-                state.link_group = None;
+        if let Some((window, selected_pane)) = self.focus {
+            let layout_id = self.layout_id;
+            let initialized = self
+                .get_mut_pane(main_window, window, selected_pane)
+                .map(|state| {
+                    let previous_ticker = state.stream_pair();
+                    if previous_ticker.is_some() && previous_ticker != Some(ticker_info) {
+                        state.link_group = None;
+                    }
+                    let streams = state.set_content_and_streams(vec![ticker_info], content_kind);
+                    (state.unique_id(), streams)
+                });
+            if let Some((pane_id, streams)) = initialized {
+                self.streams.extend(streams.iter());
+                let task = streams
+                    .iter()
+                    .find(|stream| matches!(stream, StreamKind::Kline { .. }))
+                    .map_or_else(Task::none, |stream| {
+                        fetcher::kline_fetch_task(
+                            handles.clone(),
+                            layout_id,
+                            pane_id,
+                            *stream,
+                            None,
+                            None,
+                        )
+                        .map(Message::from)
+                    });
+                self.reconcile_gex_liquidity_references(main_window);
+                return task.chain(self.refresh_streams(main_window));
             }
-
-            let streams = state.set_content_and_streams(vec![ticker_info], content_kind);
-
-            let pane_id = state.unique_id();
-            self.streams.extend(streams.iter());
-
-            for stream in &streams {
-                if let StreamKind::Kline { .. } = stream {
-                    return fetcher::kline_fetch_task(
-                        handles.clone(),
-                        self.layout_id,
-                        pane_id,
-                        *stream,
-                        None,
-                        None,
-                    )
-                    .map(Message::from);
-                }
-            }
-            return Task::none();
         }
 
         Task::done(Message::Notification(Toast::warn(
@@ -1097,8 +1235,8 @@ impl Dashboard {
                     )
                 })
                 .collect();
-
-            Task::batch(tasks)
+            self.reconcile_gex_liquidity_references(main_window);
+            Task::batch(tasks).chain(self.refresh_streams(main_window))
         } else if let Some((window, pane)) = self.focus {
             if let Some(state) = self.get_mut_pane(main_window, window, pane) {
                 let content_kind = state.content.kind();
@@ -1766,6 +1904,11 @@ impl Dashboard {
                             if let Some(panel) = panel {
                                 panel.insert_depth(depth, update_t);
                             }
+                        }
+                        pane::Content::Gex {
+                            chart: Some(chart), ..
+                        } => {
+                            chart.insert_depth(depth, update_t);
                         }
                         _ => {
                             log::error!("No chart found for the stream: {stream:?}");
@@ -2671,5 +2814,142 @@ fn data_summary_type(data: &FetchedData) -> &'static str {
         FetchedData::BubbleSummary { .. } => "BubbleSummary",
         FetchedData::Klines { .. } => "Klines",
         FetchedData::OI { .. } => "OI",
+    }
+}
+
+#[cfg(test)]
+mod gex_liquidity_reference_tests {
+    use super::*;
+    use data::layout::pane::LinkGroup;
+    use exchange::{Ticker, adapter::Exchange, options::OptionsUnderlying};
+
+    fn ticker(symbol: &str, exchange: Exchange) -> TickerInfo {
+        TickerInfo::new(Ticker::new(symbol, exchange), 0.01, 0.001, None)
+    }
+
+    #[test]
+    fn compatible_persisted_reference_is_conserved() {
+        let persisted = ticker("BTCUSDT", Exchange::BinanceLinear);
+        let other = ticker("BTCUSDT", Exchange::BybitLinear);
+        assert_eq!(
+            resolve_gex_liquidity_reference(
+                OptionsUnderlying::Btc,
+                false,
+                None,
+                Some(persisted),
+                Some(pane::GexLiquidityReferenceSource::Persisted),
+                &[(None, other)],
+            ),
+            Ok((persisted, pane::GexLiquidityReferenceSource::Persisted))
+        );
+    }
+
+    #[test]
+    fn compatible_link_group_ticker_has_priority_and_incompatible_is_ignored() {
+        let btc = ticker("BTCUSDT", Exchange::BybitLinear);
+        let eth = ticker("ETHUSDT", Exchange::BinanceLinear);
+        assert_eq!(
+            resolve_gex_liquidity_reference(
+                OptionsUnderlying::Btc,
+                true,
+                Some(LinkGroup::A),
+                None,
+                None,
+                &[(Some(LinkGroup::A), eth), (Some(LinkGroup::A), btc)],
+            ),
+            Ok((btc, pane::GexLiquidityReferenceSource::LinkGroup))
+        );
+    }
+
+    #[test]
+    fn single_dashboard_candidate_is_inferred_but_multiple_are_ambiguous() {
+        let first = ticker("BTCUSDT", Exchange::BinanceLinear);
+        let second = ticker("BTCUSDT", Exchange::BybitLinear);
+        assert_eq!(
+            resolve_gex_liquidity_reference(
+                OptionsUnderlying::Btc,
+                false,
+                None,
+                None,
+                None,
+                &[(None, first)],
+            ),
+            Ok((first, pane::GexLiquidityReferenceSource::SingleCompatible))
+        );
+        assert_eq!(
+            resolve_gex_liquidity_reference(
+                OptionsUnderlying::Btc,
+                false,
+                None,
+                None,
+                None,
+                &[(None, first), (None, second)],
+            ),
+            Err(GexReferenceMissingReason::AmbiguousTickers)
+        );
+    }
+
+    #[test]
+    fn incompatible_persisted_reference_is_not_reused() {
+        let eth = ticker("ETHUSDT", Exchange::BinanceLinear);
+        assert_eq!(
+            resolve_gex_liquidity_reference(
+                OptionsUnderlying::Btc,
+                false,
+                None,
+                Some(eth),
+                Some(pane::GexLiquidityReferenceSource::Persisted),
+                &[],
+            ),
+            Err(GexReferenceMissingReason::NoCompatibleTicker)
+        );
+    }
+
+    #[test]
+    fn linked_ticker_change_updates_reference_and_replaces_stream() {
+        let first = ticker("BTCUSDT", Exchange::BinanceLinear);
+        let second = ticker("BTCUSDT", Exchange::BybitLinear);
+        let mut state = pane::State::from_config(
+            pane::Content::Gex {
+                chart: Some(crate::chart::gex::GexChart::new(
+                    OptionsUnderlying::Btc,
+                    None,
+                    None,
+                )),
+                underlying: OptionsUnderlying::Btc,
+                liquidity_reference: None,
+                liquidity_reference_source: None,
+                unsupported: false,
+            },
+            Vec::new(),
+            data::layout::pane::Settings::default(),
+            Some(LinkGroup::A),
+        );
+        for expected in [first, second] {
+            let (reference, source) = resolve_gex_liquidity_reference(
+                OptionsUnderlying::Btc,
+                true,
+                Some(LinkGroup::A),
+                state
+                    .gex_liquidity_resolution()
+                    .and_then(|(_, _, reference, _)| reference),
+                state
+                    .gex_liquidity_resolution()
+                    .and_then(|(_, _, _, source)| source),
+                &[(Some(LinkGroup::A), expected)],
+            )
+            .expect("compatible linked ticker");
+            state.set_gex_liquidity_reference(Some(reference), Some(source));
+            let depth = state
+                .streams
+                .ready_iter()
+                .expect("ready")
+                .filter_map(|stream| match stream {
+                    StreamKind::Depth { ticker_info, .. } => Some(*ticker_info),
+                    _ => None,
+                })
+                .collect::<Vec<_>>();
+            assert_eq!(depth, vec![expected]);
+        }
     }
 }

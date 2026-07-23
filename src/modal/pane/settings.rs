@@ -665,6 +665,16 @@ pub fn gex_cfg_view<'a>(
             false,
         )
     });
+    let liquidity_depth = slider(5.0..=100.0, cfg.liquidity_depth_bps, move |value| {
+        Message::VisualConfigChanged(
+            pane,
+            VisualConfig::Gex(data::chart::gex::Config {
+                liquidity_depth_bps: value,
+                ..cfg
+            }),
+            false,
+        )
+    });
     let toggle =
         |label: &'static str, current: bool, update: fn(&mut data::chart::gex::Config, bool)| {
             checkbox(current).label(label).on_toggle(move |value| {
@@ -692,6 +702,30 @@ pub fn gex_cfg_view<'a>(
             crate::widget::chart::gex::format_exposure(cfg.min_absolute_gex)
         )),
         min_gex,
+        text("Analytics panels").size(crate::style::text_size::SECTION),
+        toggle(
+            "Intrinsic pressure",
+            cfg.show_intrinsic_stress_panel,
+            |c, v| c.show_intrinsic_stress_panel = v
+        ),
+        toggle("Gamma vs Vega", cfg.show_gamma_vega_panel, |c, v| {
+            c.show_gamma_vega_panel = v
+        }),
+        toggle(
+            "Liquidity impact",
+            cfg.show_gamma_liquidity_panel,
+            |c, v| c.show_gamma_liquidity_panel = v
+        ),
+        text(format!(
+            "Liquidity depth range: ±{:.0} bps",
+            cfg.liquidity_depth_bps
+        )),
+        liquidity_depth,
+        toggle(
+            "Follow selected/link-group ticker",
+            cfg.liquidity_reference_follow_link_group,
+            |c, v| c.liquidity_reference_follow_link_group = v
+        ),
         toggle("Show call GEX", cfg.show_call_gex, |c, v| c.show_call_gex =
             v),
         toggle("Show put GEX", cfg.show_put_gex, |c, v| c.show_put_gex = v),

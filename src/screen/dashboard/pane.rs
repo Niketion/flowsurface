@@ -40,7 +40,8 @@ use data::{
     stream::PersistStreamKind,
 };
 use exchange::{
-    Kline, OpenInterest, StreamPairKind, TickMultiplier, TickerInfo, Timeframe, UnixMs,
+    Kline, OpenInterest, PushFrequency, StreamPairKind, TickMultiplier, TickerInfo, Timeframe,
+    UnixMs,
     adapter::{MarketKind, StreamKind, StreamTicksize},
     unit::PriceStep,
 };
@@ -74,6 +75,14 @@ pub enum LoadingSource {
     #[default]
     Historical,
     Reconnect,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum GexLiquidityReferenceSource {
+    Persisted,
+    LinkGroup,
+    SingleCompatible,
+    Manual,
 }
 
 pub enum Action {
@@ -129,6 +138,7 @@ pub struct State {
     pub streams: ResolvedStream,
     pub status: Status,
     pub link_group: Option<LinkGroup>,
+    gex_liquidity_missing_logged: bool,
 }
 
 impl State {
@@ -142,16 +152,24 @@ impl State {
         settings: Settings,
         link_group: Option<LinkGroup>,
     ) -> Self {
-        Self {
+        let mut state = Self {
             content,
             settings,
             streams: ResolvedStream::waiting(streams),
             link_group,
             ..Default::default()
+        };
+        if matches!(state.content, Content::Gex { .. }) {
+            state.streams = ResolvedStream::Ready(Vec::new());
+            state.reconcile_gex_liquidity_stream();
         }
+        state
     }
 
     pub fn stream_pair(&self) -> Option<TickerInfo> {
+        if matches!(self.content, Content::Gex { .. }) {
+            return None;
+        }
         self.streams.find_ready_map(|stream| match stream {
             StreamKind::Kline { ticker_info, .. } => Some(*ticker_info),
             StreamKind::Depth { ticker_info, .. } => Some(*ticker_info),
@@ -160,6 +178,9 @@ impl State {
     }
 
     pub fn stream_pair_kind(&self) -> Option<StreamPairKind> {
+        if matches!(self.content, Content::Gex { .. }) {
+            return None;
+        }
         let ready_streams = self.streams.ready_iter()?;
         let mut unique = vec![];
 
@@ -207,6 +228,113 @@ impl State {
         }
     }
 
+    pub fn reconcile_gex_liquidity_stream(&mut self) {
+        let Content::Gex {
+            chart,
+            liquidity_reference,
+            ..
+        } = &mut self.content
+        else {
+            return;
+        };
+        let (enabled, reference) = chart
+            .as_ref()
+            .map_or((false, *liquidity_reference), |chart| {
+                (
+                    chart.config().show_gamma_liquidity_panel,
+                    chart.liquidity_reference().or(*liquidity_reference),
+                )
+            });
+        *liquidity_reference = reference;
+        if let Some(chart) = chart {
+            chart.set_liquidity_reference(reference);
+        }
+        let ResolvedStream::Ready(streams) = &mut self.streams else {
+            return;
+        };
+        streams.retain(|stream| !matches!(stream, StreamKind::Depth { .. }));
+        if enabled && let Some(ticker_info) = reference {
+            let setup = PaneSetup::new(ContentKind::GexChart, ticker_info, None, None, None);
+            streams.push(StreamKind::Depth {
+                ticker_info,
+                depth_aggr: setup.depth_aggr,
+                push_freq: PushFrequency::ServerDefault,
+            });
+        }
+    }
+
+    pub fn gex_liquidity_resolution(
+        &self,
+    ) -> Option<(
+        exchange::options::OptionsUnderlying,
+        bool,
+        Option<TickerInfo>,
+        Option<GexLiquidityReferenceSource>,
+    )> {
+        let Content::Gex {
+            chart,
+            underlying,
+            liquidity_reference,
+            liquidity_reference_source,
+            ..
+        } = &self.content
+        else {
+            return None;
+        };
+        Some((
+            *underlying,
+            chart
+                .as_ref()
+                .is_some_and(|chart| chart.config().liquidity_reference_follow_link_group),
+            chart
+                .as_ref()
+                .and_then(GexChart::liquidity_reference)
+                .or(*liquidity_reference),
+            *liquidity_reference_source,
+        ))
+    }
+
+    pub fn set_gex_liquidity_reference(
+        &mut self,
+        reference: Option<TickerInfo>,
+        source: Option<GexLiquidityReferenceSource>,
+    ) -> bool {
+        let Content::Gex {
+            chart,
+            liquidity_reference,
+            liquidity_reference_source,
+            ..
+        } = &mut self.content
+        else {
+            return false;
+        };
+        let changed = *liquidity_reference != reference || *liquidity_reference_source != source;
+        *liquidity_reference = reference;
+        *liquidity_reference_source = source;
+        if let Some(chart) = chart {
+            chart.set_liquidity_reference(reference);
+        }
+        if changed {
+            self.gex_liquidity_missing_logged = false;
+        }
+        self.reconcile_gex_liquidity_stream();
+        changed
+    }
+
+    pub fn log_gex_liquidity_missing_once(&mut self, reason: &str) {
+        if self.gex_liquidity_missing_logged {
+            return;
+        }
+        let Some((underlying, ..)) = self.gex_liquidity_resolution() else {
+            return;
+        };
+        log::warn!(
+            "GEX LiquidityReferenceMissing underlying={} reason={reason}",
+            underlying
+        );
+        self.gex_liquidity_missing_logged = true;
+    }
+
     pub fn set_content_and_streams(
         &mut self,
         tickers: Vec<TickerInfo>,
@@ -219,6 +347,17 @@ impl State {
 
         let base_ticker = tickers[0];
         if kind == ContentKind::GexChart {
+            let existing_reference = match &self.content {
+                Content::Gex {
+                    liquidity_reference,
+                    chart,
+                    ..
+                } => chart
+                    .as_ref()
+                    .and_then(GexChart::liquidity_reference)
+                    .or(*liquidity_reference),
+                _ => None,
+            };
             let resolved = exchange::options::resolve_options_underlying(base_ticker.ticker);
             if resolved.is_none() {
                 log::warn!(
@@ -232,13 +371,29 @@ impl State {
                 .visual_config
                 .as_ref()
                 .and_then(VisualConfig::gex);
+            let liquidity_reference = if config
+                .unwrap_or_default()
+                .liquidity_reference_follow_link_group
+            {
+                Some(base_ticker)
+            } else {
+                existing_reference.or(Some(base_ticker))
+            };
             self.content = Content::Gex {
-                chart: resolved.map(|value| GexChart::new(value, config)),
+                chart: resolved.map(|value| GexChart::new(value, config, liquidity_reference)),
                 underlying,
+                liquidity_reference,
+                liquidity_reference_source: liquidity_reference
+                    .map(|_| GexLiquidityReferenceSource::Manual),
                 unsupported: resolved.is_none(),
             };
             self.streams = ResolvedStream::Ready(Vec::new());
-            return Vec::new();
+            self.reconcile_gex_liquidity_stream();
+            return self
+                .streams
+                .ready_iter()
+                .map(|streams| streams.copied().collect())
+                .unwrap_or_default();
         }
         let prev_base_ticker = self.stream_pair();
 
@@ -1481,6 +1636,15 @@ impl State {
                 _ => {}
             },
             Event::GexChartInteraction(message) => {
+                if matches!(
+                    message,
+                    crate::chart::gex::Message::SelectLiquidityReference
+                ) && let Content::Gex { underlying, .. } = &self.content
+                {
+                    return self.show_modal_with_focus(Modal::GexLiquidityReference(
+                        MiniPanel::for_options_underlying(*underlying),
+                    ));
+                }
                 if let Content::Gex {
                     chart: Some(chart), ..
                 } = &mut self.content
@@ -1813,6 +1977,35 @@ impl State {
                 }
             }
             Event::MiniTickersListInteraction(message) => {
+                if let Some(Modal::GexLiquidityReference(ref mut mini_panel)) = self.modal
+                    && let Some(action) = mini_panel.update(message.clone())
+                {
+                    let crate::modal::pane::mini_tickers_list::Action::RowSelected(sel) = action;
+                    if let crate::modal::pane::mini_tickers_list::RowSelection::Switch(ticker) = sel
+                    {
+                        let compatible =
+                            self.gex_liquidity_resolution()
+                                .is_some_and(|(underlying, ..)| {
+                                    exchange::options::resolve_options_underlying(ticker.ticker)
+                                        == Some(underlying)
+                                });
+                        if compatible {
+                            self.modal = None;
+                            self.set_gex_liquidity_reference(
+                                Some(ticker),
+                                Some(GexLiquidityReferenceSource::Manual),
+                            );
+                            let (symbol, _) = ticker.ticker.display_symbol_and_type();
+                            log::info!(
+                                "GEX LiquidityReferenceResolved ticker={} exchange={} source=manual",
+                                symbol,
+                                ticker.exchange()
+                            );
+                            return Some(Effect::RefreshStreams);
+                        }
+                    }
+                    return None;
+                }
                 if let Some(Modal::MiniTickersList(ref mut mini_panel)) = self.modal
                     && let Some(action) = mini_panel.update(message)
                 {
@@ -2013,6 +2206,39 @@ impl State {
                     Alignment::Start,
                 )
             }
+            Some(Modal::GexLiquidityReference(panel)) => {
+                let reference = match &self.content {
+                    Content::Gex {
+                        chart,
+                        liquidity_reference,
+                        ..
+                    } => chart
+                        .as_ref()
+                        .and_then(GexChart::liquidity_reference)
+                        .or(*liquidity_reference),
+                    _ => None,
+                };
+                let mini_list = panel.view(tickers_table, None, reference).map(move |msg| {
+                    Message::PaneEvent(pane, Event::MiniTickersListInteraction(msg))
+                });
+                let content = column![
+                    text("Reference market").size(crate::style::text_size::SECTION),
+                    text("Choose a market with the same GEX underlying.")
+                        .size(crate::style::text_size::SMALL),
+                    mini_list
+                ]
+                .spacing(8);
+                stack_modal(
+                    base,
+                    container(content)
+                        .max_width(280)
+                        .padding(16)
+                        .style(style::chart_modal),
+                    on_blur,
+                    padding::left(12),
+                    Alignment::Start,
+                )
+            }
             Some(Modal::Settings) => stack_modal(
                 base,
                 settings_modal(),
@@ -2095,7 +2321,9 @@ impl State {
         }
 
         let focus_widget_id = match &requested_modal {
-            Modal::MiniTickersList(m) => Some(m.search_box_id.clone()),
+            Modal::MiniTickersList(m) | Modal::GexLiquidityReference(m) => {
+                Some(m.search_box_id.clone())
+            }
             _ => None,
         };
 
@@ -2227,6 +2455,7 @@ impl Default for State {
             notifications: vec![],
             status: Status::Ready,
             link_group: None,
+            gex_liquidity_missing_logged: false,
         }
     }
 }
@@ -2259,6 +2488,8 @@ pub enum Content {
     Gex {
         chart: Option<GexChart>,
         underlying: exchange::options::OptionsUnderlying,
+        liquidity_reference: Option<TickerInfo>,
+        liquidity_reference_source: Option<GexLiquidityReferenceSource>,
         unsupported: bool,
     },
 }
@@ -2471,6 +2702,8 @@ impl Content {
             ContentKind::GexChart => Content::Gex {
                 chart: None,
                 underlying: exchange::options::OptionsUnderlying::Btc,
+                liquidity_reference: None,
+                liquidity_reference_source: None,
                 unsupported: false,
             },
             ContentKind::TimeAndSales => Content::TimeAndSales(None),
@@ -2600,8 +2833,10 @@ impl Content {
                 },
                 VisualConfig::Gex(cfg),
             ) => {
+                let refresh_streams =
+                    chart.config().show_gamma_liquidity_panel != cfg.show_gamma_liquidity_panel;
                 chart.set_config(cfg);
-                false
+                refresh_streams
             }
             (Content::TimeAndSales(Some(panel)), VisualConfig::TimeAndSales(cfg)) => {
                 panel.config = cfg;
@@ -2877,6 +3112,36 @@ pub fn should_show_popout_button(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use exchange::{Ticker, adapter::Exchange};
+
+    fn ticker() -> TickerInfo {
+        TickerInfo::new(
+            Ticker::new("BTCUSDT", Exchange::BinanceLinear),
+            0.01,
+            0.001,
+            None,
+        )
+    }
+
+    fn gex_state(config: data::chart::gex::Config) -> State {
+        let reference = ticker();
+        State::from_config(
+            Content::Gex {
+                chart: Some(GexChart::new(
+                    exchange::options::OptionsUnderlying::Btc,
+                    Some(config),
+                    Some(reference),
+                )),
+                underlying: exchange::options::OptionsUnderlying::Btc,
+                liquidity_reference: Some(reference),
+                liquidity_reference_source: Some(GexLiquidityReferenceSource::Persisted),
+                unsupported: false,
+            },
+            Vec::new(),
+            Settings::default(),
+            None,
+        )
+    }
 
     #[test]
     fn popout_button_hidden_in_embedded_mode() {
@@ -2905,5 +3170,72 @@ mod tests {
         assert!(should_show_popout_button(1, true, true));
         // In embedded mode, no merge button (no native popout windows should exist)
         assert!(!should_show_popout_button(1, true, false));
+    }
+
+    #[test]
+    fn gex_liquidity_stream_toggles_without_duplicates_or_primary_pair() {
+        let mut state = gex_state(data::chart::gex::Config::default());
+        assert_eq!(
+            state
+                .streams
+                .ready_iter()
+                .expect("ready")
+                .filter(|stream| matches!(stream, StreamKind::Depth { .. }))
+                .count(),
+            1
+        );
+        assert_eq!(state.stream_pair(), None);
+        state.reconcile_gex_liquidity_stream();
+        assert_eq!(state.streams.ready_iter().expect("ready").count(), 1);
+
+        let disabled = data::chart::gex::Config {
+            show_gamma_liquidity_panel: false,
+            ..data::chart::gex::Config::default()
+        };
+        assert!(
+            state
+                .content
+                .change_visual_config(VisualConfig::Gex(disabled))
+        );
+        state.reconcile_gex_liquidity_stream();
+        assert_eq!(state.streams.ready_iter().expect("ready").count(), 0);
+
+        assert!(
+            state
+                .content
+                .change_visual_config(VisualConfig::Gex(data::chart::gex::Config::default()))
+        );
+        state.reconcile_gex_liquidity_stream();
+        assert_eq!(state.streams.ready_iter().expect("ready").count(), 1);
+        assert_eq!(state.stream_pair(), None);
+    }
+
+    #[test]
+    fn changing_gex_reference_replaces_the_depth_stream() {
+        let mut state = gex_state(data::chart::gex::Config::default());
+        let old = ticker();
+        let next = TickerInfo::new(
+            Ticker::new("BTCUSDT", Exchange::BybitLinear),
+            0.01,
+            0.001,
+            None,
+        );
+        assert!(
+            state
+                .set_gex_liquidity_reference(Some(next), Some(GexLiquidityReferenceSource::Manual))
+        );
+        let depth_streams = state
+            .streams
+            .ready_iter()
+            .expect("ready")
+            .filter_map(|stream| match stream {
+                StreamKind::Depth { ticker_info, .. } => Some(*ticker_info),
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(depth_streams, vec![next]);
+        assert!(!depth_streams.contains(&old));
+        state.reconcile_gex_liquidity_stream();
+        assert_eq!(state.streams.ready_iter().expect("ready").count(), 1);
     }
 }

@@ -70,6 +70,8 @@ pub enum Pane {
     },
     GexChart {
         underlying: exchange::options::OptionsUnderlying,
+        #[serde(default)]
+        liquidity_reference: Option<TickerInfo>,
         #[serde(deserialize_with = "ok_or_default")]
         settings: Settings,
         #[serde(deserialize_with = "ok_or_default", default)]
@@ -363,5 +365,51 @@ impl PaneSetup {
             depth_aggr,
             push_freq,
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use exchange::{Ticker, adapter::Exchange};
+
+    #[test]
+    fn legacy_gex_pane_without_liquidity_reference_still_loads() {
+        let pane: Pane = serde_json::from_str(
+            r#"{"GexChart":{"underlying":"Btc","settings":{},"link_group":null}}"#,
+        )
+        .expect("legacy GEX pane");
+        assert!(matches!(
+            pane,
+            Pane::GexChart {
+                liquidity_reference: None,
+                ..
+            }
+        ));
+    }
+
+    #[test]
+    fn gex_liquidity_reference_round_trips() {
+        let reference = TickerInfo::new(
+            Ticker::new("BTCUSDT", Exchange::BinanceLinear),
+            0.01,
+            0.001,
+            None,
+        );
+        let encoded = serde_json::to_string(&Pane::GexChart {
+            underlying: exchange::options::OptionsUnderlying::Btc,
+            liquidity_reference: Some(reference),
+            settings: Settings::default(),
+            link_group: Some(LinkGroup::A),
+        })
+        .expect("serialize");
+        let decoded: Pane = serde_json::from_str(&encoded).expect("deserialize");
+        assert!(matches!(
+            decoded,
+            Pane::GexChart {
+                liquidity_reference: Some(value),
+                ..
+            } if value == reference
+        ));
     }
 }

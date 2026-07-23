@@ -1,14 +1,19 @@
 use crate::{chart::gex, style};
-use data::chart::gex::{GexFreshness, GexSignModel, GexStrike};
+use data::chart::gex::{
+    GammaLiquidityRegime, GammaVegaRegime, GexFreshness, GexSignModel, GexStrike,
+    IntrinsicStressLevel,
+};
 use iced::{
-    Alignment, Color, Element, Length, Point, Rectangle, Renderer, Size, Theme, mouse,
+    Alignment, Border, Color, Element, Length, Point, Rectangle, Renderer, Size, Theme, mouse,
     widget::{
-        button, canvas, column, container, mouse_area, responsive, row, space, svg, text, tooltip,
+        button, canvas, column, container, mouse_area, responsive, row, rule, space, svg, text,
+        tooltip,
     },
 };
 
 pub fn view(chart: &gex::GexChart) -> Element<'_, gex::Message> {
-    responsive(move |size| view_sized(chart, GexLayoutDensity::for_width(size.width))).into()
+    responsive(move |size| view_sized(chart, GexLayoutDensity::for_width(size.width), size.width))
+        .into()
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -30,7 +35,11 @@ impl GexLayoutDensity {
     }
 }
 
-fn view_sized(chart: &gex::GexChart, density: GexLayoutDensity) -> Element<'_, gex::Message> {
+fn view_sized(
+    chart: &gex::GexChart,
+    density: GexLayoutDensity,
+    width: f32,
+) -> Element<'_, gex::Message> {
     let Some(snapshot) = chart.snapshot() else {
         return iced::widget::center(text(if chart.freshness() == GexFreshness::Error {
             "GEX data unavailable."
@@ -44,22 +53,8 @@ fn view_sized(chart: &gex::GexChart, density: GexLayoutDensity) -> Element<'_, g
         return iced::widget::center(text("No strikes in the configured range.")).into();
     }
 
-    let controls = row![
-        zoom_button(
-            include_bytes!("../../../assets/ui/zoom-in.svg"),
-            "Zoom in",
-            chart.can_zoom_in(),
-            gex::Message::ZoomIn,
-        ),
-        zoom_button(
-            include_bytes!("../../../assets/ui/zoom-out.svg"),
-            "Zoom out",
-            chart.can_zoom_out(),
-            gex::Message::ZoomOut,
-        )
-    ]
-    .spacing(3);
     let header = header_view(chart, snapshot, density);
+    let analytics = analytics_view(chart, snapshot, density, width);
     let table = canvas(GexProfileTable {
         snapshot,
         strikes: visible,
@@ -84,10 +79,527 @@ fn view_sized(chart: &gex::GexChart, density: GexLayoutDensity) -> Element<'_, g
     } else {
         4
     };
-    column![header, controls, table]
+    column![header, analytics, table]
         .spacing(4)
         .padding(padding)
         .into()
+}
+
+#[derive(Debug, Clone, Copy)]
+enum Semantic {
+    Primary,
+    Secondary,
+    Success,
+    Danger,
+    Warning,
+}
+
+#[derive(Debug, Clone, Copy)]
+struct GaugeVisual {
+    asset: &'static [u8],
+    normalized: Option<f32>,
+    muted: bool,
+}
+
+fn semantic_pair(theme: &Theme, semantic: Semantic) -> iced::theme::palette::Pair {
+    let palette = theme.extended_palette();
+    match semantic {
+        Semantic::Primary => palette.primary.weak,
+        Semantic::Secondary => palette.secondary.weak,
+        Semantic::Success => palette.success.weak,
+        Semantic::Danger => palette.danger.weak,
+        Semantic::Warning => palette.warning.weak,
+    }
+}
+
+fn card_style(theme: &Theme) -> container::Style {
+    let palette = theme.extended_palette();
+    container::Style {
+        background: None,
+        border: Border {
+            color: palette.background.strong.color.scale_alpha(0.35),
+            width: 1.0,
+            radius: 5.0.into(),
+        },
+        ..Default::default()
+    }
+}
+
+fn info<'a>(methodology: String) -> Element<'a, gex::Message> {
+    tooltip(
+        text("ⓘ").size(style::text_size::TINY),
+        container(text(methodology).size(style::text_size::SMALL).width(360))
+            .padding(8)
+            .style(container::rounded_box),
+        tooltip::Position::Bottom,
+    )
+    .into()
+}
+
+fn gauge_view<'a>(
+    gauge: GaugeVisual,
+    semantic: Semantic,
+    height: f32,
+) -> Element<'a, gex::Message> {
+    const GAUGE_ASPECT_RATIO: f32 = 180.0 / 108.0;
+
+    responsive(move |available| {
+        let width = (height * GAUGE_ASPECT_RATIO).min(available.width);
+        let fitted_height = (width / GAUGE_ASPECT_RATIO).min(height);
+        let base = svg(svg::Handle::from_memory(gauge.asset))
+            .width(width)
+            .height(fitted_height)
+            .opacity(if gauge.muted { 0.32 } else { 0.88 })
+            .style(|theme: &Theme, _| svg::Style {
+                color: Some(theme.extended_palette().secondary.strong.color),
+            });
+        let needle = canvas(GaugeNeedle {
+            normalized: gauge.normalized,
+            semantic,
+            muted: gauge.muted,
+        })
+        .width(width)
+        .height(fitted_height);
+        container(iced::widget::stack![base, needle])
+            .width(Length::Fill)
+            .height(height)
+            .align_x(Alignment::Center)
+            .align_y(Alignment::Center)
+            .into()
+    })
+    .width(Length::Fill)
+    .height(height)
+    .into()
+}
+
+#[derive(Debug, Clone, Copy)]
+struct GaugeNeedle {
+    normalized: Option<f32>,
+    semantic: Semantic,
+    muted: bool,
+}
+
+impl canvas::Program<gex::Message> for GaugeNeedle {
+    type State = ();
+
+    fn draw(
+        &self,
+        _state: &Self::State,
+        renderer: &Renderer,
+        theme: &Theme,
+        bounds: Rectangle,
+        _cursor: mouse::Cursor,
+    ) -> Vec<canvas::Geometry> {
+        let Some(normalized) = self.normalized else {
+            return Vec::new();
+        };
+        let mut frame = canvas::Frame::new(renderer, bounds.size());
+        let scale = (bounds.width / 180.0).min(bounds.height / 108.0);
+        let offset = Point::new(
+            (bounds.width - 180.0 * scale) * 0.5,
+            (bounds.height - 108.0 * scale) * 0.5,
+        );
+        let center = Point::new(offset.x + 90.0 * scale, offset.y + 84.0 * scale);
+        let sweep = 210.0_f32.to_radians();
+        let angle = 195.0_f32.to_radians() - sweep * normalized.clamp(0.0, 1.0);
+        let tip = Point::new(
+            center.x + 49.0 * scale * angle.cos(),
+            center.y - 49.0 * scale * angle.sin(),
+        );
+        let color = semantic_pair(theme, self.semantic)
+            .color
+            .scale_alpha(if self.muted { 0.42 } else { 1.0 });
+        frame.stroke(
+            &canvas::Path::line(center, tip),
+            canvas::Stroke::default()
+                .with_color(
+                    theme
+                        .extended_palette()
+                        .background
+                        .strong
+                        .color
+                        .scale_alpha(0.72),
+                )
+                .with_width(4.2 * scale),
+        );
+        frame.stroke(
+            &canvas::Path::line(center, tip),
+            canvas::Stroke::default()
+                .with_color(color)
+                .with_width(2.4 * scale),
+        );
+        frame.fill(&canvas::Path::circle(center, 5.2 * scale), color);
+        frame.fill(
+            &canvas::Path::circle(center, 2.2 * scale),
+            theme.extended_palette().background.weak.color,
+        );
+        vec![frame.into_geometry()]
+    }
+}
+
+fn analytics_section<'a>(
+    title: &'static str,
+    gauge: GaugeVisual,
+    status: String,
+    semantic: Semantic,
+    primary: String,
+    secondary: String,
+    methodology: String,
+    action: Option<gex::Message>,
+    density: GexLayoutDensity,
+) -> Element<'a, gex::Message> {
+    let status = text(status)
+        .size(9)
+        .wrapping(iced::widget::text::Wrapping::None)
+        .style(move |theme: &Theme| iced::widget::text::Style {
+            color: Some(semantic_pair(theme, semantic).color),
+        });
+    let heading = row![
+        text(title)
+            .size(style::text_size::TINY)
+            .width(Length::Fill)
+            .wrapping(iced::widget::text::Wrapping::None),
+        status,
+        info(methodology)
+    ]
+    .spacing(3)
+    .align_y(Alignment::Center);
+    let primary_text = text(primary)
+        .size(style::text_size::SECTION)
+        .width(Length::Fill)
+        .wrapping(iced::widget::text::Wrapping::None);
+    let primary: Element<_> = if let Some(message) = action {
+        button(primary_text)
+            .width(Length::Fill)
+            .padding(0)
+            .style(button::text)
+            .on_press(message)
+            .into()
+    } else {
+        primary_text.into()
+    };
+    let gauge_height = match density {
+        GexLayoutDensity::Full => 42.0,
+        GexLayoutDensity::Compact => 40.0,
+        GexLayoutDensity::Minimal => 38.0,
+    };
+    let secondary = text(secondary)
+        .size(9)
+        .width(Length::Fill)
+        .wrapping(iced::widget::text::Wrapping::None)
+        .style(|theme: &Theme| iced::widget::text::Style {
+            color: Some(theme.palette().text.scale_alpha(0.58)),
+        });
+    let content = column![
+        heading,
+        gauge_view(gauge, semantic, gauge_height),
+        primary,
+        secondary,
+    ]
+    .width(Length::Fill)
+    .spacing(0);
+    container(content)
+        .width(Length::FillPortion(1))
+        .padding([2, 6])
+        .clip(true)
+        .into()
+}
+
+fn analytics_view<'a>(
+    chart: &gex::GexChart,
+    snapshot: &data::chart::gex::GexSnapshot,
+    density: GexLayoutDensity,
+    width: f32,
+) -> Element<'a, gex::Message> {
+    let cfg = chart.config();
+    let expiry = cfg.expiry_filter.to_string();
+    let mut sections = Vec::new();
+    if cfg.show_intrinsic_stress_panel {
+        let metrics = &snapshot.intrinsic_stress;
+        let semantic = match metrics.level {
+            IntrinsicStressLevel::Low => Semantic::Success,
+            IntrinsicStressLevel::Mild => Semantic::Warning,
+            IntrinsicStressLevel::Elevated | IntrinsicStressLevel::High => Semantic::Danger,
+        };
+        sections.push(analytics_section(
+            "Intrinsic pressure",
+            GaugeVisual {
+                asset: include_bytes!("../../../assets/gex/intrinsic-pressure-gauge.svg"),
+                normalized: Some(normalize_intrinsic_pressure(metrics.intrinsic_ratio)),
+                muted: false,
+            },
+            match metrics.level {
+                IntrinsicStressLevel::Low => "Low",
+                IntrinsicStressLevel::Mild => "Moderate",
+                IntrinsicStressLevel::Elevated => "Elevated",
+                IntrinsicStressLevel::High => "High",
+            }
+            .into(),
+            semantic,
+            format_unsigned_exposure(metrics.gross_intrinsic_usd),
+            format!(
+                "{:.1}% of OI · {} / {} ITM",
+                metrics.intrinsic_ratio * 100.0,
+                metrics.itm_contracts, metrics.total_contracts
+            ),
+            format!(
+                "Calculated from open interest and intrinsic option value.\n\
+                 Formula: Σ max(±(spot − strike), 0) × OI underlying; ratio = gross intrinsic USD / Σ(OI underlying × spot).\n\
+                 Units: USD and ratio. Expiry filter: {expiry}. Source: Deribit option chain.\n\
+                 This is an OI-based exposure proxy, not observed dealer liability. Thresholds are model thresholds, not historical percentiles."
+            ),
+            None,
+            density,
+        ));
+    }
+    if cfg.show_gamma_vega_panel {
+        let metrics = &snapshot.gamma_vega;
+        let semantic = match metrics.regime {
+            GammaVegaRegime::VegaDominant => Semantic::Primary,
+            GammaVegaRegime::Balanced => Semantic::Warning,
+            GammaVegaRegime::GammaDominant => Semantic::Success,
+            GammaVegaRegime::Unavailable => Semantic::Secondary,
+        };
+        let regime = match metrics.regime {
+            GammaVegaRegime::VegaDominant => "Vega-led",
+            GammaVegaRegime::Balanced => "Balanced",
+            GammaVegaRegime::GammaDominant => "Gamma-led",
+            GammaVegaRegime::Unavailable => "Pending",
+        };
+        sections.push(analytics_section(
+            "Gamma vs Vega",
+            GaugeVisual {
+                asset: include_bytes!("../../../assets/gex/gamma-vega-gauge.svg"),
+                normalized: metrics.gamma_vega_ratio.map(normalize_gamma_vega),
+                muted: metrics.gamma_vega_ratio.is_none(),
+            },
+            regime.into(),
+            semantic,
+            metrics
+                .gamma_vega_ratio
+                .map_or_else(|| "—".into(), format_ratio),
+            format!(
+                "Gamma {} · Vega {}",
+                format_unsigned_exposure(metrics.gamma_shock_1pct_usd),
+                format_unsigned_exposure(metrics.vega_shock_1vol_usd)
+            ),
+            format!(
+                "Compares estimated USD exposure to a 1% spot move with exposure to a 1 vol-point IV move.\n\
+                 Formula: gamma shock = absolute GEX for a 1% spot move; vega shock = Σ BS vega × OI underlying × 0.01; G/V = gamma / vega.\n\
+                 Units: USD and ratio. Expiry filter: {expiry}. Source: Deribit option chain.\n\
+                 Black-Scholes is a model estimate using mark IV and does not identify dealer positioning."
+            ),
+            None,
+            density,
+        ));
+    }
+    if cfg.show_gamma_liquidity_panel {
+        sections.push(liquidity_card(chart, &expiry, density));
+    }
+    cards_layout(sections, width)
+}
+
+fn liquidity_card<'a>(
+    chart: &gex::GexChart,
+    expiry: &str,
+    density: GexLayoutDensity,
+) -> Element<'a, gex::Message> {
+    let methodology = format!(
+        "Compares GEX exposure with visible order-book depth from the selected reference market.\n\
+         Formula: effective liquidity = 2 × bid USD × ask USD / (bid USD + ask USD); impact = gamma exposure / effective liquidity.\n\
+         Gamma uses |Net GEX| in OI Proxy mode and Absolute GEX otherwise. Units: USD and ratio. Expiry filter: {expiry}.\n\
+         Sources: Deribit option chain plus live reference-market depth. It does not represent global BTC liquidity."
+    );
+    let state = chart.liquidity_depth_state();
+    let reference = chart
+        .liquidity_reference()
+        .map(|ticker| reference_label(ticker, cfg_bps(chart)));
+    if state != gex::LiquidityDepthState::Ready {
+        let (status, primary, secondary, action) = match state {
+            gex::LiquidityDepthState::NoReference => (
+                "Setup",
+                "Select market",
+                "Reference market required".into(),
+                Some(gex::Message::SelectLiquidityReference),
+            ),
+            gex::LiquidityDepthState::WaitingForDepth => (
+                "Connecting",
+                "Waiting for market depth",
+                reference.clone().unwrap_or_default(),
+                None,
+            ),
+            gex::LiquidityDepthState::InvalidDepth => (
+                "No depth",
+                "Order book not ready",
+                reference.clone().unwrap_or_default(),
+                None,
+            ),
+            gex::LiquidityDepthState::Stale => (
+                "Stale",
+                "Last depth is outdated",
+                reference.clone().unwrap_or_default(),
+                None,
+            ),
+            gex::LiquidityDepthState::Ready => unreachable!(),
+        };
+        return analytics_section(
+            "Liquidity impact",
+            GaugeVisual {
+                asset: include_bytes!("../../../assets/gex/liquidity-impact-gauge.svg"),
+                normalized: chart
+                    .liquidity_metrics()
+                    .map(|metrics| normalize_liquidity_impact(metrics.impact_ratio)),
+                muted: true,
+            },
+            status.into(),
+            Semantic::Secondary,
+            primary.into(),
+            secondary,
+            methodology,
+            action,
+            density,
+        );
+    }
+    let Some(metrics) = chart.liquidity_metrics() else {
+        unreachable!("ready liquidity state requires metrics")
+    };
+    let semantic = match metrics.regime {
+        GammaLiquidityRegime::LowImpact => Semantic::Success,
+        GammaLiquidityRegime::Moderate => Semantic::Warning,
+        GammaLiquidityRegime::Elevated | GammaLiquidityRegime::HighImpact => Semantic::Danger,
+        GammaLiquidityRegime::Unavailable => Semantic::Secondary,
+    };
+    analytics_section(
+        "Liquidity impact",
+        GaugeVisual {
+            asset: include_bytes!("../../../assets/gex/liquidity-impact-gauge.svg"),
+            normalized: Some(normalize_liquidity_impact(metrics.impact_ratio)),
+            muted: false,
+        },
+        metrics.regime.to_string(),
+        semantic,
+        format_ratio(metrics.impact_ratio),
+        format!(
+            "Gamma {} · Liquidity {}",
+            format_unsigned_exposure(metrics.gamma_exposure_usd),
+            format_unsigned_exposure(metrics.effective_liquidity_usd)
+        ),
+        methodology,
+        None,
+        density,
+    )
+}
+
+fn cards_layout<'a>(
+    cards: Vec<Element<'a, gex::Message>>,
+    width: f32,
+) -> Element<'a, gex::Message> {
+    if analytics_layout_rows(width, cards.len()).is_empty() {
+        return space::vertical().height(0).into();
+    }
+    let mut overview = row![]
+        .height(Length::Shrink)
+        .align_y(Alignment::Center)
+        .spacing(0);
+    for (index, card) in cards.into_iter().enumerate() {
+        if index > 0 {
+            overview = overview.push(
+                container(rule::vertical(1.0).style(style::split_ruler))
+                    .width(1)
+                    .height(64)
+                    .align_y(Alignment::Center),
+            );
+        }
+        overview = overview.push(card);
+    }
+    container(overview)
+        .width(Length::Fill)
+        .height(Length::Shrink)
+        .padding(0)
+        .style(card_style)
+        .clip(true)
+        .into()
+}
+
+fn analytics_layout_rows(_width: f32, card_count: usize) -> Vec<usize> {
+    if card_count == 0 {
+        Vec::new()
+    } else {
+        vec![card_count]
+    }
+}
+
+fn format_ratio(ratio: f64) -> String {
+    if ratio >= 10.0 {
+        format!("{ratio:.0}×")
+    } else {
+        format!("{ratio:.2}×")
+    }
+}
+
+fn normalize_intrinsic_pressure(value: f64) -> f32 {
+    normalize_piecewise(
+        value,
+        &[
+            (0.0, 0.0),
+            (0.02, 0.25),
+            (0.05, 0.5),
+            (0.10, 0.82),
+            (0.20, 1.0),
+        ],
+    )
+}
+
+fn normalize_gamma_vega(value: f64) -> f32 {
+    if !value.is_finite() || value <= 0.0 {
+        0.0
+    } else {
+        (0.5 + value.log10() / 6.0).clamp(0.0, 1.0) as f32
+    }
+}
+
+fn normalize_liquidity_impact(value: f64) -> f32 {
+    normalize_piecewise(
+        value,
+        &[
+            (0.0, 0.0),
+            (0.25, 0.33),
+            (0.75, 0.66),
+            (1.5, 0.88),
+            (3.0, 1.0),
+        ],
+    )
+}
+
+fn normalize_piecewise(value: f64, points: &[(f64, f32)]) -> f32 {
+    if !value.is_finite() || value <= points[0].0 {
+        return points[0].1;
+    }
+    for window in points.windows(2) {
+        let [(x0, y0), (x1, y1)] = window else {
+            continue;
+        };
+        if value <= *x1 {
+            let progress = ((value - x0) / (x1 - x0)) as f32;
+            return y0 + (y1 - y0) * progress;
+        }
+    }
+    points.last().map_or(1.0, |(_, normalized)| *normalized)
+}
+
+fn cfg_bps(chart: &gex::GexChart) -> f64 {
+    f64::from(chart.config().liquidity_depth_bps)
+}
+
+fn reference_label(ticker: exchange::TickerInfo, depth_bps: f64) -> String {
+    let (symbol, _) = ticker.ticker.display_symbol_and_type();
+    format!("{} {symbol} · ±{depth_bps:.0} bps", ticker.exchange())
+}
+
+fn format_unsigned_exposure(value: f64) -> String {
+    format_exposure(value.max(0.0))
+        .trim_start_matches('+')
+        .to_string()
 }
 
 fn zoom_button<'a>(
@@ -127,8 +639,27 @@ fn header_view<'a>(
     _density: GexLayoutDensity,
 ) -> Element<'a, gex::Message> {
     let cfg = chart.config();
+    let zoom_controls = || {
+        row![
+            zoom_button(
+                include_bytes!("../../../assets/ui/zoom-in.svg"),
+                "Zoom in · double-click chart to auto fit",
+                chart.can_zoom_in(),
+                gex::Message::ZoomIn,
+            ),
+            zoom_button(
+                include_bytes!("../../../assets/ui/zoom-out.svg"),
+                "Zoom out · double-click chart to auto fit",
+                chart.can_zoom_out(),
+                gex::Message::ZoomOut,
+            )
+        ]
+        .spacing(3)
+    };
     if !cfg.show_summary {
-        return space::vertical().height(0).into();
+        return row![space::horizontal(), zoom_controls()]
+            .align_y(Alignment::Center)
+            .into();
     }
     let status = match chart.freshness() {
         GexFreshness::Loading => "Loading",
@@ -205,7 +736,13 @@ fn header_view<'a>(
     if abnormal && let Some(error) = chart.error() {
         push("!", error.to_string());
     }
-    row(fields).spacing(4).align_y(Alignment::Center).into()
+    row![
+        row(fields).spacing(4).align_y(Alignment::Center),
+        space::horizontal(),
+        zoom_controls()
+    ]
+    .align_y(Alignment::Center)
+    .into()
 }
 
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -973,5 +1510,15 @@ mod tests {
     #[test]
     fn hover_background_is_fully_opaque() {
         assert_eq!(opaque_color(Color::from_rgba(0.1, 0.2, 0.3, 0.2)).a, 1.0);
+    }
+
+    #[test]
+    fn analytics_overview_always_uses_one_row() {
+        assert_eq!(analytics_layout_rows(900.0, 3), vec![3]);
+        assert_eq!(analytics_layout_rows(700.0, 3), vec![3]);
+        assert_eq!(analytics_layout_rows(320.0, 3), vec![3]);
+        assert_eq!(analytics_layout_rows(700.0, 2), vec![2]);
+        assert_eq!(analytics_layout_rows(320.0, 1), vec![1]);
+        assert!(analytics_layout_rows(900.0, 0).is_empty());
     }
 }

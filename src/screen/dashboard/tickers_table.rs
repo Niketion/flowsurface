@@ -1144,6 +1144,7 @@ impl TickersTable {
         on_scroll: FScroll,
         selected_tickers: Option<&'a [TickerInfo]>,
         base_ticker: Option<TickerInfo>,
+        underlying_filter: Option<exchange::options::OptionsUnderlying>,
     ) -> Element<'a, M>
     where
         M: 'a + Clone,
@@ -1162,7 +1163,14 @@ impl TickersTable {
             selected_set.insert(bt.ticker);
         }
 
-        let (fav_rows, rest_rows) = self.filtered_rows_compact(&injected_q, &selected_set);
+        let (mut fav_rows, mut rest_rows) = self.filtered_rows_compact(&injected_q, &selected_set);
+        let compatible = |row: &&TickerRowData| {
+            underlying_filter.is_none_or(|underlying| {
+                exchange::options::resolve_options_underlying(row.ticker) == Some(underlying)
+            })
+        };
+        fav_rows.retain(compatible);
+        rest_rows.retain(compatible);
 
         let base_ticker_id = base_ticker.map(|bt| bt.ticker);
         let selected_list: Vec<TickerInfo> = selected_tickers

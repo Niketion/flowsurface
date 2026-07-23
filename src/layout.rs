@@ -181,7 +181,10 @@ impl From<&pane::State> for data::Pane {
                 link_group: pane.link_group,
             },
             pane::Content::Gex {
-                chart, underlying, ..
+                chart,
+                underlying,
+                liquidity_reference,
+                ..
             } => {
                 let settings = data::layout::pane::Settings {
                     visual_config: chart
@@ -191,6 +194,10 @@ impl From<&pane::State> for data::Pane {
                 };
                 data::Pane::GexChart {
                     underlying: *underlying,
+                    liquidity_reference: chart
+                        .as_ref()
+                        .and_then(crate::chart::gex::GexChart::liquidity_reference)
+                        .or(*liquidity_reference),
                     settings,
                     link_group: pane.link_group,
                 }
@@ -306,6 +313,7 @@ pub fn configuration(pane: data::Pane) -> Configuration<pane::State> {
         }
         data::Pane::GexChart {
             underlying,
+            liquidity_reference,
             settings,
             link_group,
         } => {
@@ -314,8 +322,15 @@ pub fn configuration(pane: data::Pane) -> Configuration<pane::State> {
                 .as_ref()
                 .and_then(data::layout::pane::VisualConfig::gex);
             let content = pane::Content::Gex {
-                chart: Some(crate::chart::gex::GexChart::new(underlying, config)),
+                chart: Some(crate::chart::gex::GexChart::new(
+                    underlying,
+                    config,
+                    liquidity_reference,
+                )),
                 underlying,
+                liquidity_reference,
+                liquidity_reference_source: liquidity_reference
+                    .map(|_| pane::GexLiquidityReferenceSource::Persisted),
                 unsupported: false,
             };
             Configuration::Pane(pane::State::from_config(

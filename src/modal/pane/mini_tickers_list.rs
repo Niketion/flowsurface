@@ -19,6 +19,7 @@ pub struct MiniPanel {
     search_query: String,
     pub search_box_id: iced::widget::Id,
     scroll_offset: iced::widget::scrollable::AbsoluteOffset,
+    underlying_filter: Option<exchange::options::OptionsUnderlying>,
 }
 
 impl Default for MiniPanel {
@@ -40,6 +41,14 @@ impl MiniPanel {
             search_query: String::new(),
             search_box_id: iced::widget::Id::unique(),
             scroll_offset: iced::widget::scrollable::AbsoluteOffset::default(),
+            underlying_filter: None,
+        }
+    }
+
+    pub fn for_options_underlying(underlying: exchange::options::OptionsUnderlying) -> Self {
+        Self {
+            underlying_filter: Some(underlying),
+            ..Self::new()
         }
     }
 
@@ -73,6 +82,7 @@ impl MiniPanel {
                 Message::Scrolled,
                 selected_tickers,
                 base_ticker,
+                self.underlying_filter,
             )
         })
         .into()
