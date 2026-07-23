@@ -873,7 +873,9 @@ impl State {
                 button(content)
                     .on_press(Message::PaneEvent(
                         id,
-                        Event::ShowModal(Modal::MiniTickersList(MiniPanel::new())),
+                        Event::ShowModal(
+                            Modal::MiniTickersList(MiniPanel::for_supported_options()),
+                        ),
                     ))
                     .style(|theme, status| style::button::modifier(theme, status, true))
                     .height(widget::PANE_CONTROL_BTN_HEIGHT),
@@ -1619,7 +1621,12 @@ impl State {
 
                 if !matches!(kind, ContentKind::Starter) {
                     self.streams = ResolvedStream::waiting(vec![]);
-                    let modal = Modal::MiniTickersList(MiniPanel::new());
+                    let mini_panel = if kind == ContentKind::GexChart {
+                        MiniPanel::for_supported_options()
+                    } else {
+                        MiniPanel::new()
+                    };
+                    let modal = Modal::MiniTickersList(mini_panel);
 
                     if let Some(effect) = self.show_modal_with_focus(modal) {
                         return Some(effect);

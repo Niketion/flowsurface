@@ -57,6 +57,18 @@ const COMPACT_ROW_HEIGHT: f32 = 28.0;
 
 const EXCHANGE_UNAVAILABLE_TOOLTIP: &str = "Metadata unavailable.\nCheck logs for details.";
 
+fn matches_options_filter(
+    ticker: Ticker,
+    underlying_filter: Option<exchange::options::OptionsUnderlying>,
+    supported_options_only: bool,
+) -> bool {
+    let resolved = exchange::options::resolve_options_underlying(ticker);
+    underlying_filter.map_or_else(
+        || !supported_options_only || resolved.is_some(),
+        |underlying| resolved == Some(underlying),
+    )
+}
+
 fn available_markets(venue: Venue) -> &'static [MarketKind] {
     match venue {
         Venue::Binance | Venue::Bybit | Venue::Okex => &MarketKind::ALL,
@@ -1145,6 +1157,7 @@ impl TickersTable {
         selected_tickers: Option<&'a [TickerInfo]>,
         base_ticker: Option<TickerInfo>,
         underlying_filter: Option<exchange::options::OptionsUnderlying>,
+        supported_options_only: bool,
     ) -> Element<'a, M>
     where
         M: 'a + Clone,
@@ -1165,9 +1178,7 @@ impl TickersTable {
 
         let (mut fav_rows, mut rest_rows) = self.filtered_rows_compact(&injected_q, &selected_set);
         let compatible = |row: &&TickerRowData| {
-            underlying_filter.is_none_or(|underlying| {
-                exchange::options::resolve_options_underlying(row.ticker) == Some(underlying)
-            })
+            matches_options_filter(row.ticker, underlying_filter, supported_options_only)
         };
         fav_rows.retain(compatible);
         rest_rows.retain(compatible);
@@ -1831,5 +1842,32 @@ impl StatsFetchState {
             1 => "..",
             _ => "...",
         }
+    }
+}
+
+#[cfg(test)]
+mod options_filter_tests {
+    use super::*;
+    use exchange::options::OptionsUnderlying;
+
+    fn ticker(symbol: &str) -> Ticker {
+        Ticker::new(symbol, Exchange::BinanceLinear)
+    }
+
+    #[test]
+    fn gex_selector_only_accepts_supported_underlyings() {
+        assert!(matches_options_filter(ticker("BTCUSDT"), None, true));
+        assert!(matches_options_filter(ticker("ETHUSDT"), None, true));
+        assert!(!matches_options_filter(ticker("SOLUSDT"), None, true));
+        assert!(matches_options_filter(
+            ticker("BTCUSDT"),
+            Some(OptionsUnderlying::Btc),
+            false
+        ));
+        assert!(!matches_options_filter(
+            ticker("ETHUSDT"),
+            Some(OptionsUnderlying::Btc),
+            false
+        ));
     }
 }

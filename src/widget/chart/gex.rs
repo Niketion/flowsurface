@@ -948,17 +948,23 @@ impl canvas::Program<gex::Message> for GexProfileTable<'_> {
                 .with_color(palette.background.base.text.scale_alpha(0.7))
                 .with_width(1.2),
         );
+        let table = frame.into_geometry();
         if let (Some(index), Some(point)) = (hovered, cursor.position_in(bounds)) {
+            // Keep the hover card in its own geometry so its background and
+            // text are composited after every table label and reference band.
+            let mut overlay = canvas::Frame::new(renderer, bounds.size());
             draw_hover(
-                &mut frame,
+                &mut overlay,
                 bounds.size(),
                 point,
                 &self.strikes[index],
                 self.snapshot.source_spot,
                 palette,
             );
+            vec![table, overlay.into_geometry()]
+        } else {
+            vec![table]
         }
-        vec![frame.into_geometry()]
     }
 }
 
