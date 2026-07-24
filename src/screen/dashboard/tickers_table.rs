@@ -340,6 +340,10 @@ impl TickersTable {
         Subscription::batch([stats_fetch, debounce_tick])
     }
 
+    pub fn is_metadata_loading(&self) -> bool {
+        self.metadata_fetch_state.has_any_in_flight()
+    }
+
     fn selected_stats_fetch_task(&mut self) -> Option<Task<Message>> {
         let selected_venues = self
             .tickers_info
@@ -1615,6 +1619,10 @@ impl MetadataFetchState {
 
     fn is_in_flight(&self, venue: Venue) -> bool {
         self.in_flight_venues.contains(&venue)
+    }
+
+    fn has_any_in_flight(&self) -> bool {
+        !self.in_flight_venues.is_empty()
     }
 
     fn tick_loading_phase(&mut self) {

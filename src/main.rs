@@ -202,9 +202,9 @@ impl Flowsurface {
                 let dashboard = self.active_dashboard_mut();
 
                 match event {
-                    exchange::Event::Connected(_exchange) => {}
-                    exchange::Event::Disconnected(exchange, reason) => {
-                        log::info!("a stream disconnected from {exchange} WS: {reason:?}");
+                    exchange::Event::Connected(_streams) => {}
+                    exchange::Event::Disconnected(_streams, reason) => {
+                        log::info!("a stream disconnected from WS: {reason:?}");
                     }
                     exchange::Event::DepthReceived(stream, update_t, depth) => {
                         let task = dashboard
@@ -360,15 +360,6 @@ impl Flowsurface {
                         Some(dashboard::Event::ResolveStreams { pane_id, streams }) => {
                             let tickers_info = self.sidebar.tickers_info();
 
-                            let has_any_ticker_info =
-                                tickers_info.values().any(|opt| opt.is_some());
-                            if !has_any_ticker_info {
-                                log::debug!(
-                                    "Deferring persisted stream resolution for pane {pane_id}: ticker metadata not loaded yet"
-                                );
-                                return Task::none();
-                            }
-
                             let resolved_streams =
                                 streams.into_iter().try_fold(vec![], |mut acc, persist| {
                                     let resolver = |t: &exchange::Ticker| {
@@ -380,9 +371,7 @@ impl Flowsurface {
                                             acc.append(&mut resolved);
                                             Ok(acc)
                                         }
-                                        Err(err) => Err(format!(
-                                            "Persisted stream still not resolvable: {err}"
-                                        )),
+                                        Err(err) => Err(err),
                                     }
                                 });
 
@@ -400,8 +389,19 @@ impl Flowsurface {
                                     }
                                 }
                                 Err(err) => {
-                                    // This is typically a transient state (e.g. partial metadata, stale symbol)
-                                    log::debug!("{err}");
+                                    if self.sidebar.is_metadata_loading() {
+                                        // Metadata fetches are still in flight
+                                        log::debug!(
+                                            "Deferring stream resolution for pane {pane_id}: metadata still loading ({err})"
+                                        );
+                                    } else {
+                                        log::debug!("Blocking streams for pane {pane_id}: {err}");
+                                        dashboard.block_streams(
+                                            main_window.id,
+                                            pane_id,
+                                            format!("Metadata not available: {err}"),
+                                        );
+                                    }
                                     Task::none()
                                 }
                             }

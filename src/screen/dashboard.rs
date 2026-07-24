@@ -295,11 +295,12 @@ impl Dashboard {
                                         }
 
                                         if let Some(cluster_kind) = &clusters_cfg
-                                            && let pane::Content::Kline { chart, .. } =
+                                            && let pane::Content::Kline { chart, kind, .. } =
                                                 &mut state.content
                                             && let Some(c) = chart
                                         {
                                             c.set_cluster_kind(*cluster_kind);
+                                            *kind = c.kind.clone();
                                         }
                                     }
                                 });
@@ -1206,6 +1207,26 @@ impl Dashboard {
             state.streams = ResolvedStream::Ready(streams.clone());
         }
         self.refresh_streams(main_window)
+    }
+
+    pub fn block_streams(&mut self, main_window: window::Id, pane_id: uuid::Uuid, reason: String) {
+        if let Some(state) = self.get_mut_pane_state_by_uuid(main_window, pane_id) {
+            match &mut state.streams {
+                ResolvedStream::Waiting { streams, .. } => {
+                    state.streams = ResolvedStream::Blocked {
+                        streams: streams.clone(),
+                        reason,
+                        last_attempt: None,
+                    };
+                }
+                ResolvedStream::Blocked {
+                    reason: old_reason, ..
+                } => {
+                    *old_reason = reason;
+                }
+                _ => {}
+            }
+        }
     }
 
     pub fn market_subscriptions(&self, handles: &AdapterHandles) -> Subscription<exchange::Event> {
