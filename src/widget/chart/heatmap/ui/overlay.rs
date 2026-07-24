@@ -508,15 +508,19 @@ impl<'a> canvas::Program<Message> for OverlayCanvas<'a> {
                     rel_y_bin <= 0
                 };
 
-                for col_idx in 0..4 {
+                let columns = TOOLTIP_COL_OFFSETS
+                    .iter()
+                    .copied()
+                    .map(Some)
+                    .chain(std::iter::once(None));
+                for (col_idx, time_offset) in columns.enumerate() {
                     let cell_pos = Point::new(
                         layout.rect.x + (col_idx as f32) * (layout.cell_w + layout.col_gap),
                         layout.rect.y + (row_idx as f32) * layout.cell_h,
                     );
                     let cell_size = iced::Size::new(layout.cell_w, layout.cell_h);
 
-                    if col_idx < 3 {
-                        let dx = TOOLTIP_COL_OFFSETS[col_idx];
+                    if let Some(dx) = time_offset {
                         let bucket = base_bucket_abs.saturating_add(dx);
                         let x_ring = self.depth_grid.ring_x_for_bucket(bucket) as i64;
                         if x_ring < 0 || x_ring >= tex_w {
@@ -547,22 +551,22 @@ impl<'a> canvas::Program<Message> for OverlayCanvas<'a> {
                         let qty: f32 = (qty_u32 as f32) / self.qty_scale;
                         let t = (qty / denom).clamp(0.0, 1.0);
 
-                        if t > 0.70 {
-                            if let Some(base_price) = self.base_price {
-                                let steps_per_y_bin = self.scene.params.steps_per_y_bin();
-                                let price =
-                                    base_price.add_steps(rel_y_bin * steps_per_y_bin, self.step);
-                                let aggr_time_ms = self.depth_grid.aggr_time_ms();
-                                let t_ms = bucket.saturating_mul(aggr_time_ms as i64);
-                                let time_str = self
-                                    .timezone
-                                    .format_with_kind(
-                                        t_ms,
-                                        TimeLabelKind::Crosshair { show_millis: true },
-                                    )
-                                    .unwrap_or_else(|| "N/A".to_string());
-                                high_density_spots.push((price, qty, t, time_str));
-                            }
+                        if t > 0.70
+                            && let Some(base_price) = self.base_price
+                        {
+                            let steps_per_y_bin = self.scene.params.steps_per_y_bin();
+                            let price =
+                                base_price.add_steps(rel_y_bin * steps_per_y_bin, self.step);
+                            let aggr_time_ms = self.depth_grid.aggr_time_ms();
+                            let t_ms = bucket.saturating_mul(aggr_time_ms as i64);
+                            let time_str = self
+                                .timezone
+                                .format_with_kind(
+                                    t_ms,
+                                    TimeLabelKind::Crosshair { show_millis: true },
+                                )
+                                .unwrap_or_else(|| "N/A".to_string());
+                            high_density_spots.push((price, qty, t, time_str));
                         }
 
                         let bg_color = viridis_color(t);
@@ -591,36 +595,33 @@ impl<'a> canvas::Program<Message> for OverlayCanvas<'a> {
                             font: crate::style::AZERET_MONO,
                             ..canvas::Text::default()
                         });
-                    } else {
-                        if let Some(base_price) = self.base_price {
-                            let steps_per_y_bin = self.scene.params.steps_per_y_bin();
-                            let price =
-                                base_price.add_steps(rel_y_bin * steps_per_y_bin, self.step);
-                            let price_str = price.to_string(self.label_precision);
+                    } else if let Some(base_price) = self.base_price {
+                        let steps_per_y_bin = self.scene.params.steps_per_y_bin();
+                        let price = base_price.add_steps(rel_y_bin * steps_per_y_bin, self.step);
+                        let price_str = price.to_string(self.label_precision);
 
-                            let text_color = if is_bid_level {
-                                palette.success.strong.color
-                            } else {
-                                palette.danger.strong.color
-                            };
+                        let text_color = if is_bid_level {
+                            palette.success.strong.color
+                        } else {
+                            palette.danger.strong.color
+                        };
 
-                            frame.fill_rectangle(
-                                cell_pos,
-                                cell_size,
-                                palette.background.weakest.color.scale_alpha(0.3),
-                            );
+                        frame.fill_rectangle(
+                            cell_pos,
+                            cell_size,
+                            palette.background.weakest.color.scale_alpha(0.3),
+                        );
 
-                            frame.fill_text(canvas::Text {
-                                content: price_str,
-                                position: layout.cell_center(row_idx, col_idx),
-                                size: iced::Pixels(crate::style::text_size::TINY),
-                                color: text_color.scale_alpha(0.95),
-                                align_x: Alignment::Center.into(),
-                                align_y: Alignment::Center.into(),
-                                font: crate::style::AZERET_MONO,
-                                ..canvas::Text::default()
-                            });
-                        }
+                        frame.fill_text(canvas::Text {
+                            content: price_str,
+                            position: layout.cell_center(row_idx, col_idx),
+                            size: iced::Pixels(crate::style::text_size::TINY),
+                            color: text_color.scale_alpha(0.95),
+                            align_x: Alignment::Center.into(),
+                            align_y: Alignment::Center.into(),
+                            font: crate::style::AZERET_MONO,
+                            ..canvas::Text::default()
+                        });
                     }
                 }
             }
@@ -1172,13 +1173,13 @@ impl<'a> OverlayCanvas<'a> {
 
 fn viridis_color(t: f32) -> iced::Color {
     let t = t.clamp(0.0, 1.0);
-    let c0 = [0.2777273272234177, 0.005407344544966578, 0.3340998053353061];
-    let c1 = [0.1050930431085774, 1.404613529898575, 1.384590162594685];
-    let c2 = [-0.3308618287255563, 0.214847559468213, 0.09509516302823659];
-    let c3 = [-4.634230498983486, -5.799100973351585, -19.33244095627987];
-    let c4 = [6.228269936347081, 14.17993336680509, 56.69055260068105];
-    let c5 = [4.776384997670288, -13.74514537774601, -65.35303263337234];
-    let c6 = [-5.435455855934631, 4.645852612178535, 26.3124352495832];
+    let c0: [f32; 3] = [0.277_727_34, 0.005_407_344_5, 0.334_099_8];
+    let c1: [f32; 3] = [0.105_093_04, 1.404_613_5, 1.384_590_1];
+    let c2: [f32; 3] = [-0.330_861_84, 0.214_847_56, 0.095_095_165];
+    let c3: [f32; 3] = [-4.634_230_6, -5.799_101, -19.332_441];
+    let c4: [f32; 3] = [6.228_27, 14.179_934, 56.690_55];
+    let c5: [f32; 3] = [4.776_385, -13.745_146, -65.353_035];
+    let c6: [f32; 3] = [-5.435_456, 4.645_852_6, 26.312_435];
 
     let mut color = [0.0; 3];
     for i in 0..3 {
