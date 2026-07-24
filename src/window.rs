@@ -30,6 +30,7 @@ struct WorkArea {
 }
 
 impl WorkArea {
+    #[cfg(any(target_os = "windows", test))]
     fn from_physical(left: i32, top: i32, right: i32, bottom: i32, scale: f32) -> Self {
         let scale = if scale.is_finite() && scale > 0.0 {
             scale
