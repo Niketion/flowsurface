@@ -78,6 +78,12 @@ jobs:
       tag: ${{ steps.release.outputs.tag }}
 
     steps:
+      - name: Checkout repository history
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          fetch-tags: true
+
       - name: Create draft prerelease
         id: release
         env:
@@ -86,15 +92,59 @@ jobs:
         run: |
           short_sha="${GITHUB_SHA::7}"
           tag="develop-${short_sha}"
+          notes_file="${RUNNER_TEMP}/develop-release-notes.md"
           echo "tag=${tag}" >> "$GITHUB_OUTPUT"
 
+          previous_tag=""
+          while IFS= read -r candidate; do
+            if [ "$candidate" = "$tag" ]; then
+              continue
+            fi
+
+            if git rev-parse --verify --quiet "refs/tags/${candidate}^{commit}" >/dev/null && \
+               git merge-base --is-ancestor "$candidate" "$GITHUB_SHA"; then
+              previous_tag="$candidate"
+              break
+            fi
+          done < <(
+            gh release list \
+              --limit 100 \
+              --json tagName,isDraft,isPrerelease \
+              --jq '.[] | select(.isDraft == false and .isPrerelease == true and (.tagName | startswith("develop-"))) | .tagName'
+          )
+
+          {
+            echo "Automated multi-platform prerelease from the develop branch at commit [\`${short_sha}\`](https://github.com/${GH_REPO}/commit/${GITHUB_SHA})."
+            echo
+
+            if [ -n "$previous_tag" ]; then
+              echo "## Changes since [\`${previous_tag}\`](https://github.com/${GH_REPO}/releases/tag/${previous_tag})"
+              echo
+              git log "${previous_tag}..${GITHUB_SHA}" \
+                --pretty=format:'- [`%h`](https://github.com/'"${GH_REPO}"'/commit/%H) %s'
+              echo
+              echo
+              echo "[View full diff](https://github.com/${GH_REPO}/compare/${previous_tag}...${GITHUB_SHA})"
+            else
+              echo "## Changes"
+              echo
+              echo "No previous published develop build was found."
+              echo
+              git log -1 "$GITHUB_SHA" \
+                --pretty=format:'- [`%h`](https://github.com/'"${GH_REPO}"'/commit/%H) %s'
+              echo
+            fi
+          } > "$notes_file"
+
           if gh release view "$tag" >/dev/null 2>&1; then
-            echo "Release ${tag} already exists; it will be updated."
+            gh release edit "$tag" \
+              --title "Develop build ${short_sha}" \
+              --notes-file "$notes_file"
           else
             gh release create "$tag" \
               --target "$GITHUB_SHA" \
               --title "Develop build ${short_sha}" \
-              --notes "Automated multi-platform prerelease from the develop branch at commit ${GITHUB_SHA}." \
+              --notes-file "$notes_file" \
               --draft \
               --prerelease
           fi
