@@ -284,6 +284,17 @@ impl WsSession {
                 let disconnect_reason = loop {
                     tokio::select! {
                         biased;
+                        // Raw trade streams can remain continuously ready on active symbols.
+                        // Service the batching timer first so detector traffic cannot starve
+                        // legacy TradesReceived events used by bubbles, footprint and CVD.
+                        _ = &mut tick_sleep => {
+                            for event in adapter.on_tick().await {
+                                let _ = event_tx.send(event);
+                            }
+                            tick_sleep
+                                .as_mut()
+                                .reset(tokio::time::Instant::now() + tick_interval);
+                        }
                         frame = frame_rx.next() => {
                             let mut disconnect_reason: Option<String> = None;
 
@@ -352,14 +363,6 @@ impl WsSession {
                             if let Some(reason) = disconnect_reason {
                                 break Some(reason);
                             }
-                        }
-                        _ = &mut tick_sleep => {
-                            for event in adapter.on_tick().await {
-                                let _ = event_tx.send(event);
-                            }
-                            tick_sleep
-                                .as_mut()
-                                .reset(tokio::time::Instant::now() + tick_interval);
                         }
                         _ = &mut stability_timer, if !is_stable => {
                             is_stable = true;
@@ -778,6 +781,10 @@ impl TradeBuffer {
 
     pub(super) fn push(&mut self, ticker: Ticker, trade: Trade) {
         self.buffer_map.entry(ticker).or_default().push(trade);
+    }
+
+    pub(super) fn ticker_infos(&self) -> impl Iterator<Item = TickerInfo> + '_ {
+        self.ticker_info_map.values().map(|(info, _)| *info)
     }
 
     /// Drain all buffered trades, clearing internal buffers.

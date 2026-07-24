@@ -1,0 +1,2 @@
+{"record":"reconnect","payload":{"ticker":"BTCUSDT","at":1720000000300}}
+{"record":"gap","payload":{"expected_pu":104,"received_pu":109,"at":1720000000310}}

@@ -75,5 +75,12 @@ iced_wgpu = "0.14.0"
 exchange.workspace = true
 data.workspace = true
 
+[target.'cfg(target_os = "windows")'.dependencies]
+windows-sys = { version = "0.61.2", features = [
+    "Win32_Foundation",
+    "Win32_Graphics_Gdi",
+    "Win32_UI_HiDpi",
+] }
+
 [features]
 debug = ["iced/hot"]

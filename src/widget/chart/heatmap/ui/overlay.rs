@@ -5,6 +5,7 @@ use crate::widget::chart::heatmap::scene::depth_grid::GridRing;
 use crate::widget::chart::heatmap::ui;
 use crate::widget::chart::heatmap::view;
 
+use data::orderflow::iceberg::{IcebergEvent, IcebergSide};
 use data::util::abbr_large_numbers;
 use exchange::unit::Qty;
 use exchange::unit::{Price, PriceStep};
@@ -156,6 +157,10 @@ pub struct OverlayCanvas<'a> {
     pub volume_profile_max_qty: Option<Qty>,
 
     pub is_paused: bool,
+    pub iceberg_events: &'a std::collections::VecDeque<IcebergEvent>,
+    pub show_icebergs: bool,
+    pub aggr_time_ms: u64,
+    pub y_anchor: Option<Price>,
 }
 
 impl<'a> canvas::Program<Message> for OverlayCanvas<'a> {
@@ -205,6 +210,41 @@ impl<'a> canvas::Program<Message> for OverlayCanvas<'a> {
             .scale_labels_cache
             .draw(renderer, bounds.size(), |frame| {
                 let palette = theme.extended_palette();
+
+                if self.show_icebergs {
+                    for event in self.iceberg_events {
+                        let Some(point) = self.event_screen_position(event, bounds) else {
+                            continue;
+                        };
+                        if !(0.0..=bounds.width).contains(&point.x)
+                            || !(0.0..=bounds.height).contains(&point.y)
+                        {
+                            continue;
+                        }
+                        let size = (4.0 + f32::from(event.score) / 20.0).min(9.0);
+                        let mut color = match event.side {
+                            IcebergSide::PossibleBuy => palette.success.strong.color,
+                            IcebergSide::PossibleSell => palette.danger.strong.color,
+                        };
+                        color.a *= match event.data_quality {
+                            exchange::orderflow::OrderFlowDataQuality::Healthy => 0.95,
+                            exchange::orderflow::OrderFlowDataQuality::Degraded => 0.55,
+                            exchange::orderflow::OrderFlowDataQuality::Synchronizing
+                            | exchange::orderflow::OrderFlowDataQuality::Gap => 0.25,
+                        };
+                        let direction = if event.side == IcebergSide::PossibleBuy {
+                            -1.0
+                        } else {
+                            1.0
+                        };
+                        let mut builder = canvas::path::Builder::new();
+                        builder.move_to(Point::new(point.x, point.y + direction * size));
+                        builder.line_to(Point::new(point.x - size, point.y - direction * size));
+                        builder.line_to(Point::new(point.x + size, point.y - direction * size));
+                        builder.close();
+                        frame.fill(&builder.build(), color);
+                    }
+                }
 
                 if self.is_paused {
                     self.draw_paused_control(frame, theme, bounds, cursor);
@@ -323,6 +363,16 @@ impl<'a> canvas::Program<Message> for OverlayCanvas<'a> {
         }
 
         let tooltip = self.tooltip_cache.draw(renderer, bounds.size(), |frame| {
+            let cursor_local = Point::new(pos.x - bounds.x, pos.y - bounds.y);
+            if self.show_icebergs
+                && let Some(event) = self.iceberg_events.iter().find(|event| {
+                    self.event_screen_position(event, bounds)
+                        .is_some_and(|point| point.distance(cursor_local) <= 14.0)
+                })
+            {
+                self.draw_iceberg_tooltip(frame, theme, bounds, cursor_local, event);
+                return;
+            }
             let cell_width = self.scene.cell.width_world();
             let cell_height = self.scene.cell.height_world();
 
@@ -506,6 +556,112 @@ impl<'a> canvas::Program<Message> for OverlayCanvas<'a> {
 }
 
 impl<'a> OverlayCanvas<'a> {
+    fn event_screen_position(&self, event: &IcebergEvent, bounds: Rectangle) -> Option<Point> {
+        let base_price = self.base_price?;
+        if self.aggr_time_ms == 0 {
+            return None;
+        }
+        let bucket = i64::try_from(event.confirmed_at.as_u64() / self.aggr_time_ms).ok()?;
+        let relative_bucket = bucket.saturating_sub(self.scroll_ref_bucket);
+        let world_x =
+            (relative_bucket as f32 - self.scene.params.origin_x()) * self.scene.cell.width_world();
+        let step_units = self.step.units.max(1);
+        let steps_per_bin = self.scene.params.steps_per_y_bin().max(1);
+        let relative_bin = if let Some(anchor) = self.y_anchor {
+            ((event.price.units - anchor.units).div_euclid(step_units) / steps_per_bin)
+                - ((base_price.units - anchor.units).div_euclid(step_units) / steps_per_bin)
+        } else {
+            (event.price.units - base_price.units).div_euclid(step_units) / steps_per_bin
+        };
+        let world_y = -((relative_bin as f32 + 0.5) * self.scene.cell.height_world());
+        Some(Point::new(
+            self.scene.camera.world_to_screen_x(world_x, bounds.width),
+            self.scene
+                .camera
+                .world_to_screen_y(world_y, bounds.width, bounds.height),
+        ))
+    }
+
+    fn draw_iceberg_tooltip(
+        &self,
+        frame: &mut canvas::Frame,
+        theme: &Theme,
+        bounds: Rectangle,
+        cursor: Point,
+        event: &IcebergEvent,
+    ) {
+        let palette = theme.extended_palette();
+        let width = 350.0;
+        let height = 218.0;
+        let x = if cursor.x + width + 12.0 > bounds.width {
+            cursor.x - width - 12.0
+        } else {
+            cursor.x + 12.0
+        }
+        .max(4.0);
+        let y = (cursor.y - height / 2.0).clamp(4.0, (bounds.height - height - 4.0).max(4.0));
+        frame.fill_rectangle(
+            Point::new(x, y),
+            iced::Size::new(width, height),
+            palette.background.weakest.color.scale_alpha(0.96),
+        );
+        let title = match event.side {
+            IcebergSide::PossibleBuy => "Possible Buy Iceberg · Binance",
+            IcebergSide::PossibleSell => "Possible Sell Iceberg · Binance",
+        };
+        let aggressive = match event.side {
+            IcebergSide::PossibleBuy => "Aggressive sells",
+            IcebergSide::PossibleSell => "Aggressive buys",
+        };
+        let lines = [
+            title.to_string(),
+            format!("Price                     {:.8}", event.price.to_f64()),
+            format!("Score                     {} / 100", event.score),
+            format!(
+                "{aggressive:<25}{:.8}",
+                event.aggressive_executed_qty.to_f64()
+            ),
+            format!(
+                "Peak displayed            {:.8}",
+                event.peak_displayed_qty.to_f64()
+            ),
+            format!(
+                "Executed / displayed      {:.2}×",
+                event.executed_to_displayed
+            ),
+            format!(
+                "Replenished               {:.8}",
+                event.replenished_qty.to_f64()
+            ),
+            format!("Refill cycles              {}", event.refill_count),
+            format!(
+                "Median refill latency     {}",
+                event
+                    .median_refill_latency_ms
+                    .map_or("-".to_string(), |value| format!("{value} ms"))
+            ),
+            format!(
+                "Adverse movement           {} ticks",
+                event.maximum_adverse_ticks
+            ),
+            format!(
+                "Hidden lower bound        {:.8}",
+                event.hidden_lower_bound_qty.to_f64()
+            ),
+            format!("Data quality              {:?}", event.data_quality),
+        ];
+        for (index, line) in lines.into_iter().enumerate() {
+            frame.fill_text(canvas::Text {
+                content: line,
+                position: Point::new(x + 10.0, y + 10.0 + index as f32 * 16.5),
+                size: iced::Pixels(if index == 0 { 12.0 } else { 10.5 }),
+                color: palette.background.base.text,
+                font: style::AZERET_MONO,
+                ..canvas::Text::default()
+            });
+        }
+    }
+
     fn paused_control_contains(&self, bounds: Rectangle, point_abs: Point) -> bool {
         ui::paused_control_rect(bounds).contains(point_abs)
     }

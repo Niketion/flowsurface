@@ -1,8 +1,8 @@
 use super::market_data::{DataRequirement, DataSet, RefreshPolicy, RequestKey, TimeRange};
 use super::persistent_cache::{MarketDataCache, market_cache, merge_bubble_summaries};
-use data::chart::kline::{BubbleCandidate, BubbleVolumeSummary};
+use data::chart::kline::{BubbleVolumeSummary, VolumeBubbleConfig, cluster_volume_bubble_trades};
 use exchange::adapter::{AdapterError, AdapterHandles, Exchange, StreamKind};
-use exchange::unit::{Price, PriceStep, Qty};
+use exchange::unit::PriceStep;
 use exchange::{Kline, OpenInterest, TickerInfo, Timeframe, Trade, UnixMs};
 use iced::{
     Task,
@@ -1004,6 +1004,8 @@ pub enum FetchRange {
         timeframe_ms: u64,
         price_step: PriceStep,
         max_candidates_per_candle: usize,
+        cluster_window_ms: u32,
+        cluster_price_ticks: u32,
     },
 }
 
@@ -1119,6 +1121,8 @@ impl FetchRequest {
                     timeframe_ms: t1,
                     price_step: p1,
                     max_candidates_per_candle: m1,
+                    cluster_window_ms: cw1,
+                    cluster_price_ticks: cp1,
                 },
                 FetchRange::BubbleSummary {
                     from: s2,
@@ -1126,8 +1130,12 @@ impl FetchRequest {
                     timeframe_ms: t2,
                     price_step: p2,
                     max_candidates_per_candle: m2,
+                    cluster_window_ms: cw2,
+                    cluster_price_ticks: cp2,
                 },
-            ) => e1 == e2 && s1 == s2 && t1 == t2 && p1 == p2 && m1 == m2,
+            ) => {
+                e1 == e2 && s1 == s2 && t1 == t2 && p1 == p2 && m1 == m2 && cw1 == cw2 && cp1 == cp2
+            }
             _ => false,
         }
     }
@@ -1506,6 +1514,8 @@ pub fn request_fetch(
             timeframe_ms,
             price_step,
             max_candidates_per_candle,
+            cluster_window_ms,
+            cluster_price_ticks,
         } => {
             let kline_info = if let Some(
                 kline_stream @ StreamKind::Kline {
@@ -1560,6 +1570,8 @@ pub fn request_fetch(
                         timeframe_ms,
                         price_step,
                         max_candidates_per_candle,
+                        cluster_window_ms,
+                        cluster_price_ticks,
                         data_path,
                     );
                 }
@@ -1610,6 +1622,8 @@ fn bubble_summary_fetch_task(
     timeframe_ms: u64,
     price_step: PriceStep,
     max_candidates_per_candle: usize,
+    cluster_window_ms: u32,
+    cluster_price_ticks: u32,
     data_path: PathBuf,
 ) -> Task<FetchUpdate> {
     let update_status = Task::done(FetchUpdate::Status {
@@ -1626,6 +1640,8 @@ fn bubble_summary_fetch_task(
             timeframe_ms,
             price_step,
             max_candidates_per_candle,
+            cluster_window_ms,
+            cluster_price_ticks,
             data_path,
         )
         .await
@@ -1655,6 +1671,8 @@ fn bubble_summary_fetch_task(
                 timeframe_ms,
                 price_step,
                 max_candidates_per_candle,
+                cluster_window_ms,
+                cluster_price_ticks,
             }),
         },
     }))
@@ -2358,39 +2376,6 @@ pub fn fetch_trades_batched(
     })
 }
 
-#[derive(Debug, Clone, Copy, Default)]
-struct BubbleBucketAccum {
-    buy_qty: Qty,
-    sell_qty: Qty,
-    trade_count: usize,
-    first_time: Option<UnixMs>,
-    last_time: Option<UnixMs>,
-}
-
-impl BubbleBucketAccum {
-    fn add_trade(&mut self, trade: &Trade) {
-        if trade.is_sell {
-            self.sell_qty += trade.qty;
-        } else {
-            self.buy_qty += trade.qty;
-        }
-
-        self.trade_count += 1;
-        self.first_time = Some(
-            self.first_time
-                .map_or(trade.time, |first| first.min(trade.time)),
-        );
-        self.last_time = Some(
-            self.last_time
-                .map_or(trade.time, |last| last.max(trade.time)),
-        );
-    }
-
-    fn total_qty(self) -> Qty {
-        self.buy_qty + self.sell_qty
-    }
-}
-
 #[allow(clippy::too_many_arguments)]
 async fn fetch_bubble_summaries_cached(
     handles: AdapterHandles,
@@ -2400,6 +2385,8 @@ async fn fetch_bubble_summaries_cached(
     timeframe_ms: u64,
     price_step: PriceStep,
     max_candidates_per_candle: usize,
+    cluster_window_ms: u32,
+    cluster_price_ticks: u32,
     data_path: PathBuf,
 ) -> Result<(Vec<BubbleVolumeSummary>, usize, usize), AdapterError> {
     let to_exclusive = to_time.saturating_add(1);
@@ -2412,6 +2399,8 @@ async fn fetch_bubble_summaries_cached(
             timeframe_ms,
             price_step,
             max_candidates_per_candle,
+            cluster_window_ms,
+            cluster_price_ticks,
             data_path,
         )
         .await?;
@@ -2423,6 +2412,8 @@ async fn fetch_bubble_summaries_cached(
         timeframe_ms,
         price_step.units,
         max_candidates_per_candle,
+        cluster_window_ms,
+        cluster_price_ticks,
         from_time,
         to_exclusive,
     );
@@ -2447,6 +2438,8 @@ async fn fetch_bubble_summaries_cached(
                 timeframe_ms,
                 price_step,
                 max_candidates_per_candle,
+                cluster_window_ms,
+                cluster_price_ticks,
                 data_path.clone(),
             )
             .await?;
@@ -2473,6 +2466,8 @@ async fn fetch_bubble_summaries_cached(
             timeframe_ms,
             price_step.units,
             max_candidates_per_candle,
+            cluster_window_ms,
+            cluster_price_ticks,
             verified_from,
             verified_to_exclusive,
             &verified_summaries,
@@ -2497,6 +2492,8 @@ async fn fetch_bubble_summaries(
     timeframe_ms: u64,
     price_step: PriceStep,
     max_candidates_per_candle: usize,
+    cluster_window_ms: u32,
+    cluster_price_ticks: u32,
     data_path: PathBuf,
 ) -> Result<(Vec<BubbleVolumeSummary>, usize, usize, UnixMs), AdapterError> {
     let venue = format_venue(&ticker_info);
@@ -2507,7 +2504,7 @@ async fn fetch_bubble_summaries(
     let mut trades_seen = 0usize;
     let mut raw_discarded = 0usize;
     let mut last_trade_id = None;
-    let mut buckets: FxHashMap<(UnixMs, Price), BubbleBucketAccum> = FxHashMap::default();
+    let mut buckets: FxHashMap<UnixMs, Vec<Trade>> = FxHashMap::default();
 
     log::info!(
         "CHART Bubbles | action=fetch_summary venue={venue} symbol={symbol} range={} timeframe_ms={} max_candidates={max_candidates_per_candle}",
@@ -2527,7 +2524,7 @@ async fn fetch_bubble_summaries(
             log::warn!(
                 "BUBBLE Summary Batch | trades_seen={trades_seen} buckets={} retained_candidates={} reason=empty_batch",
                 buckets.len(),
-                retained_bubble_candidate_count(&buckets)
+                buckets.values().map(Vec::len).sum::<usize>()
             );
             break;
         }
@@ -2544,11 +2541,7 @@ async fn fetch_bubble_summaries(
         for trade in &batch {
             let candle_time =
                 UnixMs::new(trade.time.as_u64() - (trade.time.as_u64() % timeframe_ms));
-            let price = trade.price.round_to_step(price_step);
-            buckets
-                .entry((candle_time, price))
-                .or_default()
-                .add_trade(trade);
+            buckets.entry(candle_time).or_default().push(*trade);
         }
 
         trades_seen += batch.len();
@@ -2561,12 +2554,10 @@ async fn fetch_bubble_summaries(
                 .collect::<Vec<_>>();
             cache.store_trades(ticker_info, request_from, cache_to_exclusive, &cache_batch);
         }
-        retain_top_bubble_buckets(&mut buckets, max_candidates_per_candle);
-
         log::debug!(
             "BUBBLE Summary Batch | trades_seen={trades_seen} buckets={} retained_candidates={} request_idx={request_count} first={} last={} duration={}",
             buckets.len(),
-            retained_bubble_candidate_count(&buckets),
+            buckets.values().map(Vec::len).sum::<usize>(),
             format_optional_time(batch.first().map(|trade| trade.time)),
             format_optional_time(batch.last().map(|trade| trade.time)),
             format_duration_ms(batch_started.elapsed().as_millis() as u64)
@@ -2582,7 +2573,19 @@ async fn fetch_bubble_summaries(
         }
     }
 
-    let summaries = bubble_summaries_from_buckets(buckets, max_candidates_per_candle);
+    let mut bubble_config = VolumeBubbleConfig {
+        cluster_window_ms,
+        cluster_price_ticks,
+        ..VolumeBubbleConfig::default()
+    };
+    bubble_config.max_candidates_per_candle = max_candidates_per_candle;
+    let summaries = bubble_summaries_from_buckets(
+        buckets,
+        timeframe_ms,
+        price_step,
+        max_candidates_per_candle,
+        &bubble_config,
+    );
     let candidate_count = summaries
         .iter()
         .map(|summary| summary.candidates.len())
@@ -2607,77 +2610,23 @@ async fn fetch_bubble_summaries(
     Ok((summaries, trades_seen, raw_discarded, verified_to_exclusive))
 }
 
-fn retained_bubble_candidate_count(
-    buckets: &FxHashMap<(UnixMs, Price), BubbleBucketAccum>,
-) -> usize {
-    buckets.len()
-}
-
-fn retain_top_bubble_buckets(
-    buckets: &mut FxHashMap<(UnixMs, Price), BubbleBucketAccum>,
-    max_candidates_per_candle: usize,
-) {
-    if max_candidates_per_candle == 0 {
-        buckets.clear();
-        return;
-    }
-
-    let mut by_candle: FxHashMap<UnixMs, Vec<(Price, Qty)>> = FxHashMap::default();
-    for ((candle_time, price), bucket) in buckets.iter() {
-        by_candle
-            .entry(*candle_time)
-            .or_default()
-            .push((*price, bucket.total_qty()));
-    }
-
-    let mut keep: FxHashMap<(UnixMs, Price), ()> = FxHashMap::default();
-    for (candle_time, mut entries) in by_candle {
-        entries.sort_by_key(|entry| std::cmp::Reverse(entry.1));
-        entries.truncate(max_candidates_per_candle);
-        for (price, _) in entries {
-            keep.insert((candle_time, price), ());
-        }
-    }
-
-    buckets.retain(|key, _| keep.contains_key(key));
-}
-
 fn bubble_summaries_from_buckets(
-    buckets: FxHashMap<(UnixMs, Price), BubbleBucketAccum>,
+    buckets: FxHashMap<UnixMs, Vec<Trade>>,
+    timeframe_ms: u64,
+    price_step: PriceStep,
     max_candidates_per_candle: usize,
+    config: &VolumeBubbleConfig,
 ) -> Vec<BubbleVolumeSummary> {
-    let mut grouped: FxHashMap<UnixMs, Vec<BubbleCandidate>> = FxHashMap::default();
-
-    for ((candle_time, price), bucket) in buckets {
-        let total_qty = bucket.total_qty();
-        let total = total_qty.to_f64();
-        let delta_qty = bucket.buy_qty - bucket.sell_qty;
-        let score = if total > 0.0 {
-            total * (1.0 + (delta_qty.to_f64().abs() / total).clamp(0.0, 1.0))
-        } else {
-            0.0
-        };
-
-        grouped
-            .entry(candle_time)
-            .or_default()
-            .push(BubbleCandidate {
-                candle_time,
-                price,
-                total_qty,
-                buy_qty: bucket.buy_qty,
-                sell_qty: bucket.sell_qty,
-                delta_qty,
-                trade_count: bucket.trade_count,
-                score,
-                first_time: bucket.first_time,
-                last_time: bucket.last_time,
-            });
-    }
-
-    let mut summaries = grouped
+    let mut summaries = buckets
         .into_iter()
-        .map(|(candle_time, mut candidates)| {
+        .map(|(candle_time, trades)| {
+            let mut candidates = cluster_volume_bubble_trades(
+                &trades,
+                candle_time,
+                timeframe_ms,
+                price_step,
+                config,
+            );
             candidates.sort_by_key(|candidate| std::cmp::Reverse(candidate.total_qty));
             candidates.truncate(max_candidates_per_candle);
             BubbleVolumeSummary::new(candle_time, candidates)
@@ -2778,8 +2727,8 @@ mod tests {
             id,
             time: UnixMs::new(time),
             is_sell: false,
-            price: Price::from_f64(100.0),
-            qty: Qty::from_f64(1.0),
+            price: exchange::unit::Price::from_f64(100.0),
+            qty: exchange::unit::Qty::from_f64(1.0),
         }
     }
 

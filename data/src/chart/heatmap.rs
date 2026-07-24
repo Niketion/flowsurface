@@ -17,6 +17,8 @@ pub struct Config {
     pub order_size_filter: f32,
     pub trade_size_scale: Option<i32>,
     pub coalescing: Option<CoalesceKind>,
+    #[serde(default)]
+    pub iceberg_detector: crate::orderflow::iceberg::IcebergDetectorConfig,
 }
 
 impl Default for Config {
@@ -26,6 +28,7 @@ impl Default for Config {
             order_size_filter: 0.0,
             trade_size_scale: Some(100),
             coalescing: Some(CoalesceKind::Average(0.15)),
+            iceberg_detector: crate::orderflow::iceberg::IcebergDetectorConfig::default(),
         }
     }
 }

@@ -26,6 +26,7 @@ use data::chart::{
     heatmap::{HeatmapDataPoint, HeatmapStudy, HistoricalDepth},
     indicator::HeatmapIndicator,
 };
+use data::orderflow::iceberg::IcebergEvent;
 use exchange::depth::Depth;
 use exchange::unit::{Price, PriceStep};
 use exchange::{TickerInfo, Trade, UnixMs};
@@ -106,6 +107,7 @@ pub struct HeatmapShader {
     indicators: Vec<HeatmapIndicator>,
     pub studies: Vec<HeatmapStudy>,
     pub study_configurator: study::Configurator<HeatmapStudy>,
+    iceberg_events: std::collections::VecDeque<IcebergEvent>,
 }
 
 impl HeatmapShader {
@@ -155,6 +157,7 @@ impl HeatmapShader {
             config: config.unwrap_or_default(),
             studies,
             study_configurator: study::Configurator::new(),
+            iceberg_events: std::collections::VecDeque::new(),
         }
     }
 
@@ -373,6 +376,10 @@ impl HeatmapShader {
             volume_strip_max_qty: self.instances.volume_strip_scale_max_qty,
             depth_profile_max_qty: self.instances.depth_profile_scale_max_qty,
             volume_profile_max_qty: self.instances.volume_profile_scale_max_qty,
+            iceberg_events: &self.iceberg_events,
+            show_icebergs: self.config.iceberg_detector.enabled,
+            aggr_time_ms: self.depth_history.aggr_time_ms(),
+            y_anchor: self.depth_grid.y_anchor_price(),
         };
 
         let chart = HeatmapShaderWidget::new(&self.scene, x_axis, y_axis, overlay)
@@ -494,6 +501,37 @@ impl HeatmapShader {
         self.canvas_invalidation.mark_overlay_tooltip();
         self.canvas_invalidation.mark_overlay_scale_labels();
         self.try_rebuild_instances();
+    }
+
+    pub fn insert_iceberg_event(&mut self, event: IcebergEvent) {
+        if !self.config.iceberg_detector.enabled || event.ticker_info != self.ticker_info {
+            return;
+        }
+        if let Some(existing) = self
+            .iceberg_events
+            .iter_mut()
+            .find(|existing| existing.id == event.id)
+        {
+            *existing = event;
+        } else {
+            self.iceberg_events.push_back(event);
+        }
+        let retention_ms = u64::from(self.config.iceberg_detector.retention_seconds) * 1_000;
+        let cutoff = self
+            .iceberg_events
+            .back()
+            .map(|event| event.last_updated_at.saturating_sub(retention_ms))
+            .unwrap_or_default();
+        while self
+            .iceberg_events
+            .front()
+            .is_some_and(|event| event.last_updated_at < cutoff)
+        {
+            self.iceberg_events.pop_front();
+        }
+        self.canvas_invalidation.mark_overlay_tooltip();
+        self.canvas_invalidation.mark_overlay_scale_labels();
+        self.canvas_invalidation.apply(&self.canvas_caches);
     }
 
     pub fn visual_config(&self) -> data::chart::heatmap::Config {

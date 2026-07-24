@@ -11,6 +11,7 @@ use data::chart::{
     },
     indicator::HeatmapIndicator,
 };
+use data::orderflow::iceberg::{IcebergEvent, IcebergSide};
 use data::util::abbr_large_numbers;
 use data::{
     aggr::time::{DataPoint, TimeSeries},
@@ -158,6 +159,7 @@ pub struct HeatmapChart {
     study_configurator: study::Configurator<HeatmapStudy>,
     last_tick: Instant,
     pub studies: Vec<HeatmapStudy>,
+    iceberg_events: std::collections::VecDeque<IcebergEvent>,
 }
 
 impl HeatmapChart {
@@ -202,6 +204,7 @@ impl HeatmapChart {
             study_configurator: study::Configurator::new(),
             studies,
             last_tick: Instant::now(),
+            iceberg_events: std::collections::VecDeque::new(),
         }
     }
 
@@ -287,6 +290,47 @@ impl HeatmapChart {
 
     pub fn visual_config(&self) -> Config {
         self.visual_config
+    }
+
+    pub fn insert_iceberg_event(&mut self, event: IcebergEvent) {
+        if !self.visual_config.iceberg_detector.enabled
+            || event.ticker_info != self.chart.ticker_info
+        {
+            return;
+        }
+        if let Some(existing) = self
+            .iceberg_events
+            .iter_mut()
+            .find(|existing| existing.id == event.id)
+        {
+            *existing = event;
+        } else {
+            self.iceberg_events.push_back(event);
+        }
+        let cutoff = self
+            .iceberg_events
+            .back()
+            .map(|event| {
+                event.last_updated_at.saturating_sub(
+                    u64::from(self.visual_config.iceberg_detector.retention_seconds) * 1_000,
+                )
+            })
+            .unwrap_or_default();
+        while self
+            .iceberg_events
+            .front()
+            .is_some_and(|event| event.last_updated_at < cutoff)
+        {
+            self.iceberg_events.pop_front();
+        }
+        self.invalidate(None);
+    }
+
+    pub fn detector_key(&self) -> crate::connector::iceberg::DetectorKey {
+        crate::connector::iceberg::DetectorKey {
+            ticker_info: self.chart.ticker_info,
+            tick_size: self.chart.tick_size,
+        }
     }
 
     pub fn set_visual_config(&mut self, visual_config: Config) {
@@ -689,6 +733,45 @@ impl canvas::Program<Message> for HeatmapChart {
                     }
                 });
 
+            if self.visual_config.iceberg_detector.enabled {
+                for event in self.iceberg_events.iter().filter(|event| {
+                    let time = event.confirmed_at.as_u64();
+                    time >= earliest
+                        && time <= latest
+                        && event.price >= lowest
+                        && event.price <= highest
+                }) {
+                    let x = chart.interval_to_x(event.confirmed_at.as_u64());
+                    let y = chart.price_to_y(event.price);
+                    let size = (4.0 + f32::from(event.score) / 20.0).min(9.0);
+                    let mut color = match event.side {
+                        IcebergSide::PossibleBuy => palette.success.strong.color,
+                        IcebergSide::PossibleSell => palette.danger.strong.color,
+                    };
+                    color.a *= match event.data_quality {
+                        exchange::orderflow::OrderFlowDataQuality::Healthy => 0.95,
+                        exchange::orderflow::OrderFlowDataQuality::Degraded => 0.55,
+                        exchange::orderflow::OrderFlowDataQuality::Synchronizing
+                        | exchange::orderflow::OrderFlowDataQuality::Gap => 0.25,
+                    };
+                    let mut builder = canvas::path::Builder::new();
+                    match event.side {
+                        IcebergSide::PossibleBuy => {
+                            builder.move_to(Point::new(x, y - size));
+                            builder.line_to(Point::new(x - size, y + size));
+                            builder.line_to(Point::new(x + size, y + size));
+                        }
+                        IcebergSide::PossibleSell => {
+                            builder.move_to(Point::new(x, y + size));
+                            builder.line_to(Point::new(x - size, y - size));
+                            builder.line_to(Point::new(x + size, y - size));
+                        }
+                    }
+                    builder.close();
+                    frame.fill(&builder.build(), color);
+                }
+            }
+
             if volume_indicator && max_aggr_volume > 0.0 {
                 let text_size = crate::style::text_size::TINY / chart.scaling;
                 let text_content = abbr_large_numbers(max_aggr_volume);
@@ -791,6 +874,106 @@ impl canvas::Program<Message> for HeatmapChart {
                         || matches!(interaction, Interaction::Ruler { start } if start.is_some())
                     {
                         return;
+                    }
+
+                    if self.visual_config.iceberg_detector.enabled
+                        && let Some(event) = self.iceberg_events.iter().min_by(|a, b| {
+                            let screen = |event: &IcebergEvent| {
+                                Point::new(
+                                    bounds.width / 2.0
+                                        + (chart.interval_to_x(event.confirmed_at.as_u64())
+                                            + chart.translation.x)
+                                            * chart.scaling,
+                                    bounds.height / 2.0
+                                        + (chart.price_to_y(event.price) + chart.translation.y)
+                                            * chart.scaling,
+                                )
+                            };
+                            screen(a)
+                                .distance(cursor_position)
+                                .total_cmp(&screen(b).distance(cursor_position))
+                        })
+                    {
+                        let marker = Point::new(
+                            bounds.width / 2.0
+                                + (chart.interval_to_x(event.confirmed_at.as_u64())
+                                    + chart.translation.x)
+                                    * chart.scaling,
+                            bounds.height / 2.0
+                                + (chart.price_to_y(event.price) + chart.translation.y)
+                                    * chart.scaling,
+                        );
+                        if marker.distance(cursor_position) <= 14.0 {
+                            let width = 350.0;
+                            let height = 218.0;
+                            let x = if cursor_position.x + width + 12.0 > bounds.width {
+                                cursor_position.x - width - 12.0
+                            } else {
+                                cursor_position.x + 12.0
+                            };
+                            let y = (cursor_position.y - height / 2.0)
+                                .clamp(4.0, (bounds.height - height - 4.0).max(4.0));
+                            frame.fill(
+                                &Path::rectangle(Point::new(x, y), Size::new(width, height)),
+                                palette.background.weakest.color.scale_alpha(0.96),
+                            );
+                            let title = match event.side {
+                                IcebergSide::PossibleBuy => "Possible Buy Iceberg · Binance",
+                                IcebergSide::PossibleSell => "Possible Sell Iceberg · Binance",
+                            };
+                            let aggressive = match event.side {
+                                IcebergSide::PossibleBuy => "Aggressive sells",
+                                IcebergSide::PossibleSell => "Aggressive buys",
+                            };
+                            let lines = [
+                                title.to_string(),
+                                format!("Price                     {:.8}", event.price.to_f64()),
+                                format!("Score                     {} / 100", event.score),
+                                format!(
+                                    "{aggressive:<25}{:.8}",
+                                    event.aggressive_executed_qty.to_f64()
+                                ),
+                                format!(
+                                    "Peak displayed            {:.8}",
+                                    event.peak_displayed_qty.to_f64()
+                                ),
+                                format!(
+                                    "Executed / displayed      {:.2}×",
+                                    event.executed_to_displayed
+                                ),
+                                format!(
+                                    "Replenished               {:.8}",
+                                    event.replenished_qty.to_f64()
+                                ),
+                                format!("Refill cycles              {}", event.refill_count),
+                                format!(
+                                    "Median refill latency     {}",
+                                    event
+                                        .median_refill_latency_ms
+                                        .map_or("-".to_string(), |value| format!("{value} ms"))
+                                ),
+                                format!(
+                                    "Adverse movement           {} ticks",
+                                    event.maximum_adverse_ticks
+                                ),
+                                format!(
+                                    "Hidden lower bound        {:.8}",
+                                    event.hidden_lower_bound_qty.to_f64()
+                                ),
+                                format!("Data quality              {:?}", event.data_quality),
+                            ];
+                            for (index, line) in lines.into_iter().enumerate() {
+                                frame.fill_text(canvas::Text {
+                                    content: line,
+                                    position: Point::new(x + 10.0, y + 10.0 + index as f32 * 16.5),
+                                    size: iced::Pixels(if index == 0 { 12.0 } else { 10.5 }),
+                                    color: palette.background.base.text,
+                                    font: style::AZERET_MONO,
+                                    ..canvas::Text::default()
+                                });
+                            }
+                            return;
+                        }
                     }
 
                     let interval = match chart.basis {

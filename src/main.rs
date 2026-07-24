@@ -114,6 +114,7 @@ struct Flowsurface {
     market_store: Arc<market_service::MarketStore>,
     market_diagnostics: market_service::MarketDiagnostics,
     market_connectivity: market_service::MarketConnectivity,
+    iceberg_detectors: connector::iceberg::IcebergDetectorRegistry,
     dirty_flag: render_scheduler::DirtyFlag,
     debug_terminal_enabled: bool,
     debug_terminal_window: Option<window::Id>,
@@ -521,7 +522,7 @@ fn is_app_target(target: Option<&str>) -> bool {
 impl Flowsurface {
     fn new() -> (Self, Task<Message>) {
         let load_outcome = layout::load_saved_state();
-        let (saved_state, startup_warning, save_state_enabled) = match load_outcome {
+        let (mut saved_state, startup_warning, save_state_enabled) = match load_outcome {
             layout::SavedStateLoadOutcome::Loaded(state)
             | layout::SavedStateLoadOutcome::MissingDefault(state) => (state, None, true),
             layout::SavedStateLoadOutcome::Migrated {
@@ -564,6 +565,12 @@ impl Flowsurface {
                 false,
             ),
         };
+
+        if window::recover_offscreen_position(&mut saved_state.main_window) {
+            log::warn!(
+                "WINDOW SavedPositionRecovered | reason=no_reachable_title_bar action=open_centered"
+            );
+        }
 
         let (main_window_id, open_main_window) = {
             let (position, size) = saved_state.window();
@@ -628,6 +635,7 @@ impl Flowsurface {
             market_store,
             market_diagnostics,
             market_connectivity: market_service::MarketConnectivity::new(),
+            iceberg_detectors: connector::iceberg::IcebergDetectorRegistry::default(),
             dirty_flag: render_scheduler::DirtyFlag::new(),
             debug_terminal_enabled: saved_state.debug_terminal_enabled,
             debug_terminal_window: None,
@@ -811,10 +819,49 @@ impl Flowsurface {
                     return self.apply_connectivity_transition(transition);
                 }
 
+                if let exchange::Event::OrderFlow(orderflow) = &event {
+                    let requirements = self.active_dashboard().iceberg_requirements(main_window_id);
+                    self.iceberg_detectors
+                        .sync_requirements(requirements, exchange::UnixMs::now());
+                    let visible_updates = self.iceberg_detectors.ingest(orderflow.clone());
+                    if !visible_updates.is_empty() {
+                        self.active_dashboard_mut()
+                            .ingest_iceberg_events(&visible_updates, main_window_id);
+                        self.dirty_flag.mark_dirty();
+                    }
+                    return Task::none();
+                }
+
+                if let exchange::Event::OrderFlowTrades(trades) = &event {
+                    // Raw Binance trades are batched only for transport. Their original
+                    // timestamps and IDs remain intact for deterministic detector ordering.
+                    // Syncing pane requirements once per batch also avoids traversing the
+                    // dashboard for every market trade on busy symbols.
+                    let requirements = self.active_dashboard().iceberg_requirements(main_window_id);
+                    self.iceberg_detectors
+                        .sync_requirements(requirements, exchange::UnixMs::now());
+                    let visible_updates = trades
+                        .iter()
+                        .flat_map(|trade| {
+                            self.iceberg_detectors
+                                .ingest(exchange::orderflow::OrderFlowEvent::Trade(*trade))
+                        })
+                        .collect::<Vec<_>>();
+                    if !visible_updates.is_empty() {
+                        self.active_dashboard_mut()
+                            .ingest_iceberg_events(&visible_updates, main_window_id);
+                        self.dirty_flag.mark_dirty();
+                    }
+                    return Task::none();
+                }
+
                 let dashboard = self.active_dashboard_mut();
 
                 match event {
-                    exchange::Event::Connected(..) | exchange::Event::Disconnected(..) => {
+                    exchange::Event::Connected(..)
+                    | exchange::Event::Disconnected(..)
+                    | exchange::Event::OrderFlow(..)
+                    | exchange::Event::OrderFlowTrades(..) => {
                         unreachable!("connection events are handled before dashboard routing")
                     }
                     exchange::Event::DepthReceived(stream, update_t, depth) => {
@@ -881,6 +928,8 @@ impl Flowsurface {
                 }
             }
             Message::Tick(now) => {
+                self.iceberg_detectors
+                    .collect_garbage(exchange::UnixMs::now());
                 // Throttled tick debug logging (once every 2 seconds)
                 if DEBUG_WINDOW_DIAGNOSTICS {
                     static LAST_TICK_LOG: std::sync::Mutex<Option<std::time::Instant>> =

@@ -525,6 +525,12 @@ pub enum Event {
     DepthReceived(StreamKind, UnixMs, Arc<Depth>),
     TradesReceived(StreamKind, UnixMs, Box<[Trade]>),
     KlineReceived(StreamKind, Kline),
+    /// Normalized non-trade events used by order-flow consumers. These do not replace the
+    /// legacy depth/trade events.
+    OrderFlow(crate::orderflow::OrderFlowEvent),
+    /// Raw trades retain their individual exchange/receive timestamps, but are transported in
+    /// short batches so high-volume symbols cannot flood the application event channel.
+    OrderFlowTrades(Box<[crate::orderflow::NormalizedTradeEvent]>),
 }
 
 #[derive(Debug, Clone, Hash)]

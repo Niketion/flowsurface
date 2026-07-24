@@ -11,10 +11,12 @@ use data::aggr::ticks::TickAggr;
 use data::aggr::time::TimeSeries;
 use data::chart::indicator::{Indicator, KlineIndicator};
 use data::chart::kline::{
-    BubbleCandidate, BubbleColorMode, BubbleVolumeSummary, ClusterKind, ClusterScaling, Config,
-    FootprintStudy, FootprintSummary, KlineDataPoint, KlineTrades, NPoc, PointOfControl,
-    SessionProfileMode, SessionProfilePlacement, SessionVolumeProfileConfig, VolumeBubbleConfig,
-    VolumeBubbleSession, VwapConfig,
+    BubbleColorMode, BubbleLabelMode, BubblePriceResponse, BubbleVolumeSummary, ClusterKind,
+    ClusterScaling, Config, FootprintStudy, FootprintSummary, KlineDataPoint, KlineTrades, NPoc,
+    PointOfControl, SessionProfileMode, SessionProfilePlacement, SessionVolumeProfileConfig,
+    StabilizedBubbleThreshold, VolumeBubbleCluster, VolumeBubbleConfig, VolumeBubbleSession,
+    VwapConfig, adaptive_bubble_threshold_baselines, apply_volume_bubble_budget, bubble_age_factor,
+    classify_bubble_price_response, cluster_volume_bubble_trades, percentile,
 };
 use data::chart::{Autoscale, KlineChartKind, ViewConfig};
 
@@ -31,14 +33,26 @@ use iced::{Alignment, Color, Element, Point, Rectangle, Renderer, Size, Theme, V
 use chrono::{Datelike, TimeZone, Timelike};
 use enum_map::EnumMap;
 use rustc_hash::{FxHashMap, FxHashSet};
-use std::{sync::Arc, time::Instant};
+use std::{cell::RefCell, sync::Arc, time::Instant};
 
 /// Maximum number of raw trades to retain in memory.
 /// Older trades are pruned FIFO when this cap is exceeded.
 /// 50k trades ≈ 1.5-3 MB depending on Trade size.
 const MAX_RAW_TRADES: usize = 50_000;
+const MAX_LIVE_TRADE_BUCKETS: usize = 4_096;
 
 fn deduplicate_incoming_trades(existing: &[Trade], incoming: &[Trade]) -> Vec<Trade> {
+    let invalid_price_count = incoming
+        .iter()
+        .filter(|trade| trade.price.units <= 0)
+        .count();
+    if invalid_price_count > 0 {
+        log::warn!(
+            "TRADE InvalidPriceDiscarded | count={invalid_price_count} batch_len={} reason=non_positive_price",
+            incoming.len()
+        );
+    }
+
     let mut seen_ids = existing
         .iter()
         .filter_map(|trade| trade.id)
@@ -46,8 +60,26 @@ fn deduplicate_incoming_trades(existing: &[Trade], incoming: &[Trade]) -> Vec<Tr
     incoming
         .iter()
         .copied()
+        // A non-positive execution price is never valid market data. Besides corrupting the
+        // footprint bucket, it expands FitToVisible down to zero and compresses the real market
+        // into a horizontal line.
+        .filter(|trade| trade.price.units > 0)
         .filter(|trade| trade.id.is_none_or(|id| seen_ids.insert(id)))
         .collect()
+}
+
+fn exclude_historical_overlap_with_live(
+    incoming: Vec<Trade>,
+    live_buckets: &FxHashSet<UnixMs>,
+    interval: exchange::Timeframe,
+) -> (Vec<Trade>, usize) {
+    let before = incoming.len();
+    let filtered = incoming
+        .into_iter()
+        .filter(|trade| !live_buckets.contains(&trade.time.floor_to(interval)))
+        .collect::<Vec<_>>();
+    let discarded = before.saturating_sub(filtered.len());
+    (filtered, discarded)
 }
 
 impl Chart for KlineChart {
@@ -190,6 +222,9 @@ pub struct KlineChart {
     chart: ViewState,
     data_source: PlotData<KlineDataPoint>,
     raw_trades: Vec<Trade>,
+    /// Time buckets populated from the live raw feed. Historical aggTrades use a different ID
+    /// namespace and must never be added to these same buckets.
+    live_trade_buckets: FxHashSet<UnixMs>,
     covered_trade_ranges: Vec<(UnixMs, UnixMs)>,
     covered_bubble_summary_ranges: Vec<(UnixMs, UnixMs)>,
     indicators: EnumMap<KlineIndicator, Option<Box<dyn KlineIndicatorImpl>>>,
@@ -200,6 +235,8 @@ pub struct KlineChart {
     last_tick: Instant,
     visual_config: Config,
     gex_snapshot: Option<Arc<data::chart::gex::GexSnapshot>>,
+    rendered_volume_bubbles: RefCell<Vec<RenderedVolumeBubble>>,
+    stabilized_bubble_threshold: RefCell<StabilizedBubbleThreshold>,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -304,6 +341,7 @@ impl KlineChart {
                     visual_config,
                     data_source,
                     raw_trades,
+                    live_trade_buckets: FxHashSet::default(),
                     covered_trade_ranges: Vec::new(),
                     covered_bubble_summary_ranges: Vec::new(),
                     indicators,
@@ -313,6 +351,8 @@ impl KlineChart {
                     study_configurator: study::Configurator::new(),
                     last_tick: Instant::now(),
                     gex_snapshot: None,
+                    rendered_volume_bubbles: RefCell::new(Vec::new()),
+                    stabilized_bubble_threshold: RefCell::new(StabilizedBubbleThreshold::default()),
                 }
             }
             Basis::Tick(interval) => {
@@ -368,6 +408,7 @@ impl KlineChart {
                     visual_config,
                     data_source,
                     raw_trades,
+                    live_trade_buckets: FxHashSet::default(),
                     covered_trade_ranges: Vec::new(),
                     covered_bubble_summary_ranges: Vec::new(),
                     indicators,
@@ -377,6 +418,8 @@ impl KlineChart {
                     study_configurator: study::Configurator::new(),
                     last_tick: Instant::now(),
                     gex_snapshot: None,
+                    rendered_volume_bubbles: RefCell::new(Vec::new()),
+                    stabilized_bubble_threshold: RefCell::new(StabilizedBubbleThreshold::default()),
                 }
             }
         }
@@ -546,8 +589,8 @@ impl KlineChart {
                     let anchor_ms = self.visual_config.vwap.anchor.milliseconds();
                     vwap_required_from(target_to, visible_earliest_ms, anchor_ms)
                 });
-                let bubble_required_range = self
-                    .indicator_enabled(KlineIndicator::VolumeBubbles)
+                let bubble_required_range = (self.indicator_enabled(KlineIndicator::VolumeBubbles)
+                    && self.visual_config.volume_bubbles.enabled)
                     .then(|| {
                         volume_bubble_effective_range(
                             kline_latest,
@@ -702,6 +745,7 @@ impl KlineChart {
 
                 if matches!(self.kind, KlineChartKind::Candles)
                     && self.indicator_enabled(KlineIndicator::VolumeBubbles)
+                    && self.visual_config.volume_bubbles.enabled
                     && !self.fetching_trades.0
                 {
                     const BUBBLE_FETCH_CHUNK_MS: u64 = 15 * 60_000;
@@ -730,7 +774,7 @@ impl KlineChart {
                                 fetch_to,
                                 timeframe_ms,
                                 self.chart.tick_size,
-                                max_candidates,
+                                &config,
                             );
                             self.insert_bubble_summaries(
                                 summaries, fetch_from, fetch_to, 0, 0, None,
@@ -744,6 +788,8 @@ impl KlineChart {
                             timeframe_ms,
                             price_step: self.chart.tick_size,
                             max_candidates_per_candle: max_candidates,
+                            cluster_window_ms: config.cluster_window_ms,
+                            cluster_price_ticks: config.cluster_price_ticks,
                         };
                         if let Some(action) = request_fetch(
                             &mut self.request_handler,
@@ -1376,6 +1422,7 @@ impl KlineChart {
 
         let should_refetch_volume_bubbles = matches!(self.kind, KlineChartKind::Candles)
             && self.indicator_enabled(KlineIndicator::VolumeBubbles)
+            && new_bubbles.enabled
             && (old_bubbles.history_window_minutes != new_bubbles.history_window_minutes
                 || old_bubbles.session != new_bubbles.session
                 || old_bubbles
@@ -1549,6 +1596,25 @@ impl KlineChart {
 
     pub fn insert_trades(&mut self, buffer: &[Trade]) {
         let buffer = deduplicate_incoming_trades(&self.raw_trades, buffer);
+        if self.chart.ticker_info.exchange() == exchange::adapter::Exchange::BinanceLinear
+            && let PlotData::TimeBased(timeseries) = &self.data_source
+        {
+            let interval = timeseries.interval;
+            let interval_ms = timeseries.interval.to_milliseconds();
+            let latest_bucket = buffer
+                .iter()
+                .map(|trade| trade.time.floor_to(interval))
+                .max();
+            self.live_trade_buckets
+                .extend(buffer.iter().map(|trade| trade.time.floor_to(interval)));
+            if self.live_trade_buckets.len() > MAX_LIVE_TRADE_BUCKETS
+                && let Some(latest) = latest_bucket
+            {
+                let cutoff = latest
+                    .saturating_sub(interval_ms.saturating_mul(MAX_LIVE_TRADE_BUCKETS as u64));
+                self.live_trade_buckets.retain(|bucket| *bucket >= cutoff);
+            }
+        }
         let raw_before = self.raw_trades.len();
         self.raw_trades.extend_from_slice(&buffer);
 
@@ -1611,14 +1677,24 @@ impl KlineChart {
     pub fn insert_raw_trades(&mut self, raw_trades: Vec<Trade>, is_batches_done: bool) {
         let received_size = raw_trades.len();
         let raw_trades = deduplicate_incoming_trades(&self.raw_trades, &raw_trades);
+        let (raw_trades, live_overlap_discarded) = match &self.data_source {
+            PlotData::TimeBased(timeseries) => exclude_historical_overlap_with_live(
+                raw_trades,
+                &self.live_trade_buckets,
+                timeseries.interval,
+            ),
+            PlotData::TickBased(_) => (raw_trades, 0),
+        };
         let batch_size = raw_trades.len();
-        let duplicate_count = received_size.saturating_sub(batch_size);
+        let duplicate_count = received_size
+            .saturating_sub(batch_size)
+            .saturating_sub(live_overlap_discarded);
         let raw_before = self.raw_trades.len();
         let earliest = raw_trades.first().map(|t| t.time);
         let latest = raw_trades.last().map(|t| t.time);
 
         log::debug!(
-            "DATA Trades | received={received_size} deduplicated={duplicate_count} fetched_batch={batch_size} raw_before={raw_before} raw_after={} first={} last={} is_batches_done={is_batches_done}",
+            "DATA Trades | received={received_size} deduplicated={duplicate_count} live_overlap_discarded={live_overlap_discarded} fetched_batch={batch_size} raw_before={raw_before} raw_after={} first={} last={} is_batches_done={is_batches_done}",
             raw_before + batch_size,
             fetcher::format_optional_time(earliest),
             fetcher::format_optional_time(latest)
@@ -1709,18 +1785,9 @@ impl KlineChart {
         to: UnixMs,
         timeframe_ms: u64,
         price_step: PriceStep,
-        max_candidates_per_candle: usize,
+        config: &VolumeBubbleConfig,
     ) -> Vec<BubbleVolumeSummary> {
-        #[derive(Clone, Copy, Default)]
-        struct Accum {
-            buy_qty: Qty,
-            sell_qty: Qty,
-            trade_count: usize,
-            first_time: Option<UnixMs>,
-            last_time: Option<UnixMs>,
-        }
-
-        let mut buckets: FxHashMap<(UnixMs, Price), Accum> = FxHashMap::default();
+        let mut buckets: FxHashMap<UnixMs, Vec<Trade>> = FxHashMap::default();
         for trade in self
             .raw_trades
             .iter()
@@ -1728,52 +1795,24 @@ impl KlineChart {
         {
             let candle_time =
                 UnixMs::new(trade.time.as_u64() - (trade.time.as_u64() % timeframe_ms));
-            let price = trade.price.round_to_step(price_step);
-            let bucket = buckets.entry((candle_time, price)).or_default();
-            if trade.is_sell {
-                bucket.sell_qty += trade.qty;
-            } else {
-                bucket.buy_qty += trade.qty;
-            }
-            bucket.trade_count += 1;
-            bucket.first_time = Some(
-                bucket
-                    .first_time
-                    .map_or(trade.time, |first| first.min(trade.time)),
-            );
-            bucket.last_time = Some(
-                bucket
-                    .last_time
-                    .map_or(trade.time, |last| last.max(trade.time)),
-            );
+            buckets.entry(candle_time).or_default().push(*trade);
         }
-
-        let mut grouped: FxHashMap<UnixMs, Vec<BubbleCandidate>> = FxHashMap::default();
-        for ((candle_time, price), bucket) in buckets {
-            let total_qty = bucket.buy_qty + bucket.sell_qty;
-            let delta_qty = bucket.buy_qty - bucket.sell_qty;
-            grouped
-                .entry(candle_time)
-                .or_default()
-                .push(BubbleCandidate {
-                    candle_time,
-                    price,
-                    total_qty,
-                    buy_qty: bucket.buy_qty,
-                    sell_qty: bucket.sell_qty,
-                    delta_qty,
-                    trade_count: bucket.trade_count,
-                    score: total_qty.to_f64(),
-                    first_time: bucket.first_time,
-                    last_time: bucket.last_time,
-                });
-        }
-
-        let mut summaries = grouped
+        let mut summaries = buckets
             .into_iter()
-            .map(|(candle_time, mut candidates)| {
+            .map(|(candle_time, trades)| {
+                let mut candidates = cluster_volume_bubble_trades(
+                    &trades,
+                    candle_time,
+                    timeframe_ms,
+                    price_step,
+                    config,
+                );
                 candidates.sort_by_key(|candidate| std::cmp::Reverse(candidate.total_qty));
-                candidates.truncate(max_candidates_per_candle);
+                candidates.truncate(
+                    config
+                        .max_candidates_per_candle
+                        .max(config.max_bubbles_per_bar),
+                );
                 BubbleVolumeSummary::new(candle_time, candidates)
             })
             .collect::<Vec<_>>();
@@ -2430,7 +2469,11 @@ impl canvas::Program<Message> for KlineChart {
                         );
                     }
                     let volume_bubbles = self.visual_config.volume_bubbles;
-                    let bubbles_enabled = self.indicator_enabled(KlineIndicator::VolumeBubbles);
+                    let bubbles_enabled = volume_bubbles.enabled
+                        && self.indicator_enabled(KlineIndicator::VolumeBubbles);
+                    if !bubbles_enabled {
+                        self.rendered_volume_bubbles.borrow_mut().clear();
+                    }
                     let volume_bubble_range = bubbles_enabled
                         .then(|| match &self.data_source {
                             PlotData::TimeBased(timeseries) => {
@@ -2446,26 +2489,13 @@ impl canvas::Program<Message> for KlineChart {
                             PlotData::TickBased(_) => None,
                         })
                         .flatten();
-                    let visible_max_bubble_qty = if bubbles_enabled {
-                        visible_max_bubble_qty(
-                            &self.data_source,
-                            volume_bubble_range
-                                .map_or(earliest, |(from, _)| earliest.max(from.as_u64())),
-                            volume_bubble_range.map_or(latest, |(_, to)| latest.min(to.as_u64())),
-                            volume_bubbles.min_qty,
-                            volume_bubbles.use_raw_trades_when_available,
-                        )
-                    } else {
-                        0.0
-                    };
-
                     render_data_source(
                         &self.data_source,
                         frame,
                         earliest,
                         latest,
                         interval_to_x,
-                        |frame, x_position, kline, trades, summary| {
+                        |frame, x_position, kline, _trades, _summary| {
                             draw_candle_dp(
                                 frame,
                                 price_to_y,
@@ -2474,26 +2504,26 @@ impl canvas::Program<Message> for KlineChart {
                                 x_position,
                                 kline,
                             );
-
-                            if bubbles_enabled
-                                && volume_bubble_range.is_some_and(|(from, to)| {
-                                    kline.time >= from && kline.time <= to
-                                })
-                            {
-                                draw_volume_bubbles(
-                                    frame,
-                                    price_to_y,
-                                    x_position,
-                                    trades,
-                                    summary,
-                                    &volume_bubbles,
-                                    visible_max_bubble_qty,
-                                    chart.scaling,
-                                    palette,
-                                );
-                            }
                         },
                     );
+                    if bubbles_enabled && let Some((bubble_from, bubble_to)) = volume_bubble_range {
+                        let bubbles = build_rendered_volume_bubbles(
+                            &self.data_source,
+                            earliest.max(bubble_from.as_u64()),
+                            latest.min(bubble_to.as_u64()),
+                            price_to_y,
+                            interval_to_x,
+                            chart.tick_size,
+                            chart.cell_width,
+                            chart.scaling,
+                            &volume_bubbles,
+                            palette,
+                            UnixMs::now(),
+                            &self.stabilized_bubble_threshold,
+                        );
+                        draw_rendered_volume_bubbles(frame, &bubbles, chart.scaling, palette);
+                        *self.rendered_volume_bubbles.borrow_mut() = bubbles;
+                    }
                 }
             }
 
@@ -2507,16 +2537,40 @@ impl canvas::Program<Message> for KlineChart {
             if let Some(cursor_position) = cursor.position_in(bounds) {
                 let (_, rounded_aggregation) =
                     chart.draw_crosshair(frame, theme, bounds_size, cursor_position, interaction);
-
-                draw_crosshair_tooltip(
-                    &self.data_source,
-                    &chart.ticker_info,
-                    frame,
-                    palette,
-                    chart.basis,
-                    Some(rounded_aggregation),
-                    visible_range,
-                );
+                let center = Vector::new(bounds.width / 2.0, bounds.height / 2.0);
+                let bubbles = self.rendered_volume_bubbles.borrow();
+                if let Some(bubble) = hit_test_volume_bubbles(
+                    &bubbles,
+                    cursor_position,
+                    center,
+                    chart.translation,
+                    chart.scaling,
+                ) {
+                    draw_hovered_volume_bubble(
+                        frame,
+                        bubble,
+                        center,
+                        chart.translation,
+                        chart.scaling,
+                    );
+                    draw_volume_bubble_tooltip(
+                        frame,
+                        bubble,
+                        palette,
+                        &chart.ticker_info,
+                        &self.visual_config.volume_bubbles,
+                    );
+                } else {
+                    draw_crosshair_tooltip(
+                        &self.data_source,
+                        &chart.ticker_info,
+                        frame,
+                        palette,
+                        chart.basis,
+                        Some(rounded_aggregation),
+                        visible_range,
+                    );
+                }
             } else if self.visual_config.data_labels_always_visible {
                 draw_crosshair_tooltip(
                     &self.data_source,
@@ -3429,128 +3483,28 @@ fn draw_candle_dp(
     );
 }
 
-#[derive(Clone, Copy)]
-struct VolumeBubblePoint {
-    price: Price,
-    total_qty: f64,
-    buy_qty: f64,
-    sell_qty: f64,
-}
-
-fn draw_volume_bubbles(
-    frame: &mut canvas::Frame,
-    price_to_y: impl Fn(Price) -> f32,
-    x_position: f32,
-    trades: &KlineTrades,
-    summary: &BubbleVolumeSummary,
-    config: &VolumeBubbleConfig,
-    visible_max_qty: f64,
-    scaling: f32,
-    palette: &Extended,
-) {
-    if visible_max_qty <= 0.0 || config.max_bubbles_per_bar == 0 || scaling <= f32::EPSILON {
-        return;
-    }
-
-    for bubble in collect_volume_bubble_points(trades, summary, config) {
-        let radius_px = volume_bubble_radius(bubble.total_qty, visible_max_qty, config);
-        let radius = radius_px / scaling;
-        let center = Point::new(x_position, price_to_y(bubble.price));
-        let color = volume_bubble_color(bubble, config.color_mode, palette);
-
-        let circle = Path::circle(center, radius);
-        frame.stroke(
-            &circle,
-            Stroke::default()
-                .with_color(color.scale_alpha(0.86))
-                .with_width((1.6 / scaling).max(0.75 / scaling)),
-        );
-
-        if config.show_labels && radius_px >= 9.0 {
-            draw_cluster_text(
-                frame,
-                &abbr_large_numbers(bubble.total_qty),
-                center,
-                (radius_px * 0.72).clamp(7.0, 10.0) / scaling,
-                palette.background.base.text,
-                Alignment::Center,
-                Alignment::Center,
-            );
-        }
-    }
-}
-
-fn collect_volume_bubble_points(
-    trades: &KlineTrades,
-    summary: &BubbleVolumeSummary,
-    config: &VolumeBubbleConfig,
-) -> Vec<VolumeBubblePoint> {
-    // When raw trades exist they are the same source used by the footprint.
-    // Prefer them over a cached/derived summary so a bubble can never reflect a
-    // stale or previously over-merged quantity for that candle.
-    let prefer_raw = config.use_raw_trades_when_available && !trades.trades.is_empty();
-    let mut points: Vec<_> = if !prefer_raw && !summary.is_empty() {
-        summary
-            .candidates
-            .iter()
-            .filter_map(|candidate| bubble_point_from_candidate(candidate, config))
-            .collect()
-    } else {
-        trades
-            .trades
-            .iter()
-            .filter_map(|(price, group)| {
-                let buy_qty = group.buy_qty.to_f64();
-                let sell_qty = group.sell_qty.to_f64();
-                let total_qty = buy_qty + sell_qty;
-
-                (total_qty > 0.0 && total_qty >= config.min_qty).then_some(VolumeBubblePoint {
-                    price: *price,
-                    total_qty,
-                    buy_qty,
-                    sell_qty,
-                })
-            })
-            .collect()
-    };
-
-    points.sort_by(|a, b| b.total_qty.total_cmp(&a.total_qty));
-    points.truncate(config.max_bubbles_per_bar);
-    points
-}
-
-fn bubble_point_from_candidate(
-    candidate: &BubbleCandidate,
-    config: &VolumeBubbleConfig,
-) -> Option<VolumeBubblePoint> {
-    let total_qty = candidate.total_qty.to_f64();
-    (total_qty > 0.0 && total_qty >= config.min_qty).then_some(VolumeBubblePoint {
-        price: candidate.price,
-        total_qty,
-        buy_qty: candidate.buy_qty.to_f64(),
-        sell_qty: candidate.sell_qty.to_f64(),
-    })
-}
-
-fn volume_bubble_radius(qty: f64, visible_max_qty: f64, config: &VolumeBubbleConfig) -> f32 {
-    let min_radius = config.min_radius_px.min(config.max_radius_px);
-    let max_radius = config.min_radius_px.max(config.max_radius_px);
-    let intensity = if visible_max_qty > 0.0 {
-        (qty / visible_max_qty).clamp(0.0, 1.0) as f32
-    } else {
-        0.0
-    };
-
-    min_radius + intensity * (max_radius - min_radius)
+#[derive(Debug, Clone)]
+pub struct RenderedVolumeBubble {
+    pub cluster: VolumeBubbleCluster,
+    pub center: Point,
+    pub original_center: Point,
+    pub radius_px: f32,
+    pub fill_color: Color,
+    pub border_color: Color,
+    pub fill_alpha: f32,
+    pub border_alpha: f32,
+    pub label: Option<String>,
+    pub age_factor: f32,
+    pub price_response: BubblePriceResponse,
 }
 
 fn volume_bubble_color(
-    bubble: VolumeBubblePoint,
+    bubble: &VolumeBubbleCluster,
     color_mode: BubbleColorMode,
     palette: &Extended,
 ) -> Color {
-    let total_qty = bubble.total_qty.max(f64::EPSILON);
-    let delta = bubble.buy_qty - bubble.sell_qty;
+    let total_qty = bubble.total_qty.to_f64().max(f64::EPSILON);
+    let delta = bubble.delta_qty.to_f64();
     let dominance = (delta.abs() / total_qty).clamp(0.0, 1.0) as f32;
 
     if dominance < 0.10 {
@@ -3571,12 +3525,452 @@ fn volume_bubble_color(
             )
         }
         BubbleColorMode::DominantSide => {
-            if bubble.buy_qty >= bubble.sell_qty {
+            let base = if bubble.buy_qty >= bubble.sell_qty {
                 palette.success.strong.color
             } else {
                 palette.danger.strong.color
+            };
+            mix_color(base, palette.background.base.color, 0.55 + dominance * 0.35)
+        }
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn build_rendered_volume_bubbles(
+    data_source: &PlotData<KlineDataPoint>,
+    earliest: u64,
+    latest: u64,
+    price_to_y: impl Fn(Price) -> f32,
+    interval_to_x: impl Fn(u64) -> f32,
+    price_step: PriceStep,
+    candle_width: f32,
+    scaling: f32,
+    config: &VolumeBubbleConfig,
+    palette: &Extended,
+    now: UnixMs,
+    stabilized_threshold: &RefCell<StabilizedBubbleThreshold>,
+) -> Vec<RenderedVolumeBubble> {
+    if scaling <= f32::EPSILON || config.max_bubbles_per_bar == 0 || latest < earliest {
+        return Vec::new();
+    }
+    let mut clusters = Vec::new();
+    match data_source {
+        PlotData::TimeBased(timeseries) => {
+            let timeframe_ms = timeseries.interval.to_milliseconds();
+            let baseline_from =
+                latest.saturating_sub(config.adaptive_window_minutes.max(1).saturating_mul(60_000));
+            for (&candle_time, dp) in timeseries
+                .datapoints
+                .range(UnixMs::new(earliest.min(baseline_from))..=UnixMs::new(latest))
+            {
+                if config.use_raw_trades_when_available && !dp.trade_sequence.is_empty() {
+                    clusters.extend(cluster_volume_bubble_trades(
+                        &dp.trade_sequence,
+                        candle_time,
+                        timeframe_ms,
+                        price_step,
+                        config,
+                    ));
+                } else if dp.bubble_summary.algorithm_version
+                    == data::chart::kline::BUBBLE_SUMMARY_ALGORITHM_VERSION
+                {
+                    clusters.extend(dp.bubble_summary.candidates.iter().copied());
+                }
             }
         }
+        PlotData::TickBased(_) => return Vec::new(),
+    }
+    let distribution = clusters
+        .iter()
+        .filter(|cluster| {
+            cluster.last_time.as_u64()
+                >= latest
+                    .saturating_sub(config.adaptive_window_minutes.max(1).saturating_mul(60_000))
+        })
+        .map(|cluster| cluster.total_qty.to_f64())
+        .collect::<Vec<_>>();
+    let baseline_clusters = clusters
+        .iter()
+        .copied()
+        .filter(|cluster| {
+            cluster.last_time.as_u64()
+                >= latest
+                    .saturating_sub(config.adaptive_window_minutes.max(1).saturating_mul(60_000))
+        })
+        .collect::<Vec<_>>();
+    let baselines = adaptive_bubble_threshold_baselines(&baseline_clusters, config, 20);
+    let threshold = stabilized_threshold
+        .borrow_mut()
+        .update(baselines.combined.effective, now);
+    let scale = threshold / baselines.combined.effective.max(f64::EPSILON);
+    let buy_threshold = baselines.buy_dominant.effective * scale;
+    let sell_threshold = baselines.sell_dominant.effective * scale;
+    clusters.retain(|cluster| {
+        cluster.candle_time.as_u64() >= earliest
+            && cluster.candle_time.as_u64() <= latest
+            && cluster.total_qty.to_f64()
+                >= if cluster.buy_qty >= cluster.sell_qty {
+                    buy_threshold
+                } else {
+                    sell_threshold
+                }
+    });
+    let reference_p99 = percentile(&distribution, 99.0).unwrap_or(threshold.max(1.0));
+    let mut clusters = apply_volume_bubble_budget(
+        clusters,
+        config,
+        buy_threshold.min(sell_threshold).min(threshold),
+    );
+    clusters.sort_by_key(|cluster| (cluster.candle_time, cluster.weighted_time, cluster.id));
+    let response_for = |cluster: &VolumeBubbleCluster| {
+        let target = cluster
+            .last_time
+            .saturating_add(u64::from(config.price_response_horizon_seconds).saturating_mul(1_000));
+        let horizon_elapsed = now >= target;
+        let future_price = if horizon_elapsed {
+            match data_source {
+                PlotData::TimeBased(timeseries) => timeseries
+                    .datapoints
+                    .range(target..)
+                    .next()
+                    .map(|(_, point)| point.kline.close),
+                PlotData::TickBased(_) => None,
+            }
+        } else {
+            None
+        };
+        classify_bubble_price_response(cluster, future_price, horizon_elapsed, config)
+    };
+
+    let mut rendered = clusters
+        .into_iter()
+        .map(|cluster| {
+            let radius_px = data::chart::kline::volume_bubble_radius(
+                cluster.total_qty.to_f64(),
+                threshold,
+                reference_p99,
+                config.min_radius_px,
+                config.max_radius_px,
+            );
+            let original_center = Point::new(
+                interval_to_x(cluster.weighted_time.as_u64()),
+                price_to_y(cluster.vwap_price),
+            );
+            let color = volume_bubble_color(&cluster, config.color_mode, palette);
+            let age_factor = bubble_age_factor(
+                now.as_u64().saturating_sub(cluster.last_time.as_u64()),
+                config.age_fading,
+            );
+            let importance = (cluster.percentile_rank / 100.0).clamp(0.0, 1.0);
+            let fill_alpha = if config.fill_enabled {
+                (0.08 + 0.12 * importance) * config.fill_intensity * age_factor
+            } else {
+                0.0
+            };
+            let border_alpha = config.border_opacity * age_factor;
+            let price_response = response_for(&cluster);
+            let label = match config.label_mode {
+                BubbleLabelMode::None => None,
+                BubbleLabelMode::ExtremeOnly
+                    if cluster.percentile_rank < config.label_percentile =>
+                {
+                    None
+                }
+                BubbleLabelMode::ExtremeOnly | BubbleLabelMode::All if radius_px >= 9.0 => {
+                    Some(abbr_large_numbers(cluster.total_qty.to_f64()))
+                }
+                BubbleLabelMode::ExtremeOnly | BubbleLabelMode::All => None,
+            };
+            RenderedVolumeBubble {
+                cluster,
+                center: original_center,
+                original_center,
+                radius_px,
+                fill_color: color,
+                border_color: color,
+                fill_alpha: fill_alpha.clamp(0.0, 1.0),
+                border_alpha: border_alpha.clamp(0.0, 1.0),
+                label,
+                age_factor,
+                price_response,
+            }
+        })
+        .collect::<Vec<_>>();
+    collision_layout(&mut rendered, candle_width, scaling, config);
+    apply_label_budget(&mut rendered, config.max_labels_in_view);
+    rendered
+}
+
+fn collision_layout(
+    bubbles: &mut Vec<RenderedVolumeBubble>,
+    candle_width: f32,
+    scaling: f32,
+    config: &VolumeBubbleConfig,
+) {
+    bubbles.sort_by(|left, right| {
+        right
+            .cluster
+            .importance_score
+            .total_cmp(&left.cluster.importance_score)
+            .then_with(|| left.cluster.id.cmp(&right.cluster.id))
+    });
+    let max_offset = (8.0 / scaling).min(candle_width * 0.45);
+    let offsets = [0.0, -0.5, 0.5, -1.0, 1.0];
+    let mut accepted: Vec<RenderedVolumeBubble> = Vec::with_capacity(bubbles.len());
+    for mut bubble in bubbles.drain(..) {
+        let side_sign = if bubble.cluster.buy_qty >= bubble.cluster.sell_qty {
+            1.0
+        } else {
+            -1.0
+        };
+        let position = offsets
+            .into_iter()
+            .map(|factor| factor * max_offset * side_sign)
+            .find(|offset| {
+                let center =
+                    Point::new(bubble.original_center.x + offset, bubble.original_center.y);
+                accepted.iter().all(|other| {
+                    let dx = (center.x - other.center.x) * scaling;
+                    let dy = (center.y - other.center.y) * scaling;
+                    let required = config
+                        .min_center_distance_px
+                        .max((bubble.radius_px + other.radius_px) * 0.65);
+                    dx.mul_add(dx, dy * dy).sqrt() >= required
+                })
+            });
+        if let Some(offset) = position {
+            bubble.center.x += offset;
+            accepted.push(bubble);
+        }
+    }
+    accepted.sort_by_key(|bubble| {
+        (
+            bubble.cluster.candle_time,
+            bubble.cluster.weighted_time,
+            bubble.cluster.id,
+        )
+    });
+    *bubbles = accepted;
+}
+
+fn apply_label_budget(bubbles: &mut [RenderedVolumeBubble], budget: usize) {
+    let mut indices = bubbles
+        .iter()
+        .enumerate()
+        .filter(|(_, bubble)| bubble.label.is_some())
+        .map(|(index, bubble)| (index, bubble.cluster.importance_score))
+        .collect::<Vec<_>>();
+    indices.sort_by(|left, right| {
+        right
+            .1
+            .total_cmp(&left.1)
+            .then_with(|| left.0.cmp(&right.0))
+    });
+    for (index, _) in indices.into_iter().skip(budget) {
+        bubbles[index].label = None;
+    }
+}
+
+fn draw_rendered_volume_bubbles(
+    frame: &mut canvas::Frame,
+    bubbles: &[RenderedVolumeBubble],
+    scaling: f32,
+    palette: &Extended,
+) {
+    for bubble in bubbles {
+        let radius = bubble.radius_px / scaling;
+        if (bubble.center.x - bubble.original_center.x).abs() * scaling > 4.0 {
+            frame.stroke(
+                &Path::line(bubble.original_center, bubble.center),
+                Stroke::default()
+                    .with_color(bubble.border_color.scale_alpha(bubble.border_alpha * 0.45))
+                    .with_width(0.7 / scaling),
+            );
+        }
+        let circle = Path::circle(bubble.center, radius);
+        if bubble.price_response == BubblePriceResponse::FollowThrough {
+            frame.stroke(
+                &Path::circle(bubble.center, radius + 2.5 / scaling),
+                Stroke::default()
+                    .with_color(bubble.border_color.scale_alpha(bubble.border_alpha * 0.28))
+                    .with_width(1.0 / scaling),
+            );
+        }
+        frame.fill(&circle, bubble.fill_color.scale_alpha(bubble.fill_alpha));
+        frame.stroke(
+            &circle,
+            Stroke::default()
+                .with_color(bubble.border_color.scale_alpha(bubble.border_alpha))
+                .with_width(1.6 / scaling),
+        );
+        if bubble.price_response == BubblePriceResponse::Reversed {
+            frame.fill(
+                &Path::circle(
+                    Point::new(
+                        bubble.center.x + radius * 0.75,
+                        bubble.center.y - radius * 0.75,
+                    ),
+                    1.8 / scaling,
+                ),
+                palette
+                    .warning
+                    .strong
+                    .color
+                    .scale_alpha(bubble.border_alpha),
+            );
+        }
+        if let Some(label) = &bubble.label {
+            draw_cluster_text(
+                frame,
+                label,
+                bubble.center,
+                (bubble.radius_px * 0.72).clamp(7.0, 10.0) / scaling,
+                palette.background.base.text,
+                Alignment::Center,
+                Alignment::Center,
+            );
+        }
+    }
+}
+
+fn bubble_screen_center(
+    bubble: &RenderedVolumeBubble,
+    viewport_center: Vector,
+    translation: Vector,
+    scaling: f32,
+) -> Point {
+    Point::new(
+        viewport_center.x + (translation.x + bubble.center.x) * scaling,
+        viewport_center.y + (translation.y + bubble.center.y) * scaling,
+    )
+}
+
+fn hit_test_volume_bubbles(
+    bubbles: &[RenderedVolumeBubble],
+    cursor: Point,
+    viewport_center: Vector,
+    translation: Vector,
+    scaling: f32,
+) -> Option<&RenderedVolumeBubble> {
+    bubbles
+        .iter()
+        .filter(|bubble| {
+            let center = bubble_screen_center(bubble, viewport_center, translation, scaling);
+            let dx = cursor.x - center.x;
+            let dy = cursor.y - center.y;
+            dx.mul_add(dx, dy * dy) <= bubble.radius_px * bubble.radius_px
+        })
+        .max_by(|left, right| {
+            left.cluster
+                .importance_score
+                .total_cmp(&right.cluster.importance_score)
+                .then_with(|| right.cluster.id.cmp(&left.cluster.id))
+        })
+}
+
+fn draw_hovered_volume_bubble(
+    frame: &mut canvas::Frame,
+    bubble: &RenderedVolumeBubble,
+    viewport_center: Vector,
+    translation: Vector,
+    scaling: f32,
+) {
+    let center = bubble_screen_center(bubble, viewport_center, translation, scaling);
+    let circle = Path::circle(center, bubble.radius_px + 2.0);
+    frame.fill(
+        &circle,
+        bubble
+            .fill_color
+            .scale_alpha((0.26 + (1.0 - bubble.age_factor) * 0.02).clamp(0.0, 0.28)),
+    );
+    frame.stroke(
+        &circle,
+        Stroke::default()
+            .with_color(bubble.border_color.scale_alpha(0.98))
+            .with_width(2.0),
+    );
+}
+
+fn bubble_tooltip_lines(
+    bubble: &RenderedVolumeBubble,
+    unit: &str,
+    threshold_mode: data::chart::kline::BubbleThresholdMode,
+) -> Vec<String> {
+    let cluster = &bubble.cluster;
+    let total = cluster.total_qty.to_f64();
+    let dominance = cluster.buy_qty.abs_diff(cluster.sell_qty).to_f64() / total.max(f64::EPSILON);
+    let heading = if dominance < 0.10 {
+        "Mixed flow"
+    } else if cluster.buy_qty > cluster.sell_qty {
+        "Aggressive buys"
+    } else {
+        "Aggressive sells"
+    };
+    let duration = cluster
+        .last_time
+        .as_u64()
+        .saturating_sub(cluster.first_time.as_u64());
+    let timestamp = cluster
+        .weighted_time
+        .format_utc("%Y-%m-%d %H:%M:%S%.3f UTC")
+        .unwrap_or_else(|| cluster.weighted_time.as_u64().to_string());
+    vec![
+        heading.to_string(),
+        timestamp,
+        format!("Total volume      {:.4} {unit}", total),
+        format!("Buy volume        {:.4} {unit}", cluster.buy_qty.to_f64()),
+        format!("Sell volume       {:.4} {unit}", cluster.sell_qty.to_f64()),
+        format!("Delta            {:+.4} {unit}", cluster.delta_qty.to_f64()),
+        format!("Trades            {}", cluster.trade_count),
+        format!(
+            "Largest trade     {:.4} {unit}",
+            cluster.largest_trade_qty.to_f64()
+        ),
+        format!("VWAP              {:.4}", cluster.vwap_price.to_f64()),
+        format!("Duration          {duration} ms"),
+        format!(
+            "Relative size     {:.1} percentile",
+            cluster.percentile_rank
+        ),
+        format!("Threshold mode    {threshold_mode}"),
+        format!("Price response    {:?}", bubble.price_response),
+    ]
+}
+
+fn draw_volume_bubble_tooltip(
+    frame: &mut canvas::Frame,
+    bubble: &RenderedVolumeBubble,
+    palette: &Extended,
+    ticker_info: &TickerInfo,
+    config: &VolumeBubbleConfig,
+) {
+    let symbol = ticker_info.ticker.display_symbol().unwrap_or("units");
+    let unit = ["USDT", "USDC", "USD", "BTC", "ETH"]
+        .into_iter()
+        .find_map(|quote| symbol.strip_suffix(quote))
+        .filter(|base| !base.is_empty())
+        .unwrap_or("units");
+    let lines = bubble_tooltip_lines(bubble, unit, config.threshold_mode);
+    let width = 310.0;
+    let line_height = 17.0;
+    frame.fill_rectangle(
+        Point::new(8.0, 8.0),
+        Size::new(width, line_height * lines.len() as f32 + 12.0),
+        palette.background.weakest.color.scale_alpha(0.96),
+    );
+    for (index, line) in lines.into_iter().enumerate() {
+        frame.fill_text(canvas::Text {
+            content: line,
+            position: Point::new(14.0, 14.0 + index as f32 * line_height),
+            size: iced::Pixels(if index == 0 { 13.0 } else { 12.0 }),
+            color: if index == 0 {
+                bubble.border_color
+            } else {
+                palette.background.base.text
+            },
+            font: style::AZERET_MONO,
+            ..canvas::Text::default()
+        });
     }
 }
 
@@ -3634,18 +4028,6 @@ fn volume_bubble_effective_range(
     let session_start = current_volume_bubble_session_start_ms(at_window_end, config.session);
     let effective_from = window_from.max(session_start);
     (effective_from < window_to).then_some((effective_from, window_to))
-}
-
-fn visible_max_bubble_qty(
-    data_source: &PlotData<KlineDataPoint>,
-    earliest: u64,
-    latest: u64,
-    min_qty: f64,
-    prefer_raw_trades: bool,
-) -> f64 {
-    max_bubble_qty_in_range(data_source, earliest, latest, prefer_raw_trades)
-        .filter(|qty| *qty >= min_qty)
-        .unwrap_or_default()
 }
 
 fn max_bubble_qty_in_range(
@@ -5120,6 +5502,36 @@ mod tests {
     }
 
     #[test]
+    fn non_positive_trade_price_cannot_poison_footprint_autoscale() {
+        let valid = test_trade(1, 61_000, 1.0);
+        let mut zero = test_trade(2, 61_001, 1.0);
+        zero.price = Price::from_f64(0.0);
+
+        let filtered = deduplicate_incoming_trades(&[], &[zero, valid]);
+        assert_eq!(filtered.len(), 1);
+        assert_eq!(filtered[0].id, valid.id);
+        assert_eq!(filtered[0].price, valid.price);
+    }
+
+    #[test]
+    fn historical_aggtrades_do_not_double_a_live_raw_bucket() {
+        let live_bucket = UnixMs::new(60_000);
+        let live_buckets = FxHashSet::from_iter([live_bucket]);
+        let overlapping = test_trade(10, 61_000, 5.0);
+        let historical_only = test_trade(11, 121_000, 7.0);
+
+        let (filtered, discarded) = exclude_historical_overlap_with_live(
+            vec![overlapping, historical_only],
+            &live_buckets,
+            exchange::Timeframe::M1,
+        );
+
+        assert_eq!(discarded, 1);
+        assert_eq!(filtered.len(), 1);
+        assert_eq!(filtered[0].id, historical_only.id);
+    }
+
+    #[test]
     fn evicted_trade_ids_must_still_prevent_bubble_reaggregation() {
         let previously_aggregated = test_trade(42, 61_000, 10.0);
         let retained_newer_trade = test_trade(99, 120_000, 1.0);
@@ -5159,60 +5571,6 @@ mod tests {
             .map(|group| group.total_qty())
             .fold(Qty::ZERO, |total, qty| total + qty);
         assert_eq!(total_qty.to_f64(), 10.0);
-    }
-
-    #[test]
-    fn bubble_rendering_uses_raw_or_summary_without_summing_both() {
-        let price = Price::from_f64(100.0);
-        let mut trades = KlineTrades::new();
-        trades.trades.insert(
-            price,
-            data::chart::kline::GroupedTrades {
-                buy_qty: Qty::from_f64(10.0),
-                sell_qty: Qty::ZERO,
-                first_time: UnixMs::new(61_000),
-                last_time: UnixMs::new(61_000),
-                buy_count: 1,
-                sell_count: 0,
-            },
-        );
-        let summary = BubbleVolumeSummary::new(
-            UnixMs::new(60_000),
-            vec![BubbleCandidate {
-                candle_time: UnixMs::new(60_000),
-                price,
-                total_qty: Qty::from_f64(50.0),
-                buy_qty: Qty::from_f64(50.0),
-                sell_qty: Qty::ZERO,
-                delta_qty: Qty::from_f64(50.0),
-                trade_count: 5,
-                score: 50.0,
-                first_time: Some(UnixMs::new(61_000)),
-                last_time: Some(UnixMs::new(62_000)),
-            }],
-        );
-
-        let raw_points = collect_volume_bubble_points(
-            &trades,
-            &summary,
-            &VolumeBubbleConfig {
-                use_raw_trades_when_available: true,
-                ..VolumeBubbleConfig::default()
-            },
-        );
-        assert_eq!(raw_points.len(), 1);
-        assert_eq!(raw_points[0].total_qty, 10.0);
-
-        let summary_points = collect_volume_bubble_points(
-            &trades,
-            &summary,
-            &VolumeBubbleConfig {
-                use_raw_trades_when_available: false,
-                ..VolumeBubbleConfig::default()
-            },
-        );
-        assert_eq!(summary_points.len(), 1);
-        assert_eq!(summary_points[0].total_qty, 50.0);
     }
 
     #[test]
@@ -5319,6 +5677,136 @@ mod tests {
         assert_eq!(
             historical_trade_target_to(candle_open, 60_000, UnixMs::new(660_000)),
             UnixMs::new(660_000)
+        );
+    }
+
+    fn rendered_test_bubble(id: u64, x: f32, y: f32, importance: f32) -> RenderedVolumeBubble {
+        let qty = Qty::from_f64(10.0 + f64::from(importance));
+        RenderedVolumeBubble {
+            cluster: VolumeBubbleCluster {
+                id,
+                candle_time: UnixMs::new(60_000),
+                first_time: UnixMs::new(61_000 + id),
+                last_time: UnixMs::new(61_100 + id),
+                weighted_time: UnixMs::new(61_050 + id),
+                vwap_price: Price::from_f64(100.0),
+                total_qty: qty,
+                buy_qty: qty,
+                sell_qty: Qty::ZERO,
+                delta_qty: qty,
+                trade_count: 2,
+                largest_trade_qty: Qty::from_f64(7.0),
+                percentile_rank: 98.7,
+                importance_score: importance,
+            },
+            center: Point::new(x, y),
+            original_center: Point::new(x, y),
+            radius_px: 8.0,
+            fill_color: Color::from_rgb(0.2, 0.8, 0.3),
+            border_color: Color::from_rgb(0.2, 0.8, 0.3),
+            fill_alpha: 0.12,
+            border_alpha: 0.9,
+            label: Some("10".into()),
+            age_factor: 1.0,
+            price_response: BubblePriceResponse::Neutral,
+        }
+    }
+
+    #[test]
+    fn collision_layout_is_horizontal_bounded_and_deterministic() {
+        let config = VolumeBubbleConfig::default();
+        let original = vec![
+            rendered_test_bubble(1, 10.0, 20.0, 2.0),
+            rendered_test_bubble(2, 10.0, 20.0, 1.0),
+        ];
+        let mut first = original.clone();
+        let mut second = original;
+        collision_layout(&mut first, 30.0, 1.0, &config);
+        collision_layout(&mut second, 30.0, 1.0, &config);
+        assert_eq!(first.len(), second.len());
+        assert_eq!(
+            first
+                .iter()
+                .map(|b| (b.cluster.id, b.center.x, b.center.y))
+                .collect::<Vec<_>>(),
+            second
+                .iter()
+                .map(|b| (b.cluster.id, b.center.x, b.center.y))
+                .collect::<Vec<_>>()
+        );
+        assert!(
+            first
+                .iter()
+                .all(|bubble| bubble.center.y == bubble.original_center.y)
+        );
+        assert!(
+            first
+                .iter()
+                .all(|bubble| (bubble.center.x - bubble.original_center.x).abs() <= 8.0)
+        );
+    }
+
+    #[test]
+    fn collision_excludes_less_important_when_no_space() {
+        let config = VolumeBubbleConfig {
+            min_center_distance_px: 100.0,
+            ..VolumeBubbleConfig::default()
+        };
+        let mut bubbles = vec![
+            rendered_test_bubble(1, 10.0, 20.0, 2.0),
+            rendered_test_bubble(2, 10.0, 20.0, 1.0),
+        ];
+        collision_layout(&mut bubbles, 2.0, 1.0, &config);
+        assert_eq!(bubbles.len(), 1);
+        assert_eq!(bubbles[0].cluster.id, 1);
+    }
+
+    #[test]
+    fn hit_test_prefers_visually_dominant_bubble_and_tooltip_has_core_values() {
+        let bubbles = vec![
+            rendered_test_bubble(1, 0.0, 0.0, 1.0),
+            rendered_test_bubble(2, 0.0, 0.0, 2.0),
+        ];
+        let hit = hit_test_volume_bubbles(
+            &bubbles,
+            Point::new(50.0, 50.0),
+            Vector::new(50.0, 50.0),
+            Vector::new(0.0, 0.0),
+            1.0,
+        )
+        .unwrap();
+        assert_eq!(hit.cluster.id, 2);
+        let lines =
+            bubble_tooltip_lines(hit, "BTC", data::chart::kline::BubbleThresholdMode::Hybrid);
+        let text = lines.join("\n");
+        assert!(text.contains("Total volume"));
+        assert!(text.contains("Delta"));
+        assert!(text.contains("Trades"));
+        assert!(text.contains("98.7 percentile"));
+    }
+
+    #[test]
+    fn label_budget_keeps_only_most_important() {
+        let mut bubbles = vec![
+            rendered_test_bubble(1, 0.0, 0.0, 1.0),
+            rendered_test_bubble(2, 20.0, 0.0, 3.0),
+            rendered_test_bubble(3, 40.0, 0.0, 2.0),
+        ];
+        apply_label_budget(&mut bubbles, 1);
+        assert_eq!(
+            bubbles
+                .iter()
+                .filter(|bubble| bubble.label.is_some())
+                .count(),
+            1
+        );
+        assert!(
+            bubbles
+                .iter()
+                .find(|bubble| bubble.cluster.id == 2)
+                .unwrap()
+                .label
+                .is_some()
         );
     }
 }

@@ -1,7 +1,7 @@
-# Flowsurface
+# Flowdepth - Flowsurface, below the surface
 
 [![Crates.io](https://img.shields.io/crates/v/flowsurface)](https://crates.io/crates/flowsurface)
-[![Develop CI](https://github.com/Niketion/flowsurface/actions/workflows/develop-ci.yml/badge.svg?branch=develop)](https://github.com/Niketion/flowsurface/actions/workflows/develop-ci.yml)
+[![Develop CI](https://github.com/Niketion/flowdepth/actions/workflows/develop-ci.yml/badge.svg?branch=develop)](https://github.com/Niketion/flowdepth/actions/workflows/develop-ci.yml)
 [![Discord](https://img.shields.io/badge/Discord-%235865F2.svg?&logo=discord&logoColor=white)](https://discord.gg/RN2XAF7ZuR)
 [![License: GPL v3](https://img.shields.io/badge/License-GPLv3-blue.svg)](https://github.com/flowsurface-rs/flowsurface/blob/main/LICENSE)
 [![Made with iced](https://iced.rs/badge.svg)](https://github.com/iced-rs/iced)
@@ -75,7 +75,7 @@ See the complete source comparison: [`upstream/main...origin/develop`](https://g
 
 ### Method 1: Prebuilt Binaries
 
-Experimental packages for Windows, macOS, and Linux are available on this fork's [Releases page](https://github.com/Niketion/flowsurface/releases).
+Experimental packages for Windows, macOS, and Linux are available on this fork's [Releases page](https://github.com/Niketion/flowdepth/releases).
 These builds are unstable and intended for testing; use the upstream [Flowsurface Releases page](https://github.com/flowsurface-rs/flowsurface/releases) for official releases.
 
 Every successful push to `develop` creates a prerelease named `develop-<commit>`.
@@ -107,7 +107,7 @@ Since these binaries are currently unsigned they might get flagged.
 
 ```bash
 # Install latest globally
-cargo install --git https://github.com/Niketion/flowsurface --branch develop flowsurface
+cargo install --git https://github.com/Niketion/flowdepth --branch develop flowsurface
 
 # Run
 flowsurface
@@ -117,7 +117,7 @@ flowsurface
 
 ```bash
 # Clone the repository
-git clone --branch develop https://github.com/Niketion/flowsurface
+git clone --branch develop https://github.com/Niketion/flowdepth
 
 cd flowsurface
 
