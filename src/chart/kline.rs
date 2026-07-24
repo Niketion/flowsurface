@@ -260,7 +260,7 @@ impl KlineChart {
     ) -> Self {
         let mut visual_config = visual_config.unwrap_or_default();
         visual_config.migrate_legacy_indicator_configs();
-        let kind = Self::sanitized_kind(kind.clone());
+        let kind = kind.clone();
         let raw_trades = deduplicate_incoming_trades(&[], &raw_trades);
 
         match basis {
@@ -1482,13 +1482,10 @@ impl KlineChart {
 
     pub fn set_cluster_kind(&mut self, new_kind: ClusterKind) {
         if let KlineChartKind::Footprint {
-            ref mut clusters,
-            ref mut studies,
-            ..
+            ref mut clusters, ..
         } = self.kind
         {
             *clusters = new_kind;
-            studies.retain(|study| new_kind.allows_study(study));
         }
 
         self.invalidate(None);
@@ -1580,15 +1577,10 @@ impl KlineChart {
 
     pub fn set_studies(&mut self, new_studies: Vec<FootprintStudy>) {
         if let KlineChartKind::Footprint {
-            clusters,
-            ref mut studies,
-            ..
+            ref mut studies, ..
         } = self.kind
         {
-            *studies = new_studies
-                .into_iter()
-                .filter(|study| clusters.allows_study(study))
-                .collect();
+            *studies = new_studies;
         }
 
         self.invalidate(None);
@@ -2267,19 +2259,6 @@ fn select_trade_fetch_gap(
     Some(latest)
 }
 
-impl KlineChart {
-    fn sanitized_kind(mut kind: KlineChartKind) -> KlineChartKind {
-        if let KlineChartKind::Footprint {
-            clusters, studies, ..
-        } = &mut kind
-        {
-            studies.retain(|study| clusters.allows_study(study));
-        }
-
-        kind
-    }
-}
-
 impl canvas::Program<Message> for KlineChart {
     type State = Interaction;
 
@@ -2376,19 +2355,17 @@ impl canvas::Program<Message> for KlineChart {
                         gaps: content_spacing,
                     };
 
-                    if *clusters != ClusterKind::Table {
-                        draw_all_npocs(
-                            &self.data_source,
-                            frame,
-                            price_to_y,
-                            interval_to_x,
-                            &cell_layout,
-                            studies,
-                            earliest,
-                            latest,
-                            imbalance.is_some(),
-                        );
-                    }
+                    draw_all_npocs(
+                        &self.data_source,
+                        frame,
+                        price_to_y,
+                        interval_to_x,
+                        &cell_layout,
+                        studies,
+                        earliest,
+                        latest,
+                        imbalance.is_some(),
+                    );
 
                     render_data_source(
                         &self.data_source,
@@ -4246,7 +4223,8 @@ fn draw_all_npocs(
 
     let start_x_for = |cell_center_x: f32| -> f32 {
         match layout.cluster {
-            ClusterKind::BidAsk | ClusterKind::Table => {
+            ClusterKind::Table => cell_center_x + (layout.cell_w / 2.0) - inset,
+            ClusterKind::BidAsk => {
                 cell_center_x + (layout.candle_w / 2.0) + layout.gaps.candle_to_cluster
             }
             ClusterKind::VolumeProfile | ClusterKind::DeltaProfile => {

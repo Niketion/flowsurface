@@ -367,6 +367,7 @@ impl HeatmapShader {
             depth_grid: &self.depth_grid,
             base_price: render_base_price,
             step: self.step,
+            label_precision: self.ticker_info.min_ticksize,
             scroll_ref_bucket,
             qty_scale: self.qty_scale,
             tooltip_cache: &self.canvas_caches.overlay,
@@ -380,6 +381,7 @@ impl HeatmapShader {
             show_icebergs: self.config.iceberg_detector.enabled,
             aggr_time_ms: self.depth_history.aggr_time_ms(),
             y_anchor: self.depth_grid.y_anchor_price(),
+            timezone,
         };
 
         let chart = HeatmapShaderWidget::new(&self.scene, x_axis, y_axis, overlay)

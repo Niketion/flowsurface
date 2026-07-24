@@ -575,13 +575,6 @@ impl ClusterKind {
         ClusterKind::DeltaProfile,
         ClusterKind::Table,
     ];
-
-    pub fn allows_study(&self, study: &FootprintStudy) -> bool {
-        !matches!(
-            (self, study),
-            (ClusterKind::Table, FootprintStudy::NPoC { .. })
-        )
-    }
 }
 
 impl std::fmt::Display for ClusterKind {

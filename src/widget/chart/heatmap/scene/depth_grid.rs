@@ -92,6 +92,11 @@ impl GridRing {
         self.tex_h
     }
 
+    #[inline]
+    pub fn aggr_time_ms(&self) -> u64 {
+        self.aggr_time_ms
+    }
+
     /// Current y-anchor used for mapping (if any).
     #[inline]
     pub fn y_anchor_price(&self) -> Option<Price> {

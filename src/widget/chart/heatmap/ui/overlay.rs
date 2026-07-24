@@ -5,24 +5,25 @@ use crate::widget::chart::heatmap::scene::depth_grid::GridRing;
 use crate::widget::chart::heatmap::ui;
 use crate::widget::chart::heatmap::view;
 
+use data::config::timezone::TimeLabelKind;
 use data::orderflow::iceberg::{IcebergEvent, IcebergSide};
 use data::util::abbr_large_numbers;
 use exchange::unit::Qty;
-use exchange::unit::{Price, PriceStep};
+use exchange::unit::{MinTicksize, Price, PriceStep};
 
 use iced::widget::canvas::Path;
 use iced::{Alignment, Point, Rectangle, Renderer, Theme, mouse, widget::canvas};
 
-const TOOLTIP_WIDTH: f32 = 204.0;
-const TOOLTIP_HEIGHT: f32 = 66.0;
+const TOOLTIP_WIDTH: f32 = 260.0;
+const TOOLTIP_HEIGHT: f32 = 136.0;
 const TOOLTIP_PADDING: f32 = 12.0;
 const TOOLTIP_COL_GAP_PX: f32 = 2.0;
 
 const OVERLAY_LABEL_PAD_PX: f32 = 6.0;
 const OVERLAY_SCALE_LABEL_TEXT_SIZE: f32 = style::text_size::TINY;
 
-const TOOLTIP_ROW_OFFSETS: [i64; 3] = [1, 0, -1];
-const TOOLTIP_COL_OFFSETS: [i64; 4] = [-2, -1, 0, 1];
+const TOOLTIP_ROW_OFFSETS: [i64; 7] = [3, 2, 1, 0, -1, -2, -3];
+const TOOLTIP_COL_OFFSETS: [i64; 3] = [-2, -1, 0];
 
 const HIGHLIGHT_CROSSHAIR_GAP_PX: f32 = 1.0;
 const HIGHLIGHT_BORDER_WIDTH_PX: f32 = 1.0;
@@ -74,7 +75,7 @@ impl TooltipLayout {
             height: TOOLTIP_HEIGHT,
         };
 
-        let col_count = TOOLTIP_COL_OFFSETS.len() as f32;
+        let col_count = (TOOLTIP_COL_OFFSETS.len() + 1) as f32;
         let col_gap = TOOLTIP_COL_GAP_PX;
         let cell_w = (TOOLTIP_WIDTH - ((col_count - 1.0) * col_gap)) / col_count;
         let cell_h = TOOLTIP_HEIGHT / (TOOLTIP_ROW_OFFSETS.len() as f32);
@@ -144,6 +145,7 @@ pub struct OverlayCanvas<'a> {
     pub depth_grid: &'a GridRing,
     pub base_price: Option<Price>,
     pub step: PriceStep,
+    pub label_precision: MinTicksize,
     pub scroll_ref_bucket: i64,
     pub qty_scale: f32,
 
@@ -161,6 +163,7 @@ pub struct OverlayCanvas<'a> {
     pub show_icebergs: bool,
     pub aggr_time_ms: u64,
     pub y_anchor: Option<Price>,
+    pub timezone: data::UserTimezone,
 }
 
 impl<'a> canvas::Program<Message> for OverlayCanvas<'a> {
@@ -474,6 +477,9 @@ impl<'a> canvas::Program<Message> for OverlayCanvas<'a> {
 
             frame.fill_rectangle(layout.rect.position(), layout.rect.size(), bg);
 
+            let denom = self.scene.params.depth_denom().max(1.0);
+            let mut high_density_spots = Vec::new();
+
             for (row_idx, &dy) in TOOLTIP_ROW_OFFSETS.iter().enumerate() {
                 let rel_y_bin = base_rel_y_bin.saturating_add(dy);
                 let y_tex = rel_y_bin.saturating_sub(y_start_bin);
@@ -481,52 +487,172 @@ impl<'a> canvas::Program<Message> for OverlayCanvas<'a> {
                     continue;
                 }
 
-                for (col_idx, &dx) in TOOLTIP_COL_OFFSETS.iter().enumerate() {
-                    let bucket = base_bucket_abs.saturating_add(dx);
-                    let x_ring = self.depth_grid.ring_x_for_bucket(bucket) as i64;
-                    if x_ring < 0 || x_ring >= tex_w {
-                        continue;
+                // Reference bid/ask direction at column offset 0 (current time)
+                let ref_bucket = base_bucket_abs.saturating_add(0);
+                let ref_x_ring = self.depth_grid.ring_x_for_bucket(ref_bucket) as i64;
+                let is_bid_level = if ref_x_ring >= 0 && ref_x_ring < tex_w {
+                    let idx = (y_tex as usize) * (tex_w as usize) + (ref_x_ring as usize);
+                    if idx < self.depth_grid.bids_len() && idx < self.depth_grid.asks_len() {
+                        let bid_u32 = self.depth_grid.get_bid(idx).unwrap_or(0);
+                        let ask_u32 = self.depth_grid.get_ask(idx).unwrap_or(0);
+                        bid_u32 >= ask_u32
+                    } else {
+                        rel_y_bin <= 0
                     }
+                } else {
+                    rel_y_bin <= 0
+                };
 
-                    let idx = (y_tex as usize) * (tex_w as usize) + (x_ring as usize);
-                    if idx >= self.depth_grid.bids_len() || idx >= self.depth_grid.asks_len() {
-                        continue;
-                    }
+                for col_idx in 0..4 {
+                    let cell_pos = Point::new(
+                        layout.rect.x + (col_idx as f32) * (layout.cell_w + layout.col_gap),
+                        layout.rect.y + (row_idx as f32) * layout.cell_h,
+                    );
+                    let cell_size = iced::Size::new(layout.cell_w, layout.cell_h);
 
-                    let (bid_u32, ask_u32) =
-                        match (self.depth_grid.get_bid(idx), self.depth_grid.get_ask(idx)) {
-                            (Some(b), Some(a)) => (b, a),
-                            _ => continue,
+                    if col_idx < 3 {
+                        let dx = TOOLTIP_COL_OFFSETS[col_idx];
+                        let bucket = base_bucket_abs.saturating_add(dx);
+                        let x_ring = self.depth_grid.ring_x_for_bucket(bucket) as i64;
+                        if x_ring < 0 || x_ring >= tex_w {
+                            continue;
+                        }
+
+                        let idx = (y_tex as usize) * (tex_w as usize) + (x_ring as usize);
+                        if idx >= self.depth_grid.bids_len() || idx >= self.depth_grid.asks_len() {
+                            continue;
+                        }
+
+                        let (bid_u32, ask_u32) =
+                            match (self.depth_grid.get_bid(idx), self.depth_grid.get_ask(idx)) {
+                                (Some(b), Some(a)) => (b, a),
+                                _ => continue,
+                            };
+
+                        if bid_u32 == 0 && ask_u32 == 0 {
+                            continue;
+                        }
+
+                        let (_is_bid, qty_u32) = if bid_u32 >= ask_u32 {
+                            (true, bid_u32)
+                        } else {
+                            (false, ask_u32)
                         };
 
-                    if bid_u32 == 0 && ask_u32 == 0 {
-                        continue;
+                        let qty: f32 = (qty_u32 as f32) / self.qty_scale;
+                        let t = (qty / denom).clamp(0.0, 1.0);
+
+                        if t > 0.70 {
+                            if let Some(base_price) = self.base_price {
+                                let steps_per_y_bin = self.scene.params.steps_per_y_bin();
+                                let price =
+                                    base_price.add_steps(rel_y_bin * steps_per_y_bin, self.step);
+                                let aggr_time_ms = self.depth_grid.aggr_time_ms();
+                                let t_ms = bucket.saturating_mul(aggr_time_ms as i64);
+                                let time_str = self
+                                    .timezone
+                                    .format_with_kind(
+                                        t_ms,
+                                        TimeLabelKind::Crosshair { show_millis: true },
+                                    )
+                                    .unwrap_or_else(|| "N/A".to_string());
+                                high_density_spots.push((price, qty, t, time_str));
+                            }
+                        }
+
+                        let bg_color = viridis_color(t);
+                        // Scale the alpha to ensure low values are semi-transparent and dark,
+                        // while high values are bright and opaque.
+                        let final_bg_color = iced::Color {
+                            a: 0.25 + t * 0.75,
+                            ..bg_color
+                        };
+
+                        frame.fill_rectangle(cell_pos, cell_size, final_bg_color);
+
+                        let text_color = if t > 0.65 {
+                            iced::Color::BLACK
+                        } else {
+                            palette.background.base.text.scale_alpha(0.95)
+                        };
+
+                        frame.fill_text(canvas::Text {
+                            content: abbr_large_numbers(qty as f64),
+                            position: layout.cell_center(row_idx, col_idx),
+                            size: iced::Pixels(crate::style::text_size::TINY),
+                            color: text_color,
+                            align_x: Alignment::Center.into(),
+                            align_y: Alignment::Center.into(),
+                            font: crate::style::AZERET_MONO,
+                            ..canvas::Text::default()
+                        });
+                    } else {
+                        if let Some(base_price) = self.base_price {
+                            let steps_per_y_bin = self.scene.params.steps_per_y_bin();
+                            let price =
+                                base_price.add_steps(rel_y_bin * steps_per_y_bin, self.step);
+                            let price_str = price.to_string(self.label_precision);
+
+                            let text_color = if is_bid_level {
+                                palette.success.strong.color
+                            } else {
+                                palette.danger.strong.color
+                            };
+
+                            frame.fill_rectangle(
+                                cell_pos,
+                                cell_size,
+                                palette.background.weakest.color.scale_alpha(0.3),
+                            );
+
+                            frame.fill_text(canvas::Text {
+                                content: price_str,
+                                position: layout.cell_center(row_idx, col_idx),
+                                size: iced::Pixels(crate::style::text_size::TINY),
+                                color: text_color.scale_alpha(0.95),
+                                align_x: Alignment::Center.into(),
+                                align_y: Alignment::Center.into(),
+                                font: crate::style::AZERET_MONO,
+                                ..canvas::Text::default()
+                            });
+                        }
                     }
-
-                    let (is_bid, qty_u32) = if bid_u32 >= ask_u32 {
-                        (true, bid_u32)
-                    } else {
-                        (false, ask_u32)
-                    };
-
-                    let qty: f32 = (qty_u32 as f32) / self.qty_scale;
-                    let color = if is_bid {
-                        palette.success.strong.color
-                    } else {
-                        palette.danger.strong.color
-                    };
-
-                    frame.fill_text(canvas::Text {
-                        content: abbr_large_numbers(qty as f64),
-                        position: layout.cell_center(row_idx, col_idx),
-                        size: iced::Pixels(crate::style::text_size::TINY),
-                        color: color.scale_alpha(0.95),
-                        align_x: Alignment::Center.into(),
-                        align_y: Alignment::Center.into(),
-                        font: crate::style::AZERET_MONO,
-                        ..canvas::Text::default()
-                    });
                 }
+            }
+
+            if !high_density_spots.is_empty() {
+                high_density_spots
+                    .sort_by(|a, b| b.2.partial_cmp(&a.2).unwrap_or(std::cmp::Ordering::Equal));
+                high_density_spots.truncate(5);
+
+                let mut lines = Vec::new();
+                for (price, qty, t, time_str) in &high_density_spots {
+                    let price_str = price.to_string(self.label_precision);
+                    let qty_str = abbr_large_numbers(*qty as f64);
+                    lines.push(format!(
+                        "[{}] Price: {:>10} | Qty: {:>8} | t: {:.2}",
+                        time_str, price_str, qty_str, t
+                    ));
+                }
+
+                let max_len = lines.iter().map(|l| l.len()).max().unwrap_or(0).max(30);
+                let border_width = max_len + 4;
+
+                println!("┌{}┐", "─".repeat(border_width));
+                let title = "TOP DENSITY SPOTS";
+                let padding = (border_width - title.len()) / 2;
+                println!(
+                    "│{}{}{}│",
+                    " ".repeat(padding),
+                    title,
+                    " ".repeat(border_width - title.len() - padding)
+                );
+                println!("├{}┤", "─".repeat(border_width));
+                for line in lines {
+                    let right_pad = border_width - 2 - line.len();
+                    println!("│  {}{}│", line, " ".repeat(right_pad));
+                }
+                println!("└{}┘", "─".repeat(border_width));
             }
         });
 
@@ -950,4 +1076,24 @@ impl<'a> OverlayCanvas<'a> {
             height: rect_h,
         })
     }
+}
+
+fn viridis_color(t: f32) -> iced::Color {
+    let t = t.clamp(0.0, 1.0);
+    let c0 = [0.2777273272234177, 0.005407344544966578, 0.3340998053353061];
+    let c1 = [0.1050930431085774, 1.404613529898575, 1.384590162594685];
+    let c2 = [-0.3308618287255563, 0.214847559468213, 0.09509516302823659];
+    let c3 = [-4.634230498983486, -5.799100973351585, -19.33244095627987];
+    let c4 = [6.228269936347081, 14.17993336680509, 56.69055260068105];
+    let c5 = [4.776384997670288, -13.74514537774601, -65.35303263337234];
+    let c6 = [-5.435455855934631, 4.645852612178535, 26.3124352495832];
+
+    let mut color = [0.0; 3];
+    for i in 0..3 {
+        color[i] =
+            c0[i] + t * (c1[i] + t * (c2[i] + t * (c3[i] + t * (c4[i] + t * (c5[i] + t * c6[i])))));
+        color[i] = color[i].clamp(0.0, 1.0);
+    }
+
+    iced::Color::from_rgb(color[0], color[1], color[2])
 }
