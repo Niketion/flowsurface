@@ -4,8 +4,9 @@ use crate::widget::{column_drag, dragger_row, labeled_slider};
 
 use data::chart::indicator::{Indicator, KlineIndicator, UiIndicator};
 use data::chart::kline::{
-    BubbleColorMode, Config as KlineConfig, CvdRenderStyle, CvdReset, SessionProfileInterval,
-    SessionProfileMode, SessionProfilePlacement, VolumeBubbleSession,
+    BubbleColorMode, BubbleLabelMode, BubbleThresholdMode, Config as KlineConfig, CvdRenderStyle,
+    CvdReset, SessionProfileInterval, SessionProfileMode, SessionProfilePlacement,
+    VolumeBubblePreset, VolumeBubbleSession,
 };
 use data::layout::pane::VisualConfig;
 use data::util::format_with_commas;
@@ -318,6 +319,38 @@ pub fn view_kline<'a>(
 
     if selected.contains(&KlineIndicator::VolumeBubbles) {
         let bubbles = cfg.volume_bubbles;
+        let preset = pick_list(
+            VolumeBubblePreset::ALL,
+            Some(bubbles.preset),
+            move |preset| {
+                let mut volume_bubbles = data::chart::kline::VolumeBubbleConfig::for_preset(preset);
+                volume_bubbles.enabled = bubbles.enabled;
+                config_message(
+                    pane,
+                    KlineConfig {
+                        volume_bubbles,
+                        ..cfg
+                    },
+                )
+            },
+        );
+        let threshold_mode = pick_list(
+            BubbleThresholdMode::ALL,
+            Some(bubbles.threshold_mode),
+            move |threshold_mode| {
+                config_message(
+                    pane,
+                    KlineConfig {
+                        volume_bubbles: data::chart::kline::VolumeBubbleConfig {
+                            threshold_mode,
+                            ..bubbles
+                        }
+                        .customized(),
+                        ..cfg
+                    },
+                )
+            },
+        );
         let session = pick_list(
             VolumeBubbleSession::ALL,
             Some(bubbles.session),
@@ -369,6 +402,97 @@ pub fn view_kline<'a>(
             |v| format!("{v:.0}"),
             Some(1.0),
         );
+        let viewport_count = labeled_slider(
+            "Max / viewport",
+            5.0..=100.0,
+            bubbles.max_bubbles_in_view as f32,
+            move |v| {
+                config_message(
+                    pane,
+                    KlineConfig {
+                        volume_bubbles: data::chart::kline::VolumeBubbleConfig {
+                            max_bubbles_in_view: v as usize,
+                            ..bubbles
+                        }
+                        .customized(),
+                        ..cfg
+                    },
+                )
+            },
+            |v| format!("{v:.0}"),
+            Some(1.0),
+        );
+        let cluster_time = labeled_slider(
+            "Cluster time",
+            100.0..=1_500.0,
+            bubbles.cluster_window_ms as f32,
+            move |v| {
+                config_message(
+                    pane,
+                    KlineConfig {
+                        volume_bubbles: data::chart::kline::VolumeBubbleConfig {
+                            cluster_window_ms: v as u32,
+                            ..bubbles
+                        }
+                        .customized(),
+                        ..cfg
+                    },
+                )
+            },
+            |v| format!("{v:.0}ms"),
+            Some(50.0),
+        );
+        let display_percentile = labeled_slider(
+            "Display percentile",
+            80.0..=99.9,
+            bubbles.display_percentile,
+            move |v| {
+                config_message(
+                    pane,
+                    KlineConfig {
+                        volume_bubbles: data::chart::kline::VolumeBubbleConfig {
+                            display_percentile: v,
+                            ..bubbles
+                        }
+                        .customized(),
+                        ..cfg
+                    },
+                )
+            },
+            |v| format!("{v:.1}"),
+            Some(0.5),
+        );
+        let age_fading =
+            checkbox(bubbles.age_fading)
+                .label("Age fading")
+                .on_toggle(move |age_fading| {
+                    config_message(
+                        pane,
+                        KlineConfig {
+                            volume_bubbles: data::chart::kline::VolumeBubbleConfig {
+                                age_fading,
+                                ..bubbles
+                            }
+                            .customized(),
+                            ..cfg
+                        },
+                    )
+                });
+        let price_response = checkbox(bubbles.price_response_enabled)
+            .label("Price response analysis")
+            .on_toggle(move |price_response_enabled| {
+                config_message(
+                    pane,
+                    KlineConfig {
+                        volume_bubbles: data::chart::kline::VolumeBubbleConfig {
+                            price_response_enabled,
+                            ..bubbles
+                        }
+                        .customized(),
+                        ..cfg
+                    },
+                )
+            });
         let candidates = labeled_slider(
             "Historical candidates",
             1.0..=20.0,
@@ -464,20 +588,23 @@ pub fn view_kline<'a>(
             |v| format!("{v:.0}px"),
             Some(1.0),
         );
-        let labels = checkbox(bubbles.show_labels)
-            .label("Labels")
-            .on_toggle(move |show_labels| {
+        let labels = pick_list(
+            BubbleLabelMode::ALL,
+            Some(bubbles.label_mode),
+            move |label_mode| {
                 config_message(
                     pane,
                     KlineConfig {
                         volume_bubbles: data::chart::kline::VolumeBubbleConfig {
-                            show_labels,
+                            label_mode,
                             ..bubbles
-                        },
+                        }
+                        .customized(),
                         ..cfg
                     },
                 )
-            });
+            },
+        );
         let reuse = checkbox(bubbles.use_raw_trades_when_available)
             .label("Reuse shared raw trades")
             .on_toggle(move |use_raw_trades_when_available| {
@@ -495,7 +622,22 @@ pub fn view_kline<'a>(
         sections = sections.push(indicator_card(
             "Volume Bubbles",
             column![
-                session, mode, count, candidates, history, min_qty, min_radius, max_radius, labels,
+                preset,
+                session,
+                mode,
+                labels,
+                threshold_mode,
+                display_percentile,
+                min_qty,
+                cluster_time,
+                count,
+                viewport_count,
+                min_radius,
+                max_radius,
+                age_fading,
+                price_response,
+                history,
+                candidates,
                 reuse
             ]
             .spacing(6),

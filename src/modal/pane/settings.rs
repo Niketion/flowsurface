@@ -8,8 +8,8 @@ use crate::{style, tooltip, widget::scrollable_content};
 
 use data::chart::heatmap::HeatmapStudy;
 use data::chart::kline::{
-    BubbleColorMode, FootprintStudy, SessionProfileInterval, SessionProfileMode,
-    SessionProfilePlacement, VolumeBubbleSession,
+    BubbleColorMode, BubbleLabelMode, BubbleThresholdMode, FootprintStudy, SessionProfileInterval,
+    SessionProfileMode, SessionProfilePlacement, VolumeBubblePreset, VolumeBubbleSession,
 };
 use data::chart::{
     KlineChartKind,
@@ -41,6 +41,194 @@ where
         .max_width(max_width)
         .style(style::chart_modal)
         .into()
+}
+
+fn iceberg_cfg_controls<'a>(cfg: heatmap::Config, pane: pane_grid::Pane) -> Element<'a, Message> {
+    let update = move |detector: data::orderflow::iceberg::IcebergDetectorConfig| {
+        Message::VisualConfigChanged(
+            pane,
+            VisualConfig::Heatmap(heatmap::Config {
+                iceberg_detector: detector,
+                ..cfg
+            }),
+            false,
+        )
+    };
+    let detector = cfg.iceberg_detector;
+    let mut controls = column![
+        text("Order flow").size(crate::style::text_size::SECTION),
+        checkbox(detector.enabled)
+            .label("Possible iceberg markers (Binance Linear)")
+            .on_toggle(
+                move |enabled| update(data::orderflow::iceberg::IcebergDetectorConfig {
+                    enabled,
+                    ..detector
+                })
+            ),
+        text("Uses raw trades and repeated L2 replenishment; disabled by default.")
+            .size(crate::style::text_size::SMALL),
+    ]
+    .spacing(8);
+
+    if detector.enabled {
+        controls = controls
+            .push(classic_slider_row(
+                text("Distance from touch"),
+                slider(
+                    0..=10,
+                    detector.max_distance_from_touch_ticks,
+                    move |value| {
+                        update(data::orderflow::iceberg::IcebergDetectorConfig {
+                            max_distance_from_touch_ticks: value,
+                            ..detector
+                        })
+                    },
+                )
+                .into(),
+                Some(text(format!(
+                    "{} ticks",
+                    detector.max_distance_from_touch_ticks
+                ))),
+            ))
+            .push(classic_slider_row(
+                text("Reorder window"),
+                slider(50..=500, detector.reorder_window_ms, move |value| {
+                    update(data::orderflow::iceberg::IcebergDetectorConfig {
+                        reorder_window_ms: value,
+                        ..detector
+                    })
+                })
+                .step(10u32)
+                .into(),
+                Some(text(format!("{} ms", detector.reorder_window_ms))),
+            ))
+            .push(classic_slider_row(
+                text("Idle timeout"),
+                slider(
+                    1_000..=15_000,
+                    detector.episode_idle_timeout_ms,
+                    move |value| {
+                        update(data::orderflow::iceberg::IcebergDetectorConfig {
+                            episode_idle_timeout_ms: value,
+                            ..detector
+                        })
+                    },
+                )
+                .step(500u32)
+                .into(),
+                Some(text(format!("{} ms", detector.episode_idle_timeout_ms))),
+            ))
+            .push(classic_slider_row(
+                text("Max episode"),
+                slider(
+                    5_000..=60_000,
+                    detector.episode_max_duration_ms,
+                    move |value| {
+                        update(data::orderflow::iceberg::IcebergDetectorConfig {
+                            episode_max_duration_ms: value,
+                            ..detector
+                        })
+                    },
+                )
+                .step(1_000u32)
+                .into(),
+                Some(text(format!(
+                    "{} s",
+                    detector.episode_max_duration_ms / 1_000
+                ))),
+            ))
+            .push(classic_slider_row(
+                text("Minimum refill cycles"),
+                slider(1..=10, detector.minimum_refill_count, move |value| {
+                    update(data::orderflow::iceberg::IcebergDetectorConfig {
+                        minimum_refill_count: value,
+                        ..detector
+                    })
+                })
+                .into(),
+                Some(text(detector.minimum_refill_count)),
+            ))
+            .push(classic_slider_row(
+                text("Executed / displayed"),
+                slider(
+                    1.0..=10.0,
+                    detector.minimum_executed_to_displayed,
+                    move |value| {
+                        update(data::orderflow::iceberg::IcebergDetectorConfig {
+                            minimum_executed_to_displayed: value,
+                            ..detector
+                        })
+                    },
+                )
+                .step(0.1)
+                .into(),
+                Some(text(format!(
+                    "{:.1}×",
+                    detector.minimum_executed_to_displayed
+                ))),
+            ))
+            .push(classic_slider_row(
+                text("Minimum refill ratio"),
+                slider(0.1..=1.5, detector.minimum_refill_ratio, move |value| {
+                    update(data::orderflow::iceberg::IcebergDetectorConfig {
+                        minimum_refill_ratio: value,
+                        ..detector
+                    })
+                })
+                .step(0.05)
+                .into(),
+                Some(text(format!(
+                    "{:.0}%",
+                    detector.minimum_refill_ratio * 100.0
+                ))),
+            ))
+            .push(classic_slider_row(
+                text("Maximum adverse move"),
+                slider(0..=10, detector.maximum_adverse_ticks, move |value| {
+                    update(data::orderflow::iceberg::IcebergDetectorConfig {
+                        maximum_adverse_ticks: value,
+                        ..detector
+                    })
+                })
+                .into(),
+                Some(text(format!("{} ticks", detector.maximum_adverse_ticks))),
+            ))
+            .push(classic_slider_row(
+                text("Minimum score"),
+                slider(50..=100, detector.minimum_score, move |value| {
+                    update(data::orderflow::iceberg::IcebergDetectorConfig {
+                        minimum_score: value,
+                        ..detector
+                    })
+                })
+                .into(),
+                Some(text(format!("{} / 100", detector.minimum_score))),
+            ))
+            .push(classic_slider_row(
+                text("Marker retention"),
+                slider(30..=900, detector.retention_seconds, move |value| {
+                    update(data::orderflow::iceberg::IcebergDetectorConfig {
+                        retention_seconds: value,
+                        ..detector
+                    })
+                })
+                .step(30u32)
+                .into(),
+                Some(text(format!("{} s", detector.retention_seconds))),
+            ))
+            .push(
+                checkbox(detector.show_weak_candidates)
+                    .label("Show weak candidates")
+                    .on_toggle(move |show_weak_candidates| {
+                        update(data::orderflow::iceberg::IcebergDetectorConfig {
+                            show_weak_candidates,
+                            ..detector
+                        })
+                    }),
+            );
+    }
+
+    controls.into()
 }
 
 pub fn heatmap_cfg_view<'a>(
@@ -263,6 +451,8 @@ pub fn heatmap_cfg_view<'a>(
         col
     };
 
+    let orderflow_column = iceberg_cfg_controls(cfg, pane);
+
     let study_cfg = study_config.view(studies, basis).map(move |msg| {
         Message::PaneEvent(
             pane,
@@ -274,6 +464,7 @@ pub fn heatmap_cfg_view<'a>(
         size_filters_column,
         noise_filters_column,
         trade_viz_column,
+        orderflow_column,
         column![text("Studies").size(crate::style::text_size::SECTION), study_cfg].spacing(8),
         row![
             space::horizontal(),
@@ -384,6 +575,8 @@ pub fn heatmap_shader_cfg_view<'a>(
         col
     };
 
+    let orderflow_column = iceberg_cfg_controls(cfg, pane);
+
     let study_cfg = study_config.view(studies, basis).map(move |msg| {
         Message::PaneEvent(
             pane,
@@ -394,6 +587,7 @@ pub fn heatmap_shader_cfg_view<'a>(
     let content = split_column![
         size_filters_column,
         trade_viz_column,
+        orderflow_column,
         column![text("Studies").size(crate::style::text_size::SECTION), study_cfg].spacing(8),
         row![
             space::horizontal(),
@@ -1026,6 +1220,23 @@ pub fn kline_cfg_view<'a>(
                 .spacing(8)
             };
             let volume_bubbles_section = {
+                let preset_picklist = pick_list(
+                    VolumeBubblePreset::ALL,
+                    Some(bubbles_cfg.preset),
+                    move |preset| {
+                        let mut volume_bubbles =
+                            data::chart::kline::VolumeBubbleConfig::for_preset(preset);
+                        volume_bubbles.enabled = bubbles_cfg.enabled;
+                        Message::VisualConfigChanged(
+                            pane,
+                            VisualConfig::Kline(data::chart::kline::Config {
+                                volume_bubbles,
+                                ..cfg
+                            }),
+                            false,
+                        )
+                    },
+                );
                 let enabled_checkbox = tooltip(
                     checkbox(bubbles_cfg.enabled)
                         .label("Show volume bubbles")
@@ -1130,21 +1341,42 @@ pub fn kline_cfg_view<'a>(
                     Some(1.0),
                 );
 
-                let labels_checkbox = checkbox(bubbles_cfg.show_labels)
-                    .label("Show bubble labels")
-                    .on_toggle(move |value| {
+                let labels_picklist = pick_list(
+                    BubbleLabelMode::ALL,
+                    Some(bubbles_cfg.label_mode),
+                    move |value| {
                         Message::VisualConfigChanged(
                             pane,
                             VisualConfig::Kline(data::chart::kline::Config {
                                 volume_bubbles: data::chart::kline::VolumeBubbleConfig {
-                                    show_labels: value,
+                                    label_mode: value,
                                     ..bubbles_cfg
-                                },
+                                }
+                                .customized(),
                                 ..cfg
                             }),
                             false,
                         )
-                    });
+                    },
+                );
+                let threshold_picklist = pick_list(
+                    BubbleThresholdMode::ALL,
+                    Some(bubbles_cfg.threshold_mode),
+                    move |value| {
+                        Message::VisualConfigChanged(
+                            pane,
+                            VisualConfig::Kline(data::chart::kline::Config {
+                                volume_bubbles: data::chart::kline::VolumeBubbleConfig {
+                                    threshold_mode: value,
+                                    ..bubbles_cfg
+                                }
+                                .customized(),
+                                ..cfg
+                            }),
+                            false,
+                        )
+                    },
+                );
 
                 let color_mode_picklist = pick_list(
                     BubbleColorMode::ALL,
@@ -1187,6 +1419,7 @@ pub fn kline_cfg_view<'a>(
                     enabled_checkbox,
                     text("Uses fetched trade data when enabled.")
                         .size(crate::style::text_size::SMALL),
+                    preset_picklist,
                     session_picklist,
                     column![
                         text(format!(
@@ -1199,7 +1432,8 @@ pub fn kline_cfg_view<'a>(
                     min_qty_slider,
                     min_radius_slider,
                     max_radius_slider,
-                    labels_checkbox,
+                    labels_picklist,
+                    threshold_picklist,
                     color_mode_picklist,
                 ]
                 .spacing(8)

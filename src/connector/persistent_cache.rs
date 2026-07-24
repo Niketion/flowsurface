@@ -30,7 +30,8 @@ const COVERAGE_TABLE: TableDefinition<&str, &[u8]> = TableDefinition::new("cache
 const KLINE_TABLE: TableDefinition<&str, &[u8]> = TableDefinition::new("klines_v1");
 const TRADE_TABLE: TableDefinition<&str, &[u8]> = TableDefinition::new("trades_v1");
 const OI_TABLE: TableDefinition<&str, &[u8]> = TableDefinition::new("open_interest_v1");
-const BUBBLE_TABLE: TableDefinition<&str, &[u8]> = TableDefinition::new("bubble_summaries_v1");
+// V1 stored candle/price bins. V2 stores temporal/spatial smart clusters and must never decode V1.
+const BUBBLE_TABLE: TableDefinition<&str, &[u8]> = TableDefinition::new("bubble_summaries_v2");
 
 static CACHE: OnceLock<Option<MarketDataCache>> = OnceLock::new();
 
@@ -196,21 +197,20 @@ impl CacheRecord for BubbleVolumeSummary {
         if self.candidates.len() > MAX_RECORDS_PER_BUCKET {
             return false;
         }
+        if self.algorithm_version != data::chart::kline::BUBBLE_SUMMARY_ALGORITHM_VERSION {
+            return false;
+        }
         self.candidates.iter().all(|candidate| {
             candidate.candle_time == self.candle_time
-                && candidate.price.units > 0
+                && candidate.vwap_price.units > 0
                 && candidate.total_qty.units >= 0
                 && candidate.buy_qty.units >= 0
                 && candidate.sell_qty.units >= 0
                 && candidate.total_qty == candidate.buy_qty + candidate.sell_qty
                 && candidate.delta_qty == candidate.buy_qty - candidate.sell_qty
-                && candidate.score.is_finite()
-                && candidate.score >= 0.0
-                && match (candidate.first_time, candidate.last_time) {
-                    (Some(first), Some(last)) => first <= last,
-                    (None, None) => candidate.trade_count == 0,
-                    _ => false,
-                }
+                && candidate.percentile_rank.is_finite()
+                && candidate.importance_score.is_finite()
+                && candidate.first_time <= candidate.last_time
         })
     }
 
@@ -397,6 +397,8 @@ impl MarketDataCache {
         timeframe_ms: u64,
         price_step_units: i64,
         max_candidates_per_candle: usize,
+        cluster_window_ms: u32,
+        cluster_price_ticks: u32,
         from: UnixMs,
         to_exclusive: UnixMs,
     ) -> CacheSlice<BubbleVolumeSummary> {
@@ -405,6 +407,8 @@ impl MarketDataCache {
             timeframe_ms,
             price_step_units,
             max_candidates_per_candle,
+            cluster_window_ms,
+            cluster_price_ticks,
         );
         let record_from = from.saturating_sub(timeframe_ms.saturating_sub(1));
         self.read_records(
@@ -423,6 +427,8 @@ impl MarketDataCache {
         timeframe_ms: u64,
         price_step_units: i64,
         max_candidates_per_candle: usize,
+        cluster_window_ms: u32,
+        cluster_price_ticks: u32,
         from: UnixMs,
         to_exclusive: UnixMs,
         records: &[BubbleVolumeSummary],
@@ -432,6 +438,8 @@ impl MarketDataCache {
             timeframe_ms,
             price_step_units,
             max_candidates_per_candle,
+            cluster_window_ms,
+            cluster_price_ticks,
         );
         self.store_records(CacheKind::BubbleSummary, &key, from, to_exclusive, records);
     }
@@ -925,11 +933,13 @@ fn bubble_dataset_key(
     timeframe_ms: u64,
     price_step_units: i64,
     max_candidates_per_candle: usize,
+    cluster_window_ms: u32,
+    cluster_price_ticks: u32,
 ) -> String {
     dataset_key(
         ticker_info,
         &format!(
-            "bubble_summary|timeframe_ms={timeframe_ms}|price_step_units={price_step_units}|max_candidates={max_candidates_per_candle}"
+            "bubble_summary|algorithm=v2|timeframe_ms={timeframe_ms}|price_step_units={price_step_units}|max_candidates={max_candidates_per_candle}|cluster_ms={cluster_window_ms}|cluster_ticks={cluster_price_ticks}"
         ),
     )
 }
@@ -1101,67 +1111,29 @@ fn coverage_gaps(intervals: &[(u64, u64)], from: u64, to_exclusive: u64) -> Vec<
     gaps
 }
 
-/// Merge partial Bubble results at candle/price level before caching them as a
-/// complete result. This keeps an in-progress candle correct when only its tail
-/// was missing from the persistent cache.
+/// Merge V2 smart-cluster summaries by stable cluster id. Overlapping fetches keep the most
+/// complete cluster and are never summed, preventing duplicate volume.
 pub fn merge_bubble_summaries(
     summaries: impl IntoIterator<Item = BubbleVolumeSummary>,
     max_candidates_per_candle: usize,
 ) -> Vec<BubbleVolumeSummary> {
-    let mut grouped: BTreeMap<UnixMs, BTreeMap<i64, BubbleCandidate>> = BTreeMap::new();
+    let mut grouped: BTreeMap<UnixMs, BTreeMap<u64, BubbleCandidate>> = BTreeMap::new();
     for summary in summaries {
+        if summary.algorithm_version != data::chart::kline::BUBBLE_SUMMARY_ALGORITHM_VERSION {
+            continue;
+        }
         for candidate in summary.candidates {
             grouped
                 .entry(summary.candle_time)
                 .or_default()
-                .entry(candidate.price.units)
+                .entry(candidate.id)
                 .and_modify(|existing| {
-                    let intervals_are_disjoint = match (
-                        existing.first_time,
-                        existing.last_time,
-                        candidate.first_time,
-                        candidate.last_time,
-                    ) {
-                        (
-                            Some(existing_first),
-                            Some(existing_last),
-                            Some(new_first),
-                            Some(new_last),
-                        ) => existing_last < new_first || new_last < existing_first,
-                        _ => false,
-                    };
-
-                    // Overlapping summaries may contain the same executions
-                    // but no longer carry their individual trade ids. Adding
-                    // them would inflate bubbles. Keep the more complete
-                    // candidate; only truly disjoint time slices are additive.
-                    if !intervals_are_disjoint {
-                        if candidate.trade_count > existing.trade_count {
-                            *existing = candidate;
-                        }
-                        return;
+                    if candidate.trade_count > existing.trade_count
+                        || (candidate.trade_count == existing.trade_count
+                            && candidate.last_time > existing.last_time)
+                    {
+                        *existing = candidate;
                     }
-
-                    existing.buy_qty += candidate.buy_qty;
-                    existing.sell_qty += candidate.sell_qty;
-                    existing.total_qty = existing.buy_qty + existing.sell_qty;
-                    existing.delta_qty = existing.buy_qty - existing.sell_qty;
-                    existing.trade_count =
-                        existing.trade_count.saturating_add(candidate.trade_count);
-                    existing.first_time = match (existing.first_time, candidate.first_time) {
-                        (Some(left), Some(right)) => Some(left.min(right)),
-                        (left, right) => left.or(right),
-                    };
-                    existing.last_time = match (existing.last_time, candidate.last_time) {
-                        (Some(left), Some(right)) => Some(left.max(right)),
-                        (left, right) => left.or(right),
-                    };
-                    let total = existing.total_qty.to_f64();
-                    existing.score = if total > 0.0 {
-                        total * (1.0 + (existing.delta_qty.to_f64().abs() / total).clamp(0.0, 1.0))
-                    } else {
-                        0.0
-                    };
                 })
                 .or_insert(candidate);
         }
@@ -1190,16 +1162,20 @@ mod tests {
     ) -> BubbleCandidate {
         let qty = exchange::unit::Qty::from_f64(qty);
         BubbleCandidate {
+            id: first_time,
             candle_time: UnixMs::new(60_000),
-            price: exchange::unit::Price::from_f64(100.0),
+            first_time: UnixMs::new(first_time),
+            last_time: UnixMs::new(last_time),
+            weighted_time: UnixMs::new((first_time + last_time) / 2),
+            vwap_price: exchange::unit::Price::from_f64(100.0),
             total_qty: qty,
             buy_qty: qty,
             sell_qty: exchange::unit::Qty::ZERO,
             delta_qty: qty,
             trade_count,
-            score: qty.to_f64(),
-            first_time: Some(UnixMs::new(first_time)),
-            last_time: Some(UnixMs::new(last_time)),
+            largest_trade_qty: qty,
+            percentile_rank: 0.0,
+            importance_score: qty.to_f32_lossy(),
         }
     }
 
@@ -1262,7 +1238,7 @@ mod tests {
     }
 
     #[test]
-    fn disjoint_bubble_summary_slices_are_added_once() {
+    fn different_cluster_ids_are_preserved_without_summing() {
         let candle_time = UnixMs::new(60_000);
         let merged = merge_bubble_summaries(
             [
@@ -1278,8 +1254,15 @@ mod tests {
             3,
         );
 
-        assert_eq!(merged[0].candidates[0].total_qty.to_f64(), 15.0);
-        assert_eq!(merged[0].candidates[0].trade_count, 6);
+        assert_eq!(merged[0].candidates.len(), 2);
+        assert_eq!(
+            merged[0]
+                .candidates
+                .iter()
+                .map(|c| c.total_qty.to_f64())
+                .sum::<f64>(),
+            15.0
+        );
     }
 
     #[test]

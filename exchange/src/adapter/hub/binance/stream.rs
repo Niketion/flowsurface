@@ -1,3 +1,7 @@
+use crate::orderflow::{
+    AggressorSide, BookContinuity, BookDeltaEvent, BookLevelDelta, NormalizedTradeEvent,
+    OrderFlowDataQuality, OrderFlowEvent,
+};
 use crate::{
     Event, Kline, Price, PushFrequency, Ticker, TickerInfo, Trade, Volume,
     adapter::{
@@ -92,8 +96,12 @@ struct SonicKlineWrap {
 
 #[derive(Deserialize, Debug)]
 struct SonicTrade {
+    #[serde(rename = "t")]
+    raw_id: Option<u64>,
     #[serde(rename = "a")]
-    id: u64,
+    aggregate_id: Option<u64>,
+    #[serde(rename = "E")]
+    event_time: u64,
     #[serde(rename = "T")]
     time: u64,
     #[serde(rename = "p", deserialize_with = "de_string_to_number")]
@@ -102,6 +110,15 @@ struct SonicTrade {
     qty: f64,
     #[serde(rename = "m")]
     is_sell: bool,
+}
+
+impl SonicTrade {
+    fn stream_id(&self, kind: TradeStreamKind) -> Option<u64> {
+        match kind {
+            TradeStreamKind::Raw => self.raw_id,
+            TradeStreamKind::Aggregate => self.aggregate_id,
+        }
+    }
 }
 
 enum SonicDepth {
@@ -116,6 +133,7 @@ impl SonicDepth {
         ticker_info: TickerInfo,
         qty_norm: QtyNormalization,
         prev_id: &mut u64,
+        receive_time: crate::UnixMs,
     ) -> ApplyDepthResult {
         let last_update_id = orderbook.last_update_id;
 
@@ -140,6 +158,14 @@ impl SonicDepth {
                     ));
                 }
 
+                let delta = normalized_delta_event(
+                    self,
+                    orderbook,
+                    ticker_info,
+                    qty_norm,
+                    receive_time,
+                    BookContinuity::Continuous,
+                );
                 orderbook.update_with_qty_norm(
                     DepthUpdate::Diff(self.into()),
                     ticker_info.min_ticksize,
@@ -147,7 +173,7 @@ impl SonicDepth {
                 );
 
                 *prev_id = de_depth.final_id;
-                ApplyDepthResult::Applied(de_depth.time)
+                ApplyDepthResult::Applied(de_depth.time, delta)
             }
             SonicDepth::Spot(de_depth) => {
                 if last_update_id == 0 || de_depth.final_id <= last_update_id {
@@ -172,6 +198,14 @@ impl SonicDepth {
                     }
                 }
 
+                let delta = normalized_delta_event(
+                    self,
+                    orderbook,
+                    ticker_info,
+                    qty_norm,
+                    receive_time,
+                    BookContinuity::Continuous,
+                );
                 orderbook.update_with_qty_norm(
                     DepthUpdate::Diff(self.into()),
                     ticker_info.min_ticksize,
@@ -179,7 +213,7 @@ impl SonicDepth {
                 );
 
                 *prev_id = de_depth.final_id;
-                ApplyDepthResult::Applied(de_depth.time)
+                ApplyDepthResult::Applied(de_depth.time, delta)
             }
         }
     }
@@ -229,6 +263,8 @@ struct SpotDepth {
 
 #[derive(Deserialize)]
 struct PerpDepth {
+    #[serde(rename = "E")]
+    event_time: u64,
     #[serde(rename = "T")]
     time: u64,
     #[serde(rename = "U")]
@@ -243,16 +279,83 @@ struct PerpDepth {
     asks: Vec<DeOrder>,
 }
 
+fn normalized_delta_event(
+    depth: &SonicDepth,
+    orderbook: &LocalDepthCache,
+    ticker_info: TickerInfo,
+    qty_norm: QtyNormalization,
+    receive_time: crate::UnixMs,
+    continuity: BookContinuity,
+) -> BookDeltaEvent {
+    let make_levels = |orders: &[DeOrder], is_bid: bool| {
+        orders
+            .iter()
+            .map(|order| {
+                let price =
+                    Price::from_f64(order.price).round_to_min_tick(ticker_info.min_ticksize);
+                let previous_qty = if is_bid {
+                    orderbook.depth.bids.get(&price)
+                } else {
+                    orderbook.depth.asks.get(&price)
+                }
+                .copied()
+                .unwrap_or(crate::unit::Qty::ZERO);
+                BookLevelDelta {
+                    price,
+                    previous_qty,
+                    current_qty: crate::unit::Qty::from_f64(
+                        qty_norm.normalize(order.qty, order.price),
+                    ),
+                }
+            })
+            .collect::<Vec<_>>()
+            .into_boxed_slice()
+    };
+
+    match depth {
+        SonicDepth::Spot(value) => BookDeltaEvent {
+            ticker_info,
+            exchange_time: value.time.into(),
+            transaction_time: None,
+            receive_time,
+            first_update_id: value.first_id,
+            final_update_id: value.final_id,
+            previous_final_update_id: None,
+            bids: make_levels(&value.bids, true),
+            asks: make_levels(&value.asks, false),
+            continuity,
+        },
+        SonicDepth::Perp(value) => BookDeltaEvent {
+            ticker_info,
+            exchange_time: value.event_time.into(),
+            transaction_time: Some(value.time.into()),
+            receive_time,
+            first_update_id: value.first_id,
+            final_update_id: value.final_id,
+            previous_final_update_id: Some(value.prev_final_id),
+            bids: make_levels(&value.bids, true),
+            asks: make_levels(&value.asks, false),
+            continuity,
+        },
+    }
+}
+
 enum StreamData {
-    Trade(Ticker, SonicTrade),
+    Trade(Ticker, SonicTrade, TradeStreamKind),
     Depth(SonicDepth),
     Kline(Ticker, SonicKline),
 }
 
 enum StreamWrapper {
-    Trade,
+    Trade(TradeStreamKind),
     Depth,
     Kline,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum TradeStreamKind {
+    Raw,
+    Aggregate,
 }
 
 impl StreamWrapper {
@@ -262,7 +365,8 @@ impl StreamWrapper {
             .nth(1)
             .and_then(|after_at| match after_at {
                 s if s.starts_with("de") => Some(StreamWrapper::Depth),
-                s if s.starts_with("ag") => Some(StreamWrapper::Trade),
+                "trade" => Some(StreamWrapper::Trade(TradeStreamKind::Raw)),
+                "aggTrade" => Some(StreamWrapper::Trade(TradeStreamKind::Aggregate)),
                 s if s.starts_with("kl") => Some(StreamWrapper::Kline),
                 _ => None,
             })
@@ -293,12 +397,12 @@ fn feed_de(slice: &[u8], market: MarketKind) -> Result<StreamData, AdapterError>
             }
         } else if k == "data" {
             match stream_type {
-                Some(StreamWrapper::Trade) => {
+                Some(StreamWrapper::Trade(kind)) => {
                     let trade: SonicTrade = sonic_rs::from_str(&v.as_raw_faststr())
                         .map_err(|e| AdapterError::ParseError(e.to_string()))?;
 
                     if let Some(t) = topic_ticker {
-                        return Ok(StreamData::Trade(t, trade));
+                        return Ok(StreamData::Trade(t, trade, kind));
                     }
 
                     return Err(AdapterError::ParseError(
@@ -345,15 +449,49 @@ fn feed_de(slice: &[u8], market: MarketKind) -> Result<StreamData, AdapterError>
 struct TradeAdapter {
     market: MarketKind,
     buffer: TradeBuffer,
+    orderflow_trades: Vec<NormalizedTradeEvent>,
+    logged_first_raw_batch: bool,
     stream: String,
     proxy_cfg: Option<crate::proxy::Proxy>,
 }
 
+const MAX_PENDING_ORDERFLOW_TRADES: usize = 16_384;
+
+impl TradeAdapter {
+    fn flush_trade_events(&mut self) -> Vec<Event> {
+        // Compatibility consumers (bubbles, footprint, CVD) deliberately go first. If the
+        // bounded application channel is under pressure, their established batch must not be
+        // displaced by detector-only traffic.
+        let mut events = self.buffer.flush();
+        if self.market == MarketKind::LinearPerps && !self.orderflow_trades.is_empty() {
+            let trades = std::mem::take(&mut self.orderflow_trades).into_boxed_slice();
+            if !self.logged_first_raw_batch {
+                log::info!(
+                    "BinanceRawTradeStreamActive | batch_len={} legacy_batches={}",
+                    trades.len(),
+                    events.len()
+                );
+                self.logged_first_raw_batch = true;
+            }
+            events.push(Event::OrderFlowTrades(trades));
+        }
+        events
+    }
+}
+
 impl WsAdapter for TradeAdapter {
     async fn connect(&mut self) -> Result<WsTransport, String> {
+        let traffic_kind = if self.market == MarketKind::LinearPerps {
+            WsTrafficKind::Public
+        } else {
+            WsTrafficKind::Market
+        };
         connect_stream_socket(
             self.market,
-            WsTrafficKind::Market,
+            // Binance's USDⓈ-M raw `@trade` feed is served by the public stream endpoint.
+            // The market endpoint accepts the WebSocket handshake but does not publish this
+            // stream, which looks healthy while silently starving all trade consumers.
+            traffic_kind,
             &self.stream,
             self.proxy_cfg.as_ref(),
         )
@@ -361,25 +499,57 @@ impl WsAdapter for TradeAdapter {
     }
 
     async fn on_connected(&mut self) -> Vec<Event> {
-        self.buffer.flush()
+        self.flush_trade_events()
     }
 
     async fn on_text(&mut self, payload: &[u8]) -> Result<Vec<Event>, String> {
-        if let Ok(StreamData::Trade(ticker, de_trade)) = feed_de(payload, self.market) {
+        let receive_time = crate::UnixMs::now();
+        if let Ok(StreamData::Trade(ticker, de_trade, stream_kind)) = feed_de(payload, self.market)
+        {
             if let Some((ticker_info, qty_norm)) = self.buffer.ticker_info(&ticker) {
                 let ticker_info = *ticker_info;
+                let Some(trade_id) = de_trade.stream_id(stream_kind) else {
+                    return Err(format!("Missing {stream_kind:?} trade ID"));
+                };
                 let price =
                     Price::from_f64(de_trade.price).round_to_min_tick(ticker_info.min_ticksize);
 
                 let trade = Trade {
-                    id: Some(de_trade.id),
+                    id: Some(trade_id),
                     time: de_trade.time.into(),
                     is_sell: de_trade.is_sell,
                     price,
                     qty: qty_norm.normalize_qty(de_trade.qty, de_trade.price),
                 };
 
-                self.buffer.push(ticker, trade);
+                if stream_kind == TradeStreamKind::Raw
+                    && self.market == MarketKind::LinearPerps
+                    && self.orderflow_trades.len() < MAX_PENDING_ORDERFLOW_TRADES
+                {
+                    self.orderflow_trades.push(NormalizedTradeEvent {
+                        ticker_info,
+                        event_time: de_trade.event_time.into(),
+                        trade_time: de_trade.time.into(),
+                        receive_time,
+                        trade_id,
+                        price,
+                        quantity: trade.qty,
+                        aggressor: if de_trade.is_sell {
+                            AggressorSide::Sell
+                        } else {
+                            AggressorSide::Buy
+                        },
+                    });
+                }
+                // A single raw stream feeds the established live consumers too. Historical
+                // aggTrades use a different ID namespace; chart ingestion reconciles overlap by
+                // time bucket rather than pretending those IDs are comparable.
+                if (self.market == MarketKind::LinearPerps && stream_kind == TradeStreamKind::Raw)
+                    || (self.market != MarketKind::LinearPerps
+                        && stream_kind == TradeStreamKind::Aggregate)
+                {
+                    self.buffer.push(ticker, trade);
+                }
             } else {
                 log::error!("Ticker info not found for ticker: {ticker}");
                 return Err("Received trade for unknown ticker".to_string());
@@ -390,11 +560,18 @@ impl WsAdapter for TradeAdapter {
     }
 
     async fn on_disconnected(&mut self, _reason: &str) -> Vec<Event> {
-        self.buffer.flush()
+        let mut events = self.flush_trade_events();
+        if self.market == MarketKind::LinearPerps {
+            let at = crate::UnixMs::now();
+            events.extend(self.buffer.ticker_infos().map(|ticker_info| {
+                Event::OrderFlow(OrderFlowEvent::Reconnect { ticker_info, at })
+            }));
+        }
+        events
     }
 
     async fn on_tick(&mut self) -> Vec<Event> {
-        self.buffer.flush()
+        self.flush_trade_events()
     }
 }
 
@@ -416,14 +593,16 @@ pub fn connect_trade_stream(
     let stream = tickers
         .iter()
         .map(|ticker_info| {
-            format!(
-                "{}@aggTrade",
-                ticker_info
-                    .ticker
-                    .to_full_symbol_and_type()
-                    .0
-                    .to_lowercase()
-            )
+            let symbol = ticker_info
+                .ticker
+                .to_full_symbol_and_type()
+                .0
+                .to_lowercase();
+            if market == MarketKind::LinearPerps {
+                format!("{symbol}@trade")
+            } else {
+                format!("{symbol}@aggTrade")
+            }
         })
         .collect::<Vec<_>>()
         .join("/");
@@ -448,6 +627,8 @@ pub fn connect_trade_stream(
     let adapter = TradeAdapter {
         market,
         buffer: TradeBuffer::new(ticker_info_map),
+        orderflow_trades: Vec::new(),
+        logged_first_raw_batch: false,
         stream: stream.clone(),
         proxy_cfg: proxy_cfg.clone(),
     };
@@ -482,37 +663,67 @@ impl WsAdapter for DepthAdapter {
 
     async fn on_connected(&mut self) -> Vec<Event> {
         self.sync_machine.begin_resync();
-        Vec::new()
+        if self.market == MarketKind::LinearPerps {
+            vec![Event::OrderFlow(OrderFlowEvent::Quality {
+                ticker_info: self.ticker_info,
+                at: crate::UnixMs::now(),
+                quality: OrderFlowDataQuality::Synchronizing,
+            })]
+        } else {
+            Vec::new()
+        }
     }
 
     async fn on_text(&mut self, payload: &[u8]) -> Result<Vec<Event>, String> {
-        self.sync_machine
-            .poll_snapshot_if_ready(self.ticker_info, self.qty_norm)?;
+        let receive_time = crate::UnixMs::now();
+        let mut events = self.sync_machine.poll_snapshot_if_ready(
+            self.ticker_info,
+            self.qty_norm,
+            receive_time,
+        )?;
 
-        if let Ok(StreamData::Depth(depth_type)) = feed_de(payload, self.market)
-            && let Some(time) = self.sync_machine.handle_depth_update(
+        if let Ok(StreamData::Depth(depth_type)) = feed_de(payload, self.market) {
+            if let Some((time, delta)) = self.sync_machine.handle_depth_update(
                 depth_type,
                 self.ticker_info,
                 self.qty_norm,
-            )?
-        {
-            return Ok(vec![Event::DepthReceived(
-                self.stream,
-                time.into(),
-                self.sync_machine.current.depth.clone(),
-            )]);
+                receive_time,
+            )? {
+                if self.market == MarketKind::LinearPerps {
+                    events.push(Event::OrderFlow(OrderFlowEvent::BookDelta(delta)));
+                }
+                events.push(Event::DepthReceived(
+                    self.stream,
+                    time.into(),
+                    self.sync_machine.current.depth.clone(),
+                ));
+            }
+            if self.market == MarketKind::LinearPerps && self.sync_machine.take_gap() {
+                events.push(Event::OrderFlow(OrderFlowEvent::Quality {
+                    ticker_info: self.ticker_info,
+                    at: receive_time,
+                    quality: OrderFlowDataQuality::Gap,
+                }));
+            }
         }
 
-        Ok(Vec::new())
+        Ok(events)
     }
 
     async fn on_disconnected(&mut self, _reason: &str) -> Vec<Event> {
-        Vec::new()
+        if self.market == MarketKind::LinearPerps {
+            vec![Event::OrderFlow(OrderFlowEvent::Reconnect {
+                ticker_info: self.ticker_info,
+                at: crate::UnixMs::now(),
+            })]
+        } else {
+            Vec::new()
+        }
     }
 }
 
 enum ApplyDepthResult {
-    Applied(u64),
+    Applied(u64, BookDeltaEvent),
     Skipped,
     NeedsResync(String),
 }
@@ -534,6 +745,7 @@ struct DepthSyncMachine {
     prev_id: u64,
     pending: VecDeque<SonicDepth>,
     current: LocalDepthCache,
+    gap_detected: bool,
 }
 
 impl DepthSyncMachine {
@@ -544,6 +756,7 @@ impl DepthSyncMachine {
             ticker,
             prev_id: 0,
             current: LocalDepthCache::default(),
+            gap_detected: false,
             pending: VecDeque::new(),
         }
     }
@@ -565,12 +778,17 @@ impl DepthSyncMachine {
         self.state = DepthSyncState::WaitingSnapshot(fetch_snapshot);
     }
 
+    fn take_gap(&mut self) -> bool {
+        std::mem::take(&mut self.gap_detected)
+    }
+
     fn handle_snapshot_result(
         &mut self,
         snapshot_result: Result<DepthPayload, AdapterError>,
         ticker_info: TickerInfo,
         qty_norm: QtyNormalization,
-    ) -> Result<(), String> {
+        receive_time: crate::UnixMs,
+    ) -> Result<Option<BookDeltaEvent>, String> {
         let snapshot = match snapshot_result {
             Ok(snapshot) => snapshot,
             Err(e) => return Err(format!("Depth fetch failed: {e}")),
@@ -589,19 +807,58 @@ impl DepthSyncMachine {
                 ticker_info,
                 qty_norm,
                 &mut self.prev_id,
+                receive_time,
             ) {
-                ApplyDepthResult::Applied(_) => {}
+                ApplyDepthResult::Applied(_, _) => {}
                 ApplyDepthResult::Skipped => {}
                 ApplyDepthResult::NeedsResync(reason) => {
                     log::warn!("{}", reason);
+                    self.gap_detected = true;
                     self.begin_resync();
-                    return Ok(());
+                    return Ok(None);
                 }
             }
         }
 
+        // Publish one coherent boundary after every buffered diff has been replayed. The
+        // detector never observes the stale REST image followed by silently consumed deltas.
+        let boundary = BookDeltaEvent {
+            ticker_info,
+            exchange_time: self.current.time,
+            transaction_time: None,
+            receive_time,
+            first_update_id: self.current.last_update_id,
+            final_update_id: self.current.last_update_id,
+            previous_final_update_id: None,
+            bids: self
+                .current
+                .depth
+                .bids
+                .iter()
+                .map(|(price, qty)| BookLevelDelta {
+                    price: *price,
+                    previous_qty: crate::unit::Qty::ZERO,
+                    current_qty: *qty,
+                })
+                .collect::<Vec<_>>()
+                .into_boxed_slice(),
+            asks: self
+                .current
+                .depth
+                .asks
+                .iter()
+                .map(|(price, qty)| BookLevelDelta {
+                    price: *price,
+                    previous_qty: crate::unit::Qty::ZERO,
+                    current_qty: *qty,
+                })
+                .collect::<Vec<_>>()
+                .into_boxed_slice(),
+            continuity: BookContinuity::SnapshotBoundary,
+        };
+
         self.state = DepthSyncState::Live;
-        Ok(())
+        Ok(Some(boundary))
     }
 
     fn on_live_diff(
@@ -609,17 +866,20 @@ impl DepthSyncMachine {
         diff_update: SonicDepth,
         ticker_info: TickerInfo,
         qty_norm: QtyNormalization,
-    ) -> Result<Option<u64>, String> {
+        receive_time: crate::UnixMs,
+    ) -> Result<Option<(u64, BookDeltaEvent)>, String> {
         match diff_update.apply_depth_diff(
             &mut self.current,
             ticker_info,
             qty_norm,
             &mut self.prev_id,
+            receive_time,
         ) {
-            ApplyDepthResult::Applied(time) => Ok(Some(time)),
+            ApplyDepthResult::Applied(time, delta) => Ok(Some((time, delta))),
             ApplyDepthResult::Skipped => Ok(None),
             ApplyDepthResult::NeedsResync(reason) => {
                 log::warn!("{}", reason);
+                self.gap_detected = true;
                 self.pending.clear();
                 self.pending.push_back(diff_update);
                 self.prev_id = 0;
@@ -641,10 +901,11 @@ impl DepthSyncMachine {
         &mut self,
         ticker_info: TickerInfo,
         qty_norm: QtyNormalization,
-    ) -> Result<(), String> {
+        receive_time: crate::UnixMs,
+    ) -> Result<Vec<Event>, String> {
         let snapshot_result = {
             let DepthSyncState::WaitingSnapshot(snapshot_rx) = &mut self.state else {
-                return Ok(());
+                return Ok(Vec::new());
             };
 
             match snapshot_rx.try_recv() {
@@ -656,11 +917,21 @@ impl DepthSyncMachine {
             }
         };
 
-        if let Some(snapshot_result) = snapshot_result {
-            self.handle_snapshot_result(snapshot_result, ticker_info, qty_norm)?;
+        if let Some(snapshot_result) = snapshot_result
+            && let Some(boundary) =
+                self.handle_snapshot_result(snapshot_result, ticker_info, qty_norm, receive_time)?
+        {
+            return Ok(vec![
+                Event::OrderFlow(OrderFlowEvent::BookDelta(boundary)),
+                Event::OrderFlow(OrderFlowEvent::Quality {
+                    ticker_info,
+                    at: receive_time,
+                    quality: OrderFlowDataQuality::Healthy,
+                }),
+            ]);
         }
 
-        Ok(())
+        Ok(Vec::new())
     }
 
     fn handle_depth_update(
@@ -668,12 +939,13 @@ impl DepthSyncMachine {
         diff_update: SonicDepth,
         ticker_info: TickerInfo,
         qty_norm: QtyNormalization,
-    ) -> Result<Option<u64>, String> {
+        receive_time: crate::UnixMs,
+    ) -> Result<Option<(u64, BookDeltaEvent)>, String> {
         if matches!(self.state, DepthSyncState::WaitingSnapshot(_)) {
             self.queue_pending_diff(diff_update);
             Ok(None)
         } else {
-            self.on_live_diff(diff_update, ticker_info, qty_norm)
+            self.on_live_diff(diff_update, ticker_info, qty_norm, receive_time)
         }
     }
 }
@@ -845,4 +1117,169 @@ pub fn connect_kline_stream(
     };
 
     WsSession::with_opcode_ping(BINANCE_OPCODE_PING_PAYLOAD, stream_scope).run(adapter)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn ticker_info() -> TickerInfo {
+        TickerInfo::new(
+            Ticker::new("BTCUSDT", crate::adapter::Exchange::BinanceLinear),
+            0.1,
+            0.001,
+            None,
+        )
+    }
+
+    #[test]
+    fn parses_raw_trade_id_times_and_maker_semantics() {
+        let payload = include_bytes!("../../../../tests/fixtures/binance_raw_trade.json");
+        let StreamData::Trade(_, trade, kind) = feed_de(payload, MarketKind::LinearPerps).unwrap()
+        else {
+            panic!("expected trade");
+        };
+        assert_eq!(kind, TradeStreamKind::Raw);
+        assert_eq!(trade.stream_id(kind), Some(987_654_321));
+        assert_eq!(trade.event_time, 1_720_000_000_001);
+        assert_eq!(trade.time, 1_720_000_000_000);
+        assert!(trade.is_sell, "m=true means seller aggressor");
+        assert_eq!(trade.price, 65_000.10);
+        assert_eq!(trade.qty, 0.125);
+
+        let buyer = br#"{"stream":"btcusdt@trade","data":{"E":1720000000002,"t":987654322,"T":1720000000001,"p":"65000.20","q":"0.010","m":false}}"#;
+        let StreamData::Trade(_, buyer, kind) = feed_de(buyer, MarketKind::LinearPerps).unwrap()
+        else {
+            panic!("expected buyer trade");
+        };
+        assert_eq!(kind, TradeStreamKind::Raw);
+        assert!(!buyer.is_sell, "m=false means buyer aggressor");
+    }
+
+    #[tokio::test]
+    async fn raw_trade_feeds_legacy_and_detector_batches() {
+        let ticker_info = ticker_info();
+        let ticker_info_map = [(
+            ticker_info.ticker,
+            (
+                ticker_info,
+                QtyNormalization::with_raw_qty_unit(
+                    false,
+                    ticker_info,
+                    raw_qty_unit_from_market_type(MarketKind::LinearPerps),
+                ),
+            ),
+        )]
+        .into_iter()
+        .collect();
+        let mut adapter = TradeAdapter {
+            market: MarketKind::LinearPerps,
+            buffer: TradeBuffer::new(ticker_info_map),
+            orderflow_trades: Vec::new(),
+            logged_first_raw_batch: false,
+            stream: "btcusdt@trade".to_string(),
+            proxy_cfg: None,
+        };
+        let raw = include_bytes!("../../../../tests/fixtures/binance_raw_trade.json");
+        let StreamData::Trade(raw_ticker, _, raw_kind) =
+            feed_de(raw, MarketKind::LinearPerps).unwrap()
+        else {
+            panic!("expected raw trade");
+        };
+        assert_eq!(raw_ticker, ticker_info.ticker);
+        assert_eq!(raw_kind, TradeStreamKind::Raw);
+        assert!(adapter.on_text(raw).await.unwrap().is_empty());
+        assert_eq!(adapter.orderflow_trades.len(), 1);
+        let batches = adapter.on_tick().await;
+        let [
+            Event::TradesReceived(_, _, trades),
+            Event::OrderFlowTrades(raw_trades),
+        ] = batches.as_slice()
+        else {
+            panic!("legacy trades must be delivered before the detector batch: {batches:?}");
+        };
+        assert_eq!(trades.len(), 1);
+        assert_eq!(trades[0].id, Some(987_654_321));
+        assert_eq!(raw_trades.len(), 1);
+        assert_eq!(raw_trades[0].trade_id, 987_654_321);
+    }
+
+    #[test]
+    fn parses_perp_depth_sequence_times_and_zero_quantity() {
+        let payload = include_bytes!("../../../../tests/fixtures/binance_diff_depth.json");
+        let StreamData::Depth(SonicDepth::Perp(depth)) =
+            feed_de(payload, MarketKind::LinearPerps).unwrap()
+        else {
+            panic!("expected perpetual depth");
+        };
+        assert_eq!(
+            (depth.first_id, depth.final_id, depth.prev_final_id),
+            (102, 104, 101)
+        );
+        assert_eq!(
+            (depth.event_time, depth.time),
+            (1_720_000_000_100, 1_720_000_000_098)
+        );
+        assert!(depth.bids[1].qty == 0.0);
+        assert_eq!(depth.asks[0].price, 65_000.1);
+    }
+
+    #[test]
+    fn applies_snapshot_boundary_then_detects_pu_gap() {
+        let ticker_info = ticker_info();
+        let qty_norm = QtyNormalization::with_raw_qty_unit(
+            false,
+            ticker_info,
+            raw_qty_unit_from_market_type(MarketKind::LinearPerps),
+        );
+        let mut book = LocalDepthCache::default();
+        book.update_with_qty_norm(
+            DepthUpdate::Snapshot(DepthPayload {
+                last_update_id: 101,
+                time: 1_720_000_000_000u64.into(),
+                bids: vec![DeOrder {
+                    price: 65_000.0,
+                    qty: 1.0,
+                }],
+                asks: vec![DeOrder {
+                    price: 65_000.1,
+                    qty: 1.1,
+                }],
+            }),
+            ticker_info.min_ticksize,
+            Some(qty_norm),
+        );
+        let payload = include_bytes!("../../../../tests/fixtures/binance_diff_depth.json");
+        let StreamData::Depth(first) = feed_de(payload, MarketKind::LinearPerps).unwrap() else {
+            panic!("expected depth");
+        };
+        let mut previous = 0;
+        let ApplyDepthResult::Applied(_, delta) = first.apply_depth_diff(
+            &mut book,
+            ticker_info,
+            qty_norm,
+            &mut previous,
+            1_720_000_000_101u64.into(),
+        ) else {
+            panic!("expected first boundary update");
+        };
+        assert_eq!(previous, 104);
+        assert_eq!(delta.bids[0].previous_qty, crate::unit::Qty::from_f64(1.0));
+        assert_eq!(delta.bids[0].current_qty, crate::unit::Qty::from_f64(1.25));
+
+        let gap_payload = include_bytes!("../../../../tests/fixtures/binance_depth_gap.json");
+        let StreamData::Depth(gap) = feed_de(gap_payload, MarketKind::LinearPerps).unwrap() else {
+            panic!("expected gap depth");
+        };
+        assert!(matches!(
+            gap.apply_depth_diff(
+                &mut book,
+                ticker_info,
+                qty_norm,
+                &mut previous,
+                1_720_000_000_201u64.into(),
+            ),
+            ApplyDepthResult::NeedsResync(_)
+        ));
+    }
 }

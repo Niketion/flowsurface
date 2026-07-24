@@ -38,6 +38,11 @@ impl KlineDataPoint {
     }
 
     pub fn add_trade(&mut self, trade: &Trade, step: PriceStep) {
+        // Keep the datapoint invariant even for callers which do not pass through the UI chart's
+        // ingestion filter. Zero/negative prices would poison footprint autoscaling.
+        if trade.price.units <= 0 {
+            return;
+        }
         if let Some(id) = trade.id
             && !self.trade_ids.insert(id)
         {
@@ -197,30 +202,59 @@ pub enum BubbleHistoricalMode {
     SummaryOnly,
 }
 
-#[derive(Debug, Clone, Copy, Deserialize, Serialize)]
-pub struct BubbleCandidate {
+pub type VolumeBubbleClusterId = u64;
+
+#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
+pub struct VolumeBubbleCluster {
+    pub id: VolumeBubbleClusterId,
     pub candle_time: UnixMs,
-    pub price: Price,
+    pub first_time: UnixMs,
+    pub last_time: UnixMs,
+    pub weighted_time: UnixMs,
+    pub vwap_price: Price,
     pub total_qty: Qty,
     pub buy_qty: Qty,
     pub sell_qty: Qty,
     pub delta_qty: Qty,
     pub trade_count: usize,
-    pub score: f64,
-    pub first_time: Option<UnixMs>,
-    pub last_time: Option<UnixMs>,
+    pub largest_trade_qty: Qty,
+    #[serde(default)]
+    pub percentile_rank: f32,
+    #[serde(default)]
+    pub importance_score: f32,
 }
 
-#[derive(Debug, Clone, Default, Deserialize, Serialize)]
+/// Compatibility name used by the fetch/cache plumbing. V2 candidates are smart clusters.
+pub type BubbleCandidate = VolumeBubbleCluster;
+
+#[derive(Debug, Clone, Deserialize, Serialize)]
 pub struct BubbleVolumeSummary {
     pub candle_time: UnixMs,
+    #[serde(default = "bubble_summary_algorithm_version")]
+    pub algorithm_version: u16,
     pub candidates: Vec<BubbleCandidate>,
+}
+
+impl Default for BubbleVolumeSummary {
+    fn default() -> Self {
+        Self {
+            candle_time: UnixMs::ZERO,
+            algorithm_version: BUBBLE_SUMMARY_ALGORITHM_VERSION,
+            candidates: Vec::new(),
+        }
+    }
+}
+
+pub const BUBBLE_SUMMARY_ALGORITHM_VERSION: u16 = 2;
+const fn bubble_summary_algorithm_version() -> u16 {
+    BUBBLE_SUMMARY_ALGORITHM_VERSION
 }
 
 impl BubbleVolumeSummary {
     pub fn new(candle_time: UnixMs, candidates: Vec<BubbleCandidate>) -> Self {
         Self {
             candle_time,
+            algorithm_version: BUBBLE_SUMMARY_ALGORITHM_VERSION,
             candidates,
         }
     }
@@ -228,6 +262,84 @@ impl BubbleVolumeSummary {
     pub fn is_empty(&self) -> bool {
         self.candidates.is_empty()
     }
+}
+
+#[derive(Debug, Copy, Clone, PartialEq, Eq, Default, Serialize, Deserialize)]
+pub enum VolumeBubblePreset {
+    Clean,
+    #[default]
+    Balanced,
+    Detailed,
+    Custom,
+}
+
+impl VolumeBubblePreset {
+    pub const ALL: [Self; 4] = [Self::Clean, Self::Balanced, Self::Detailed, Self::Custom];
+}
+
+impl std::fmt::Display for VolumeBubblePreset {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(match self {
+            Self::Clean => "Clean",
+            Self::Balanced => "Balanced",
+            Self::Detailed => "Detailed",
+            Self::Custom => "Custom",
+        })
+    }
+}
+
+#[derive(Debug, Copy, Clone, PartialEq, Eq, Default, Serialize, Deserialize)]
+pub enum BubbleThresholdMode {
+    Fixed,
+    AdaptivePercentile,
+    #[default]
+    Hybrid,
+}
+
+impl BubbleThresholdMode {
+    pub const ALL: [Self; 3] = [Self::Fixed, Self::AdaptivePercentile, Self::Hybrid];
+}
+
+impl std::fmt::Display for BubbleThresholdMode {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(match self {
+            Self::Fixed => "Fixed",
+            Self::AdaptivePercentile => "Adaptive percentile",
+            Self::Hybrid => "Hybrid",
+        })
+    }
+}
+
+#[derive(Debug, Copy, Clone, PartialEq, Eq, Default, Serialize, Deserialize)]
+pub enum BubbleLabelMode {
+    None,
+    #[default]
+    ExtremeOnly,
+    All,
+}
+
+impl BubbleLabelMode {
+    pub const ALL: [Self; 3] = [Self::None, Self::ExtremeOnly, Self::All];
+}
+
+impl std::fmt::Display for BubbleLabelMode {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(match self {
+            Self::None => "None",
+            Self::ExtremeOnly => "Extreme only",
+            Self::All => "All",
+        })
+    }
+}
+
+#[derive(Debug, Copy, Clone, PartialEq, Eq, Default, Serialize, Deserialize)]
+pub enum BubblePriceResponse {
+    Pending,
+    FollowThrough,
+    Stalled,
+    Reversed,
+    #[default]
+    Neutral,
 }
 
 #[derive(Debug, Clone, Default)]
@@ -753,39 +865,613 @@ impl std::fmt::Display for SessionProfileMode {
     }
 }
 
-#[derive(Debug, Copy, Clone, PartialEq, Deserialize, Serialize)]
-#[serde(default)]
+#[derive(Debug, Copy, Clone, PartialEq, Serialize)]
 pub struct VolumeBubbleConfig {
     pub enabled: bool,
+    pub preset: VolumeBubblePreset,
+    pub threshold_mode: BubbleThresholdMode,
     pub min_qty: f64,
+    pub adaptive_window_minutes: u64,
+    pub display_percentile: f32,
+    pub label_percentile: f32,
+    pub cluster_window_ms: u32,
+    pub cluster_price_ticks: u32,
     pub max_bubbles_per_bar: usize,
+    pub max_bubbles_in_view: usize,
+    pub max_labels_in_view: usize,
     pub historical_mode: BubbleHistoricalMode,
     pub max_candidates_per_candle: usize,
     pub history_window_minutes: u64,
     pub use_raw_trades_when_available: bool,
     pub min_radius_px: f32,
     pub max_radius_px: f32,
-    pub show_labels: bool,
+    pub fill_enabled: bool,
+    pub fill_intensity: f32,
+    pub border_opacity: f32,
+    pub hover_opacity: f32,
+    pub age_fading: bool,
+    pub label_mode: BubbleLabelMode,
     pub color_mode: BubbleColorMode,
     pub session: VolumeBubbleSession,
+    pub min_center_distance_px: f32,
+    pub price_response_enabled: bool,
+    pub price_response_horizon_seconds: u32,
+    pub minimum_side_dominance: f32,
+    pub response_threshold_bps: f32,
 }
 
 impl Default for VolumeBubbleConfig {
     fn default() -> Self {
         Self {
             enabled: false,
+            preset: VolumeBubblePreset::Balanced,
+            threshold_mode: BubbleThresholdMode::Hybrid,
             min_qty: 0.0,
+            adaptive_window_minutes: 20,
+            display_percentile: 95.0,
+            label_percentile: 99.0,
+            cluster_window_ms: 500,
+            cluster_price_ticks: 1,
             max_bubbles_per_bar: 3,
+            max_bubbles_in_view: 40,
+            max_labels_in_view: 6,
             historical_mode: BubbleHistoricalMode::SummaryOnly,
-            max_candidates_per_candle: 3,
+            max_candidates_per_candle: 32,
             history_window_minutes: 30,
             use_raw_trades_when_available: true,
-            min_radius_px: 3.0,
-            max_radius_px: 14.0,
-            show_labels: false,
+            min_radius_px: 5.0,
+            max_radius_px: 16.0,
+            fill_enabled: true,
+            fill_intensity: 1.0,
+            border_opacity: 0.90,
+            hover_opacity: 0.26,
+            age_fading: true,
+            label_mode: BubbleLabelMode::ExtremeOnly,
             color_mode: BubbleColorMode::Delta,
             session: VolumeBubbleSession::Auto,
+            min_center_distance_px: 12.0,
+            price_response_enabled: false,
+            price_response_horizon_seconds: 10,
+            minimum_side_dominance: 0.65,
+            response_threshold_bps: 1.5,
         }
+    }
+}
+
+impl VolumeBubbleConfig {
+    pub fn for_preset(preset: VolumeBubblePreset) -> Self {
+        let mut config = Self {
+            preset,
+            ..Self::default()
+        };
+        match preset {
+            VolumeBubblePreset::Clean => {
+                config.display_percentile = 99.0;
+                config.label_percentile = 100.0;
+                config.cluster_window_ms = 750;
+                config.cluster_price_ticks = 2;
+                config.max_bubbles_per_bar = 1;
+                config.max_bubbles_in_view = 25;
+                config.max_labels_in_view = 0;
+                config.label_mode = BubbleLabelMode::None;
+            }
+            VolumeBubblePreset::Balanced | VolumeBubblePreset::Custom => {}
+            VolumeBubblePreset::Detailed => {
+                config.display_percentile = 90.0;
+                config.label_percentile = 98.0;
+                config.cluster_window_ms = 250;
+                config.max_bubbles_per_bar = 5;
+                config.max_bubbles_in_view = 70;
+                config.max_labels_in_view = 10;
+            }
+        }
+        config
+    }
+
+    pub fn customized(mut self) -> Self {
+        self.preset = VolumeBubblePreset::Custom;
+        self
+    }
+}
+
+#[derive(Deserialize, Default)]
+#[serde(default)]
+struct VolumeBubbleConfigWire {
+    enabled: bool,
+    preset: Option<VolumeBubblePreset>,
+    threshold_mode: Option<BubbleThresholdMode>,
+    min_qty: f64,
+    adaptive_window_minutes: Option<u64>,
+    display_percentile: Option<f32>,
+    label_percentile: Option<f32>,
+    cluster_window_ms: Option<u32>,
+    cluster_price_ticks: Option<u32>,
+    max_bubbles_per_bar: Option<usize>,
+    max_bubbles_in_view: Option<usize>,
+    max_labels_in_view: Option<usize>,
+    historical_mode: Option<BubbleHistoricalMode>,
+    max_candidates_per_candle: Option<usize>,
+    history_window_minutes: Option<u64>,
+    use_raw_trades_when_available: Option<bool>,
+    min_radius_px: Option<f32>,
+    max_radius_px: Option<f32>,
+    fill_enabled: Option<bool>,
+    show_labels: Option<bool>,
+    label_mode: Option<BubbleLabelMode>,
+    color_mode: Option<BubbleColorMode>,
+    session: Option<VolumeBubbleSession>,
+    fill_intensity: Option<f32>,
+    border_opacity: Option<f32>,
+    hover_opacity: Option<f32>,
+    age_fading: Option<bool>,
+    min_center_distance_px: Option<f32>,
+    price_response_enabled: Option<bool>,
+    price_response_horizon_seconds: Option<u32>,
+    minimum_side_dominance: Option<f32>,
+    response_threshold_bps: Option<f32>,
+}
+
+impl<'de> Deserialize<'de> for VolumeBubbleConfig {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        let wire = VolumeBubbleConfigWire::deserialize(deserializer)?;
+        let legacy = wire.preset.is_none();
+        let mut config = Self::default();
+        config.enabled = wire.enabled;
+        config.min_qty = wire.min_qty;
+        config.preset = wire.preset.unwrap_or(VolumeBubblePreset::Custom);
+        config.threshold_mode = wire.threshold_mode.unwrap_or(if legacy {
+            BubbleThresholdMode::Fixed
+        } else {
+            config.threshold_mode
+        });
+        config.adaptive_window_minutes = wire
+            .adaptive_window_minutes
+            .unwrap_or(config.adaptive_window_minutes);
+        config.display_percentile = wire.display_percentile.unwrap_or(config.display_percentile);
+        config.label_percentile = wire.label_percentile.unwrap_or(config.label_percentile);
+        config.cluster_window_ms = wire.cluster_window_ms.unwrap_or(config.cluster_window_ms);
+        config.cluster_price_ticks = wire
+            .cluster_price_ticks
+            .unwrap_or(config.cluster_price_ticks);
+        config.max_bubbles_per_bar = wire
+            .max_bubbles_per_bar
+            .unwrap_or(config.max_bubbles_per_bar);
+        config.max_bubbles_in_view = wire
+            .max_bubbles_in_view
+            .unwrap_or(config.max_bubbles_in_view);
+        config.max_labels_in_view = wire.max_labels_in_view.unwrap_or(config.max_labels_in_view);
+        config.historical_mode = wire.historical_mode.unwrap_or(config.historical_mode);
+        config.max_candidates_per_candle = wire
+            .max_candidates_per_candle
+            .unwrap_or(config.max_candidates_per_candle);
+        config.history_window_minutes = wire
+            .history_window_minutes
+            .unwrap_or(config.history_window_minutes);
+        config.use_raw_trades_when_available = wire
+            .use_raw_trades_when_available
+            .unwrap_or(config.use_raw_trades_when_available);
+        config.min_radius_px = wire.min_radius_px.unwrap_or(config.min_radius_px);
+        config.max_radius_px = wire.max_radius_px.unwrap_or(config.max_radius_px);
+        config.fill_enabled = wire.fill_enabled.unwrap_or(config.fill_enabled);
+        config.label_mode = wire.label_mode.unwrap_or(match wire.show_labels {
+            Some(true) => BubbleLabelMode::All,
+            Some(false) => BubbleLabelMode::None,
+            None => config.label_mode,
+        });
+        config.color_mode = wire.color_mode.unwrap_or(config.color_mode);
+        config.session = wire.session.unwrap_or(config.session);
+        config.fill_intensity = wire.fill_intensity.unwrap_or(config.fill_intensity);
+        config.border_opacity = wire.border_opacity.unwrap_or(config.border_opacity);
+        config.hover_opacity = wire.hover_opacity.unwrap_or(config.hover_opacity);
+        config.age_fading = wire.age_fading.unwrap_or(config.age_fading);
+        config.min_center_distance_px = wire
+            .min_center_distance_px
+            .unwrap_or(config.min_center_distance_px);
+        config.price_response_enabled = wire
+            .price_response_enabled
+            .unwrap_or(config.price_response_enabled);
+        config.price_response_horizon_seconds = wire
+            .price_response_horizon_seconds
+            .unwrap_or(config.price_response_horizon_seconds);
+        config.minimum_side_dominance = wire
+            .minimum_side_dominance
+            .unwrap_or(config.minimum_side_dominance);
+        config.response_threshold_bps = wire
+            .response_threshold_bps
+            .unwrap_or(config.response_threshold_bps);
+        Ok(config)
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct AdaptiveBubbleThreshold {
+    pub effective: f64,
+    pub adaptive: Option<f64>,
+    pub warmed_up: bool,
+}
+
+#[derive(Debug, Clone, Copy, Default)]
+pub struct StabilizedBubbleThreshold {
+    pub value: f64,
+    pub last_update: Option<UnixMs>,
+}
+
+impl StabilizedBubbleThreshold {
+    pub fn update(&mut self, proposed: f64, now: UnixMs) -> f64 {
+        if !proposed.is_finite() || proposed < 0.0 {
+            return self.value.max(0.0);
+        }
+        if self
+            .last_update
+            .is_some_and(|last| now.as_u64().saturating_sub(last.as_u64()) < 1_000)
+        {
+            return self.value;
+        }
+        let relative_change = if self.value > f64::EPSILON {
+            (proposed - self.value).abs() / self.value
+        } else {
+            1.0
+        };
+        if self.last_update.is_none() || relative_change >= 0.10 {
+            self.value = proposed;
+            self.last_update = Some(now);
+        }
+        self.value
+    }
+}
+
+pub fn percentile(values: &[f64], percentile: f32) -> Option<f64> {
+    let mut values = values
+        .iter()
+        .copied()
+        .filter(|value| value.is_finite() && *value >= 0.0)
+        .collect::<Vec<_>>();
+    if values.is_empty() {
+        return None;
+    }
+    values.sort_by(f64::total_cmp);
+    let rank =
+        (f64::from(percentile.clamp(0.0, 100.0)) / 100.0) * (values.len().saturating_sub(1) as f64);
+    let lower = rank.floor() as usize;
+    let upper = rank.ceil() as usize;
+    let fraction = rank - lower as f64;
+    Some(values[lower] + ((values[upper] - values[lower]) * fraction))
+}
+
+pub fn adaptive_bubble_threshold(
+    values: &[f64],
+    config: &VolumeBubbleConfig,
+    minimum_samples: usize,
+) -> AdaptiveBubbleThreshold {
+    let warmed_up = values.len() >= minimum_samples;
+    let adaptive = warmed_up
+        .then(|| percentile(values, config.display_percentile))
+        .flatten();
+    let effective = match config.threshold_mode {
+        BubbleThresholdMode::Fixed => config.min_qty,
+        BubbleThresholdMode::AdaptivePercentile => adaptive.unwrap_or(config.min_qty),
+        BubbleThresholdMode::Hybrid => adaptive.unwrap_or(config.min_qty).max(config.min_qty),
+    };
+    AdaptiveBubbleThreshold {
+        effective: if effective.is_finite() {
+            effective.max(0.0)
+        } else {
+            config.min_qty.max(0.0)
+        },
+        adaptive,
+        warmed_up,
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct BubbleThresholdBaselines {
+    pub combined: AdaptiveBubbleThreshold,
+    pub buy_dominant: AdaptiveBubbleThreshold,
+    pub sell_dominant: AdaptiveBubbleThreshold,
+}
+
+pub fn adaptive_bubble_threshold_baselines(
+    clusters: &[VolumeBubbleCluster],
+    config: &VolumeBubbleConfig,
+    minimum_samples_per_side: usize,
+) -> BubbleThresholdBaselines {
+    let combined_values = clusters
+        .iter()
+        .map(|cluster| cluster.total_qty.to_f64())
+        .collect::<Vec<_>>();
+    let combined = adaptive_bubble_threshold(&combined_values, config, minimum_samples_per_side);
+    let side = |buy: bool| {
+        let values = clusters
+            .iter()
+            .filter(|cluster| (cluster.buy_qty >= cluster.sell_qty) == buy)
+            .map(|cluster| cluster.total_qty.to_f64())
+            .collect::<Vec<_>>();
+        if values.len() < minimum_samples_per_side {
+            combined
+        } else {
+            adaptive_bubble_threshold(&values, config, minimum_samples_per_side)
+        }
+    };
+    BubbleThresholdBaselines {
+        combined,
+        buy_dominant: side(true),
+        sell_dominant: side(false),
+    }
+}
+
+#[derive(Clone, Copy)]
+struct ClusterAccumulator {
+    first_time: UnixMs,
+    last_time: UnixMs,
+    anchor_price: Price,
+    anchor_is_sell: bool,
+    price_qty_units: f64,
+    time_qty_ms: f64,
+    total_qty: Qty,
+    buy_qty: Qty,
+    sell_qty: Qty,
+    trade_count: usize,
+    largest_trade_qty: Qty,
+}
+
+impl ClusterAccumulator {
+    fn new(trade: Trade) -> Self {
+        let qty = trade.qty.to_f64();
+        Self {
+            first_time: trade.time,
+            last_time: trade.time,
+            anchor_price: trade.price,
+            anchor_is_sell: trade.is_sell,
+            price_qty_units: trade.price.units as f64 * qty,
+            time_qty_ms: trade.time.as_u64() as f64 * qty,
+            total_qty: trade.qty,
+            buy_qty: if trade.is_sell { Qty::ZERO } else { trade.qty },
+            sell_qty: if trade.is_sell { trade.qty } else { Qty::ZERO },
+            trade_count: 1,
+            largest_trade_qty: trade.qty,
+        }
+    }
+
+    fn add(&mut self, trade: Trade) {
+        let qty = trade.qty.to_f64();
+        self.last_time = self.last_time.max(trade.time);
+        self.price_qty_units += trade.price.units as f64 * qty;
+        self.time_qty_ms += trade.time.as_u64() as f64 * qty;
+        self.total_qty += trade.qty;
+        if trade.is_sell {
+            self.sell_qty += trade.qty
+        } else {
+            self.buy_qty += trade.qty
+        }
+        self.trade_count += 1;
+        self.largest_trade_qty = self.largest_trade_qty.max(trade.qty);
+    }
+
+    fn vwap(self, price_step: PriceStep) -> Price {
+        let qty = self.total_qty.to_f64();
+        if qty <= f64::EPSILON {
+            Price::from_units(0)
+        } else {
+            Price::from_units((self.price_qty_units / qty).round() as i64).round_to_step(price_step)
+        }
+    }
+
+    fn finish(self, candle_time: UnixMs, price_step: PriceStep) -> VolumeBubbleCluster {
+        let qty = self.total_qty.to_f64().max(f64::EPSILON);
+        let weighted_time = UnixMs::new((self.time_qty_ms / qty).round().max(0.0) as u64);
+        let vwap_price = self.vwap(price_step);
+        let id = stable_cluster_id(
+            candle_time,
+            self.first_time,
+            self.anchor_price.round_to_step(price_step),
+            self.anchor_is_sell,
+        );
+        VolumeBubbleCluster {
+            id,
+            candle_time,
+            first_time: self.first_time,
+            last_time: self.last_time,
+            weighted_time,
+            vwap_price,
+            total_qty: self.total_qty,
+            buy_qty: self.buy_qty,
+            sell_qty: self.sell_qty,
+            delta_qty: self.buy_qty - self.sell_qty,
+            trade_count: self.trade_count,
+            largest_trade_qty: self.largest_trade_qty,
+            percentile_rank: 0.0,
+            importance_score: 0.0,
+        }
+    }
+}
+
+fn stable_cluster_id(
+    candle_time: UnixMs,
+    first_time: UnixMs,
+    price: Price,
+    is_sell: bool,
+) -> VolumeBubbleClusterId {
+    // FNV-1a over stable cluster anchors. Quantities intentionally do not participate: the ID
+    // remains unchanged while the current live burst grows.
+    let mut hash = 0xcbf29ce484222325u64;
+    for value in [
+        candle_time.as_u64(),
+        first_time.as_u64(),
+        price.units as u64,
+    ] {
+        for byte in value.to_le_bytes() {
+            hash ^= u64::from(byte);
+            hash = hash.wrapping_mul(0x100000001b3);
+        }
+    }
+    hash ^ u64::from(is_sell)
+}
+
+pub fn cluster_volume_bubble_trades(
+    trades: &[Trade],
+    candle_time: UnixMs,
+    timeframe_ms: u64,
+    price_step: PriceStep,
+    config: &VolumeBubbleConfig,
+) -> Vec<VolumeBubbleCluster> {
+    if timeframe_ms == 0 || price_step.units <= 0 {
+        return Vec::new();
+    }
+    let candle_end = candle_time.saturating_add(timeframe_ms);
+    let mut ordered = trades
+        .iter()
+        .copied()
+        .filter(|trade| {
+            trade.time >= candle_time
+                && trade.time < candle_end
+                && trade.qty.units > 0
+                && trade.price.units > 0
+        })
+        .collect::<Vec<_>>();
+    ordered.sort_by_key(|trade| (trade.time, trade.id));
+
+    let max_price_distance = price_step
+        .units
+        .saturating_mul(i64::from(config.cluster_price_ticks));
+    let mut accumulators: Vec<ClusterAccumulator> = Vec::new();
+    for trade in ordered {
+        let matching = accumulators.iter().rposition(|cluster| {
+            trade
+                .time
+                .as_u64()
+                .saturating_sub(cluster.last_time.as_u64())
+                <= u64::from(config.cluster_window_ms)
+                && (trade.price.units - cluster.vwap(price_step).units).abs() <= max_price_distance
+        });
+        if let Some(index) = matching {
+            accumulators[index].add(trade);
+        } else {
+            accumulators.push(ClusterAccumulator::new(trade));
+        }
+    }
+    accumulators
+        .into_iter()
+        .map(|cluster| cluster.finish(candle_time, price_step))
+        .collect()
+}
+
+pub fn rank_volume_bubble_clusters(clusters: &mut [VolumeBubbleCluster], effective_threshold: f64) {
+    let quantities = clusters
+        .iter()
+        .map(|cluster| cluster.total_qty.to_f64())
+        .collect::<Vec<_>>();
+    for cluster in clusters {
+        let qty = cluster.total_qty.to_f64();
+        let below_or_equal = quantities
+            .iter()
+            .filter(|candidate| **candidate <= qty)
+            .count();
+        cluster.percentile_rank = 100.0 * below_or_equal as f32 / quantities.len().max(1) as f32;
+        let dominance = cluster.buy_qty.abs_diff(cluster.sell_qty).to_f64() / qty.max(f64::EPSILON);
+        let threshold_ratio = qty / effective_threshold.max(f64::EPSILON);
+        let count_bonus = (cluster.trade_count as f32).ln_1p().min(3.0) / 3.0;
+        cluster.importance_score = cluster.percentile_rank
+            + (threshold_ratio.ln_1p() as f32 * 8.0)
+            + (dominance as f32 * 3.0)
+            + count_bonus;
+    }
+}
+
+pub fn apply_volume_bubble_budget(
+    clusters: impl IntoIterator<Item = VolumeBubbleCluster>,
+    config: &VolumeBubbleConfig,
+    effective_threshold: f64,
+) -> Vec<VolumeBubbleCluster> {
+    let mut clusters = clusters
+        .into_iter()
+        .filter(|cluster| cluster.total_qty.to_f64() >= effective_threshold)
+        .collect::<Vec<_>>();
+    rank_volume_bubble_clusters(&mut clusters, effective_threshold);
+    clusters.sort_by(|left, right| {
+        right
+            .importance_score
+            .total_cmp(&left.importance_score)
+            .then_with(|| left.id.cmp(&right.id))
+    });
+    let mut per_candle = FxHashMap::<UnixMs, usize>::default();
+    clusters.retain(|cluster| {
+        let count = per_candle.entry(cluster.candle_time).or_default();
+        if *count >= config.max_bubbles_per_bar {
+            return false;
+        }
+        *count += 1;
+        true
+    });
+    clusters.truncate(config.max_bubbles_in_view);
+    clusters
+}
+
+pub fn volume_bubble_radius(
+    qty: f64,
+    effective_threshold: f64,
+    reference_p99: f64,
+    min_radius: f32,
+    max_radius: f32,
+) -> f32 {
+    let min_radius = min_radius.max(0.0);
+    let max_radius = max_radius.max(min_radius);
+    let threshold = effective_threshold.max(f64::EPSILON);
+    let denominator = (1.0 + reference_p99.max(threshold) / threshold).ln();
+    let relative = if denominator > f64::EPSILON {
+        (1.0 + qty.max(0.0) / threshold).ln() / denominator
+    } else {
+        0.0
+    };
+    let normalized = relative.clamp(0.0, 1.0) as f32;
+    (min_radius.mul_add(
+        min_radius,
+        normalized * (max_radius * max_radius - min_radius * min_radius),
+    ))
+    .sqrt()
+}
+
+pub fn bubble_age_factor(age_ms: u64, enabled: bool) -> f32 {
+    if !enabled || age_ms <= 30_000 {
+        return 1.0;
+    }
+    if age_ms >= 120_000 {
+        return 0.58;
+    }
+    1.0 - (age_ms - 30_000) as f32 / 90_000.0 * 0.42
+}
+
+pub fn classify_bubble_price_response(
+    cluster: &VolumeBubbleCluster,
+    future_price: Option<Price>,
+    horizon_elapsed: bool,
+    config: &VolumeBubbleConfig,
+) -> BubblePriceResponse {
+    if !config.price_response_enabled {
+        return BubblePriceResponse::Neutral;
+    }
+    let total = cluster.total_qty.to_f64();
+    let dominance = cluster.buy_qty.max(cluster.sell_qty).to_f64() / total.max(f64::EPSILON);
+    if dominance < f64::from(config.minimum_side_dominance) {
+        return BubblePriceResponse::Neutral;
+    }
+    if !horizon_elapsed || future_price.is_none() {
+        return BubblePriceResponse::Pending;
+    }
+    let move_bps = (future_price.unwrap().to_f64() / cluster.vwap_price.to_f64() - 1.0) * 10_000.0;
+    let directional = if cluster.buy_qty > cluster.sell_qty {
+        move_bps
+    } else {
+        -move_bps
+    };
+    if directional >= f64::from(config.response_threshold_bps) {
+        BubblePriceResponse::FollowThrough
+    } else if directional <= -f64::from(config.response_threshold_bps) {
+        BubblePriceResponse::Reversed
+    } else {
+        BubblePriceResponse::Stalled
     }
 }
 
@@ -949,5 +1635,244 @@ impl NPoc {
 
     pub fn unfilled(&mut self) {
         *self = NPoc::Naked;
+    }
+}
+
+#[cfg(test)]
+mod volume_bubble_tests {
+    use super::*;
+
+    fn step() -> PriceStep {
+        PriceStep {
+            units: Price::from_f64(0.1).units,
+        }
+    }
+
+    fn trade(id: u64, time: u64, price: f64, qty: f64, is_sell: bool) -> Trade {
+        Trade {
+            id: Some(id),
+            time: UnixMs::new(time),
+            is_sell,
+            price: Price::from_f64(price),
+            qty: Qty::from_f64(qty),
+        }
+    }
+
+    fn cluster(trades: &[Trade], config: &VolumeBubbleConfig) -> Vec<VolumeBubbleCluster> {
+        cluster_volume_bubble_trades(trades, UnixMs::new(60_000), 60_000, step(), config)
+    }
+
+    #[test]
+    fn clustering_preserves_volume_sides_vwap_count_largest_and_stable_id() {
+        let config = VolumeBubbleConfig::default();
+        let trades = [
+            trade(1, 61_000, 100.0, 2.0, false),
+            trade(2, 61_200, 100.1, 3.0, true),
+        ];
+        let first = cluster(&trades, &config);
+        let second = cluster(&trades, &config);
+        let growing = cluster(&trades[..1], &config);
+        assert_eq!(first.len(), 1);
+        assert_eq!(first[0].id, second[0].id);
+        assert_eq!(first[0].id, growing[0].id);
+        assert_eq!(first[0].total_qty.to_f64(), 5.0);
+        assert_eq!(first[0].buy_qty.to_f64(), 2.0);
+        assert_eq!(first[0].sell_qty.to_f64(), 3.0);
+        assert_eq!(first[0].trade_count, 2);
+        assert_eq!(first[0].largest_trade_qty.to_f64(), 3.0);
+        assert!((first[0].vwap_price.to_f64() - 100.1).abs() < 0.001);
+    }
+
+    #[test]
+    fn temporal_and_price_distance_split_clusters() {
+        let config = VolumeBubbleConfig::default();
+        assert_eq!(
+            cluster(
+                &[
+                    trade(1, 61_000, 100.0, 1.0, false),
+                    trade(2, 61_501, 100.0, 1.0, false),
+                ],
+                &config
+            )
+            .len(),
+            2
+        );
+        assert_eq!(
+            cluster(
+                &[
+                    trade(1, 61_000, 100.0, 1.0, false),
+                    trade(2, 61_100, 100.2, 1.0, false),
+                ],
+                &config
+            )
+            .len(),
+            2
+        );
+    }
+
+    #[test]
+    fn percentile_threshold_warmup_hybrid_and_empty_are_finite() {
+        let mut config = VolumeBubbleConfig {
+            min_qty: 50.0,
+            ..VolumeBubbleConfig::default()
+        };
+        let values = (1..=100).map(f64::from).collect::<Vec<_>>();
+        assert!((percentile(&values, 95.0).unwrap() - 95.05).abs() < 0.01);
+        let hybrid = adaptive_bubble_threshold(&values, &config, 20);
+        assert!(hybrid.warmed_up && hybrid.effective > 95.0);
+        config.min_qty = 200.0;
+        assert_eq!(
+            adaptive_bubble_threshold(&values, &config, 20).effective,
+            200.0
+        );
+        let warmup = adaptive_bubble_threshold(&[100.0], &config, 20);
+        assert!(!warmup.warmed_up && warmup.effective == 200.0);
+        assert!(
+            adaptive_bubble_threshold(&[], &config, 20)
+                .effective
+                .is_finite()
+        );
+    }
+
+    #[test]
+    fn threshold_hysteresis_ignores_small_and_too_frequent_changes() {
+        let mut state = StabilizedBubbleThreshold::default();
+        assert_eq!(state.update(100.0, UnixMs::new(1_000)), 100.0);
+        assert_eq!(state.update(120.0, UnixMs::new(1_500)), 100.0);
+        assert_eq!(state.update(105.0, UnixMs::new(2_500)), 100.0);
+        assert_eq!(state.update(120.0, UnixMs::new(3_500)), 120.0);
+    }
+
+    #[test]
+    fn side_baseline_falls_back_to_combined_until_enough_samples() {
+        let config = VolumeBubbleConfig::default();
+        let clusters = cluster(
+            &[
+                trade(1, 61_000, 100.0, 10.0, false),
+                trade(2, 62_000, 101.0, 20.0, true),
+            ],
+            &VolumeBubbleConfig {
+                cluster_window_ms: 10,
+                ..config
+            },
+        );
+        let baselines = adaptive_bubble_threshold_baselines(&clusters, &config, 20);
+        assert_eq!(baselines.buy_dominant, baselines.combined);
+        assert_eq!(baselines.sell_dominant, baselines.combined);
+    }
+
+    #[test]
+    fn ranking_respects_per_bar_and_viewport_budgets() {
+        let config = VolumeBubbleConfig {
+            max_bubbles_per_bar: 1,
+            max_bubbles_in_view: 2,
+            ..VolumeBubbleConfig::default()
+        };
+        let mut clusters = Vec::new();
+        for (id, candle, qty) in [
+            (1, 60_000, 10.0),
+            (2, 60_000, 50.0),
+            (3, 120_000, 30.0),
+            (4, 180_000, 20.0),
+        ] {
+            clusters.push(
+                cluster_volume_bubble_trades(
+                    &[trade(id, candle + 1, 100.0, qty, false)],
+                    UnixMs::new(candle),
+                    60_000,
+                    step(),
+                    &config,
+                )[0],
+            );
+        }
+        let selected = apply_volume_bubble_budget(clusters, &config, 0.0);
+        assert_eq!(selected.len(), 2);
+        assert!(selected.iter().any(|item| item.total_qty.to_f64() == 50.0));
+        assert!(selected.iter().any(|item| item.total_qty.to_f64() == 30.0));
+    }
+
+    #[test]
+    fn radius_is_monotonic_bounded_finite_and_outlier_resistant() {
+        let small = volume_bubble_radius(10.0, 10.0, 1_000.0, 5.0, 16.0);
+        let medium = volume_bubble_radius(100.0, 10.0, 1_000.0, 5.0, 16.0);
+        let huge = volume_bubble_radius(1e12, 10.0, 1_000.0, 5.0, 16.0);
+        assert!(small.is_finite() && small >= 5.0);
+        assert!(medium >= small && medium < 16.0);
+        assert_eq!(huge, 16.0);
+    }
+
+    #[test]
+    fn age_fading_is_progressive_and_never_invisible() {
+        assert_eq!(bubble_age_factor(10_000, true), 1.0);
+        assert!(bubble_age_factor(60_000, true) < 1.0);
+        assert_eq!(bubble_age_factor(180_000, true), 0.58);
+    }
+
+    #[test]
+    fn price_response_has_no_lookahead_and_is_symmetric() {
+        let config = VolumeBubbleConfig {
+            price_response_enabled: true,
+            ..VolumeBubbleConfig::default()
+        };
+        let buy = cluster(&[trade(1, 61_000, 100.0, 10.0, false)], &config)[0];
+        assert_eq!(
+            classify_bubble_price_response(&buy, Some(Price::from_f64(101.0)), false, &config),
+            BubblePriceResponse::Pending
+        );
+        assert_eq!(
+            classify_bubble_price_response(&buy, Some(Price::from_f64(101.0)), true, &config),
+            BubblePriceResponse::FollowThrough
+        );
+        assert_eq!(
+            classify_bubble_price_response(&buy, Some(Price::from_f64(99.0)), true, &config),
+            BubblePriceResponse::Reversed
+        );
+        assert_eq!(
+            classify_bubble_price_response(&buy, Some(Price::from_f64(100.001)), true, &config),
+            BubblePriceResponse::Stalled
+        );
+        let sell = cluster(&[trade(2, 61_000, 100.0, 10.0, true)], &config)[0];
+        assert_eq!(
+            classify_bubble_price_response(&sell, Some(Price::from_f64(99.0)), true, &config),
+            BubblePriceResponse::FollowThrough
+        );
+    }
+
+    #[test]
+    fn legacy_label_and_threshold_migration_and_balanced_new_default() {
+        let hidden: VolumeBubbleConfig =
+            serde_json::from_str(r#"{"show_labels":false,"min_qty":12.0}"#).unwrap();
+        let shown: VolumeBubbleConfig =
+            serde_json::from_str(r#"{"show_labels":true,"min_qty":12.0}"#).unwrap();
+        assert_eq!(hidden.label_mode, BubbleLabelMode::None);
+        assert_eq!(shown.label_mode, BubbleLabelMode::All);
+        assert_eq!(hidden.threshold_mode, BubbleThresholdMode::Fixed);
+        assert_eq!(hidden.min_qty, 12.0);
+        assert_eq!(
+            VolumeBubbleConfig::default().preset,
+            VolumeBubblePreset::Balanced
+        );
+    }
+
+    #[test]
+    fn balanced_defaults_match_the_product_contract() {
+        let config = VolumeBubbleConfig::default();
+        assert_eq!(config.threshold_mode, BubbleThresholdMode::Hybrid);
+        assert_eq!(config.adaptive_window_minutes, 20);
+        assert_eq!(config.display_percentile, 95.0);
+        assert_eq!(config.label_percentile, 99.0);
+        assert_eq!(config.cluster_window_ms, 500);
+        assert_eq!(config.cluster_price_ticks, 1);
+        assert_eq!(config.max_bubbles_per_bar, 3);
+        assert_eq!(config.max_bubbles_in_view, 40);
+        assert_eq!(config.max_labels_in_view, 6);
+        assert_eq!((config.min_radius_px, config.max_radius_px), (5.0, 16.0));
+        assert!(config.fill_enabled);
+        assert_eq!(config.label_mode, BubbleLabelMode::ExtremeOnly);
+        assert_eq!(config.color_mode, BubbleColorMode::Delta);
+        assert!(config.age_fading && config.use_raw_trades_when_available);
+        assert!(!config.price_response_enabled);
+        assert_eq!(config.border_opacity, 0.90);
+        assert_eq!(config.hover_opacity, 0.26);
     }
 }

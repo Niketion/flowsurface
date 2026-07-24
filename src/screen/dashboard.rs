@@ -1936,6 +1936,68 @@ impl Dashboard {
         }
     }
 
+    pub fn iceberg_requirements(
+        &self,
+        main_window: window::Id,
+    ) -> Vec<(
+        crate::connector::iceberg::DetectorKey,
+        data::orderflow::iceberg::IcebergDetectorConfig,
+    )> {
+        self.iter_all_panes(main_window)
+            .filter_map(|(_, _, pane_state)| match &pane_state.content {
+                pane::Content::Heatmap {
+                    chart: Some(chart), ..
+                } => {
+                    let config = chart.visual_config().iceberg_detector;
+                    config.enabled.then(|| (chart.detector_key(), config))
+                }
+                pane::Content::ShaderHeatmap {
+                    chart: Some(chart), ..
+                } => {
+                    let config = chart.visual_config().iceberg_detector;
+                    config.enabled.then(|| {
+                        (
+                            crate::connector::iceberg::DetectorKey {
+                                ticker_info: chart.ticker_info,
+                                tick_size: chart.tick_size(),
+                            },
+                            config,
+                        )
+                    })
+                }
+                _ => None,
+            })
+            .collect()
+    }
+
+    pub fn ingest_iceberg_events(
+        &mut self,
+        events: &[data::orderflow::iceberg::IcebergEvent],
+        main_window: window::Id,
+    ) {
+        if events.is_empty() {
+            return;
+        }
+        self.iter_all_panes_mut(main_window)
+            .for_each(|(_, _, pane_state)| {
+                if let pane::Content::Heatmap {
+                    chart: Some(chart), ..
+                } = &mut pane_state.content
+                {
+                    for event in events {
+                        chart.insert_iceberg_event(event.clone());
+                    }
+                } else if let pane::Content::ShaderHeatmap {
+                    chart: Some(chart), ..
+                } = &mut pane_state.content
+                {
+                    for event in events {
+                        chart.insert_iceberg_event(event.clone());
+                    }
+                }
+            });
+    }
+
     pub fn ingest_trades(
         &mut self,
         stream: &StreamKind,

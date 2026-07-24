@@ -4,6 +4,7 @@ pub mod chart;
 pub mod config;
 pub mod layout;
 pub mod log;
+pub mod orderflow;
 pub mod panel;
 pub mod stream;
 pub mod tickers_table;
