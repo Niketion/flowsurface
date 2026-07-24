@@ -106,6 +106,24 @@ pub struct Dashboard {
     pending_disconnect: Option<PendingDisconnect>,
 }
 
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+pub struct StartupLoadStatus {
+    pub pane_count: usize,
+    pub unresolved_streams: usize,
+    pub initializing_panes: usize,
+    pub loading_panes: usize,
+    pub loading_gex: usize,
+}
+
+impl StartupLoadStatus {
+    pub fn is_ready(self) -> bool {
+        self.unresolved_streams == 0
+            && self.initializing_panes == 0
+            && self.loading_panes == 0
+            && self.loading_gex == 0
+    }
+}
+
 impl Default for Dashboard {
     fn default() -> Self {
         Self {
@@ -415,35 +433,23 @@ impl Dashboard {
         &mut self,
         main_window: window::Id,
         windowing_mode: WindowingMode,
+        open_native_popouts: bool,
     ) -> Task<Message> {
-        let mut open_popouts_tasks: Vec<Task<Message>> = vec![];
-        let mut new_popout = Vec::new();
         let mut keys_to_remove = Vec::new();
 
         for (old_window_id, (_, specs)) in &self.popout {
             keys_to_remove.push((*old_window_id, *specs));
         }
 
-        if windowing_mode.allows_native_popout() {
-            // remove keys and open new windows
-            for (old_window_id, window_spec) in keys_to_remove {
-                let (window, task) = window::open(window::Settings {
-                    position: window::Position::Specific(window_spec.position()),
-                    size: window_spec.size(),
-                    exit_on_close_request: false,
-                    ..window::settings()
-                });
-
-                open_popouts_tasks.push(task.then(|_| Task::none()));
-
-                if let Some((removed_pane, specs)) = self.popout.remove(&old_window_id) {
-                    new_popout.push((window, (removed_pane, specs)));
-                }
-            }
-
-            // assign new windows to old panes
-            for (window, (pane, specs)) in new_popout {
-                self.popout.insert(window, (pane, specs));
+        let open_popouts = if windowing_mode.allows_native_popout() {
+            if open_native_popouts {
+                self.open_popout_windows()
+            } else {
+                log::info!(
+                    "WINDOW StartupPopoutsDeferred | count={} reason=startup_loading",
+                    self.popout.len()
+                );
+                Task::none()
             }
         } else {
             // In embedded mode, merge popout panes back into the main pane grid
@@ -464,10 +470,41 @@ impl Dashboard {
                     );
                 }
             }
-        }
+            Task::none()
+        };
 
         self.reconcile_gex_liquidity_references(main_window);
-        Task::batch(open_popouts_tasks).chain(self.refresh_streams(main_window))
+        open_popouts.chain(self.refresh_streams(main_window))
+    }
+
+    pub fn open_popout_windows(&mut self) -> Task<Message> {
+        let existing = self
+            .popout
+            .iter()
+            .map(|(id, (_, specs))| (*id, *specs))
+            .collect::<Vec<_>>();
+        let mut open_tasks = Vec::with_capacity(existing.len());
+        let mut rekeyed = Vec::with_capacity(existing.len());
+
+        for (old_window_id, window_spec) in existing {
+            let (window, task) = window::open(window::Settings {
+                position: window::Position::Specific(window_spec.position()),
+                size: window_spec.size(),
+                exit_on_close_request: false,
+                ..window::settings()
+            });
+            open_tasks.push(task.then(|_| Task::none()));
+
+            if let Some((pane, specs)) = self.popout.remove(&old_window_id) {
+                rekeyed.push((window, (pane, specs)));
+            }
+        }
+
+        for (window, pane) in rekeyed {
+            self.popout.insert(window, pane);
+        }
+
+        Task::batch(open_tasks)
     }
 
     pub fn update(
@@ -2400,6 +2437,39 @@ impl Dashboard {
     /// partial reconnect as a fully restored connection.
     pub fn configured_market_streams(&self) -> Vec<StreamKind> {
         all_unique_streams(&self.streams)
+    }
+
+    pub fn startup_load_status(&self, main_window: window::Id) -> StartupLoadStatus {
+        let mut status = StartupLoadStatus::default();
+
+        for (_, _, pane_state) in self.iter_all_panes(main_window) {
+            if matches!(pane_state.content, pane::Content::Starter) {
+                continue;
+            }
+
+            status.pane_count += 1;
+            if matches!(
+                &pane_state.streams,
+                ResolvedStream::Waiting { streams, .. } if !streams.is_empty()
+            ) {
+                status.unresolved_streams += 1;
+            }
+            if !pane_state.content.initialized() {
+                status.initializing_panes += 1;
+            }
+            if matches!(pane_state.status, pane::Status::Loading { .. }) {
+                status.loading_panes += 1;
+            }
+            if matches!(
+                &pane_state.content,
+                pane::Content::Gex { chart: Some(chart), unsupported: false, .. }
+                    if chart.freshness() == data::chart::gex::GexFreshness::Loading
+            ) {
+                status.loading_gex += 1;
+            }
+        }
+
+        status
     }
 
     /// Historical gap backfill after WS disconnect.

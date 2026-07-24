@@ -39,6 +39,20 @@ pub fn loading_spinner<'a, Message: 'a>() -> Element<'a, Message> {
     image(frame).width(24).height(8).into()
 }
 
+/// Large animated mark used while the application resolves its initial data set.
+pub fn startup_loading_animation<'a, Message: 'a>() -> Element<'a, Message> {
+    static FRAMES: std::sync::OnceLock<Vec<image::Handle>> = std::sync::OnceLock::new();
+    let frames = FRAMES
+        .get_or_init(|| decode_gif_frames(include_bytes!("../assets/ui/startup-loading.gif")));
+    let elapsed_ms = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_millis();
+    let frame = frames[(elapsed_ms / 80) as usize % frames.len()].clone();
+
+    image(frame).width(148).height(148).into()
+}
+
 fn decode_gif_frames(bytes: &[u8]) -> Vec<image::Handle> {
     let mut options = gif::DecodeOptions::new();
     options.set_color_output(gif::ColorOutput::RGBA);

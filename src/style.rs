@@ -543,6 +543,31 @@ pub fn dashboard_modal(theme: &Theme) -> Style {
     }
 }
 
+pub fn startup_backdrop(_theme: &Theme) -> Style {
+    Style {
+        background: Some(Color::TRANSPARENT.into()),
+        ..Default::default()
+    }
+}
+
+pub fn startup_modal(_theme: &Theme) -> Style {
+    Style {
+        text_color: Some(Color::from_rgb8(219, 222, 225)),
+        background: Some(Color::from_rgb8(30, 31, 34).into()),
+        border: Border {
+            width: 1.0,
+            color: Color::from_rgb8(46, 48, 54),
+            radius: 12.0.into(),
+        },
+        shadow: Shadow {
+            offset: iced::Vector { x: 0.0, y: 10.0 },
+            blur_radius: 32.0,
+            color: Color::BLACK.scale_alpha(0.55),
+        },
+        ..Default::default()
+    }
+}
+
 pub fn modal_container(theme: &Theme) -> Style {
     let palette = theme.extended_palette();
 

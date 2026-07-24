@@ -246,4 +246,8 @@ impl Sidebar {
     pub fn is_metadata_loading(&self) -> bool {
         self.tickers_table.is_metadata_loading()
     }
+
+    pub fn metadata_loading_progress(&self) -> (usize, usize) {
+        self.tickers_table.metadata_loading_progress()
+    }
 }

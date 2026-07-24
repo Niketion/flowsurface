@@ -356,6 +356,12 @@ impl TickersTable {
         self.metadata_fetch_state.has_any_in_flight()
     }
 
+    pub fn metadata_loading_progress(&self) -> (usize, usize) {
+        let total = self.selected_exchanges.len();
+        let pending = self.metadata_fetch_state.in_flight_venues.len();
+        (total.saturating_sub(pending), total)
+    }
+
     fn selected_stats_fetch_task(&mut self) -> Option<Task<Message>> {
         let selected_venues = self
             .tickers_info
