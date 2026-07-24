@@ -16,6 +16,8 @@ pub struct Config {
     pub trade_size_filter: f32,
     pub order_size_filter: f32,
     pub trade_size_scale: Option<i32>,
+    #[serde(default)]
+    pub trade_bubbles_3d: bool,
     pub coalescing: Option<CoalesceKind>,
     #[serde(default)]
     pub iceberg_detector: crate::orderflow::iceberg::IcebergDetectorConfig,
@@ -27,6 +29,7 @@ impl Default for Config {
             trade_size_filter: 0.0,
             order_size_filter: 0.0,
             trade_size_scale: Some(100),
+            trade_bubbles_3d: false,
             coalescing: Some(CoalesceKind::Average(0.15)),
             iceberg_detector: crate::orderflow::iceberg::IcebergDetectorConfig::default(),
         }
@@ -690,5 +693,27 @@ impl std::fmt::Display for ProfileKind {
             ProfileKind::FixedWindow(_) => write!(f, "Fixed window"),
             ProfileKind::VisibleRange => write!(f, "Visible range"),
         }
+    }
+}
+
+#[cfg(test)]
+mod config_tests {
+    use super::Config;
+
+    #[test]
+    fn trade_bubbles_3d_is_backward_compatible_and_persistent() {
+        let legacy: Config = serde_json::from_str(
+            r#"{"trade_size_filter":0.0,"order_size_filter":0.0,"trade_size_scale":100,"coalescing":null}"#,
+        )
+        .unwrap();
+        assert!(!legacy.trade_bubbles_3d);
+
+        let configured = Config {
+            trade_bubbles_3d: true,
+            ..Config::default()
+        };
+        let decoded: Config =
+            serde_json::from_str(&serde_json::to_string(&configured).unwrap()).unwrap();
+        assert!(decoded.trade_bubbles_3d);
     }
 }

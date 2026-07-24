@@ -16,6 +16,12 @@ pub struct CircleInstance {
     pub radius_px: f32,
     _pad: f32,
     pub color: [f32; 4],
+    pub style_3d: u32,
+    pub qty: f32,
+    pub is_sell: u32,
+    _meta_pad_0: u32,
+    _meta_pad_1: u32,
+    pub price_units: i64,
 }
 
 impl CircleInstance {
@@ -35,6 +41,7 @@ impl CircleInstance {
         max_trade_qty: Qty,
         trade_size_scale: Option<i32>,
         fallback_radius_px: f32,
+        style_3d: bool,
     ) -> Self {
         let x_bin_rel = (bucket - ref_bucket).clamp(i32::MIN as i64, i32::MAX as i64) as i32;
         let x_frac = 0.0;
@@ -73,6 +80,25 @@ impl CircleInstance {
             radius_px,
             _pad: 0.0,
             color: rgba,
+            style_3d: u32::from(style_3d),
+            qty: trade.qty.to_f32_lossy(),
+            is_sell: u32::from(trade.is_sell),
+            _meta_pad_0: 0,
+            _meta_pad_1: 0,
+            price_units: trade.price.units,
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::CircleInstance;
+
+    #[test]
+    fn gpu_attributes_keep_the_expected_offsets() {
+        assert_eq!(std::mem::offset_of!(CircleInstance, y_world), 0);
+        assert_eq!(std::mem::offset_of!(CircleInstance, color), 20);
+        assert_eq!(std::mem::offset_of!(CircleInstance, style_3d), 36);
+        assert_eq!(std::mem::size_of::<CircleInstance>(), 64);
     }
 }

@@ -363,6 +363,7 @@ impl InstanceBuilder {
                 max_qty,
                 config.trade_size_scale,
                 fallback_radius_px,
+                config.trade_bubbles_3d,
             ));
         }
 

@@ -6,8 +6,8 @@ use crate::{
 use data::chart::{
     Basis, ViewConfig,
     heatmap::{
-        CLEANUP_THRESHOLD, Config, HeatmapDataPoint, HeatmapStudy, HistoricalDepth, ProfileKind,
-        QtyScale,
+        CLEANUP_THRESHOLD, Config, GroupedTrade, HeatmapDataPoint, HeatmapStudy, HistoricalDepth,
+        ProfileKind, QtyScale,
     },
     indicator::HeatmapIndicator,
 };
@@ -42,6 +42,102 @@ const MIN_CELL_WIDTH: f32 = 1.0;
 
 const MAX_CELL_HEIGHT: f32 = 10.0;
 const MIN_CELL_HEIGHT: f32 = 1.0;
+
+fn draw_trade_bubble(
+    frame: &mut canvas::Frame,
+    center: Point,
+    radius: f32,
+    color: Color,
+    three_dimensional: bool,
+    scaling: f32,
+) {
+    if !three_dimensional {
+        frame.fill(&Path::circle(center, radius), color);
+        return;
+    }
+
+    let shadow_offset = 2.5 / scaling.max(f32::EPSILON);
+    frame.fill(
+        &Path::circle(
+            Point::new(center.x + shadow_offset, center.y + shadow_offset * 1.2),
+            radius,
+        ),
+        Color::BLACK.scale_alpha(0.28),
+    );
+    frame.fill(&Path::circle(center, radius), color.scale_alpha(0.92));
+    for (radius_factor, offset_factor, alpha) in
+        [(0.70, 0.10, 0.14), (0.44, 0.24, 0.20), (0.18, 0.42, 0.34)]
+    {
+        frame.fill(
+            &Path::circle(
+                Point::new(
+                    center.x - radius * offset_factor,
+                    center.y - radius * offset_factor,
+                ),
+                radius * radius_factor,
+            ),
+            Color::WHITE.scale_alpha(alpha),
+        );
+    }
+}
+
+fn draw_trade_tooltip(
+    frame: &mut canvas::Frame,
+    bounds: Rectangle,
+    cursor: Point,
+    time: UnixMs,
+    trade: &GroupedTrade,
+    min_ticksize: exchange::unit::MinTicksize,
+    palette: &Extended,
+    three_dimensional: bool,
+) {
+    let width = 270.0_f32.min((bounds.width - 16.0).max(160.0));
+    let height = 116.0;
+    let x = if cursor.x + width + 12.0 <= bounds.width {
+        cursor.x + 12.0
+    } else {
+        cursor.x - width - 12.0
+    }
+    .clamp(8.0, (bounds.width - width - 8.0).max(8.0));
+    let y = (cursor.y - height * 0.5).clamp(8.0, (bounds.height - height - 8.0).max(8.0));
+    frame.fill(
+        &Path::rectangle(Point::new(x, y), Size::new(width, height)),
+        palette.background.weakest.color.scale_alpha(0.97),
+    );
+    let side = if trade.is_sell {
+        "Aggressive sell"
+    } else {
+        "Aggressive buy"
+    };
+    let timestamp = time
+        .format_utc("%Y-%m-%d %H:%M:%S%.3f UTC")
+        .unwrap_or_else(|| time.as_u64().to_string());
+    let lines = [
+        side.to_string(),
+        format!("Time       {timestamp}"),
+        format!("Price      {}", trade.price.to_string(min_ticksize)),
+        format!("Quantity   {}", abbr_large_numbers(trade.qty.to_f64())),
+        format!("Rendering  {}", if three_dimensional { "3D" } else { "2D" }),
+    ];
+    for (index, line) in lines.into_iter().enumerate() {
+        frame.fill_text(canvas::Text {
+            content: line,
+            position: Point::new(x + 10.0, y + 10.0 + index as f32 * 20.0),
+            size: iced::Pixels(if index == 0 { 13.0 } else { 11.0 }),
+            color: if index == 0 {
+                if trade.is_sell {
+                    palette.danger.strong.color
+                } else {
+                    palette.success.strong.color
+                }
+            } else {
+                palette.background.base.text
+            },
+            font: style::AZERET_MONO,
+            ..canvas::Text::default()
+        });
+    }
+}
 
 const DEFAULT_CELL_WIDTH: f32 = 3.0;
 
@@ -703,9 +799,13 @@ impl canvas::Program<Message> for HeatmapChart {
                                 }
                             };
 
-                            frame.fill(
-                                &Path::circle(Point::new(x_position, y_position), radius),
+                            draw_trade_bubble(
+                                frame,
+                                Point::new(x_position, y_position),
+                                radius,
                                 color,
+                                self.visual_config.trade_bubbles_3d,
+                                chart.scaling,
                             );
                         }
                     });
@@ -974,6 +1074,71 @@ impl canvas::Program<Message> for HeatmapChart {
                             }
                             return;
                         }
+                    }
+
+                    let visible_region = chart.visible_region(bounds_size);
+                    let (earliest, latest) = chart.interval_range(&visible_region);
+                    let (highest, lowest) = chart.price_range(&visible_region);
+                    let max_trade_qty = self
+                        .calc_qty_scales(earliest, latest, highest, lowest)
+                        .max_trade_qty
+                        .to_f64();
+                    let size_in_quote_ccy = volume_size_unit() == SizeUnit::Quote;
+                    let mut hovered_trade: Option<(f32, UnixMs, &GroupedTrade)> = None;
+                    for (time, dp) in self
+                        .trades
+                        .datapoints
+                        .range(UnixMs::new(earliest)..=UnixMs::new(latest))
+                    {
+                        for trade in dp.grouped_trades.iter() {
+                            if trade.price < lowest || trade.price > highest {
+                                continue;
+                            }
+                            let trade_size = market_type.qty_in_quote_value(
+                                trade.qty,
+                                trade.price,
+                                size_in_quote_ccy,
+                            );
+                            if trade_size <= f64::from(self.visual_config.trade_size_filter) {
+                                continue;
+                            }
+                            let radius = if let Some(scale) = self.visual_config.trade_size_scale {
+                                1.0 + (trade.qty.to_f64() / max_trade_qty.max(f64::EPSILON)) as f32
+                                    * (MAX_CIRCLE_RADIUS - 1.0)
+                                    * (scale as f32 / 100.0)
+                            } else {
+                                chart.cell_height * chart.scaling / 2.0
+                            };
+                            let center = Point::new(
+                                bounds.width / 2.0
+                                    + (chart.interval_to_x(time.as_u64()) + chart.translation.x)
+                                        * chart.scaling,
+                                bounds.height / 2.0
+                                    + (chart.price_to_y(trade.price) + chart.translation.y)
+                                        * chart.scaling,
+                            );
+                            let distance = center.distance(cursor_position);
+                            if distance <= radius.max(4.0) + 3.0
+                                && hovered_trade
+                                    .as_ref()
+                                    .is_none_or(|(best, _, _)| distance < *best)
+                            {
+                                hovered_trade = Some((distance, *time, trade));
+                            }
+                        }
+                    }
+                    if let Some((_, time, trade)) = hovered_trade {
+                        draw_trade_tooltip(
+                            frame,
+                            bounds,
+                            cursor_position,
+                            time,
+                            trade,
+                            chart.ticker_info.min_ticksize,
+                            palette,
+                            self.visual_config.trade_bubbles_3d,
+                        );
+                        return;
                     }
 
                     let interval = match chart.basis {

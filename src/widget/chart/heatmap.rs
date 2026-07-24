@@ -592,7 +592,8 @@ impl HeatmapShader {
             prev.order_size_filter.to_bits() != self.config.order_size_filter.to_bits();
         let trade_visual_changed = prev.trade_size_filter.to_bits()
             != self.config.trade_size_filter.to_bits()
-            || prev.trade_size_scale != self.config.trade_size_scale;
+            || prev.trade_size_scale != self.config.trade_size_scale
+            || prev.trade_bubbles_3d != self.config.trade_bubbles_3d;
 
         self.canvas_invalidation.mark_overlay_tooltip();
         self.canvas_invalidation.mark_overlay_scale_labels();

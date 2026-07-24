@@ -440,9 +440,23 @@ pub fn heatmap_cfg_view<'a>(
                 )
             });
 
+        let bubbles_3d_checkbox = checkbox(cfg.trade_bubbles_3d)
+            .label("3D trade bubbles")
+            .on_toggle(move |trade_bubbles_3d| {
+                Message::VisualConfigChanged(
+                    pane,
+                    VisualConfig::Heatmap(heatmap::Config {
+                        trade_bubbles_3d,
+                        ..cfg
+                    }),
+                    false,
+                )
+            });
+
         let mut col = column![
             text("Trade visualization").size(crate::style::text_size::SECTION),
-            dyn_checkbox
+            dyn_checkbox,
+            bubbles_3d_checkbox
         ]
         .spacing(8);
         if let Some(slider) = circle_scaling_slider {
@@ -564,9 +578,23 @@ pub fn heatmap_shader_cfg_view<'a>(
                 )
             });
 
+        let bubbles_3d_checkbox = checkbox(cfg.trade_bubbles_3d)
+            .label("3D trade bubbles")
+            .on_toggle(move |trade_bubbles_3d| {
+                Message::VisualConfigChanged(
+                    pane,
+                    VisualConfig::Heatmap(heatmap::Config {
+                        trade_bubbles_3d,
+                        ..cfg
+                    }),
+                    false,
+                )
+            });
+
         let mut col = column![
             text("Trade visualization").size(crate::style::text_size::SECTION),
-            dyn_checkbox
+            dyn_checkbox,
+            bubbles_3d_checkbox
         ]
         .spacing(8);
         if let Some(slider) = circle_scaling_slider {
@@ -1227,6 +1255,7 @@ pub fn kline_cfg_view<'a>(
                         let mut volume_bubbles =
                             data::chart::kline::VolumeBubbleConfig::for_preset(preset);
                         volume_bubbles.enabled = bubbles_cfg.enabled;
+                        volume_bubbles.three_dimensional = bubbles_cfg.three_dimensional;
                         Message::VisualConfigChanged(
                             pane,
                             VisualConfig::Kline(data::chart::kline::Config {
@@ -1254,6 +1283,25 @@ pub fn kline_cfg_view<'a>(
                             )
                         }),
                     Some("Draw order-flow bubbles on the main candlestick chart"),
+                    TooltipPosition::Top,
+                );
+                let three_dimensional_checkbox = tooltip(
+                    checkbox(bubbles_cfg.three_dimensional)
+                        .label("3D bubbles")
+                        .on_toggle(move |value| {
+                            Message::VisualConfigChanged(
+                                pane,
+                                VisualConfig::Kline(data::chart::kline::Config {
+                                    volume_bubbles: data::chart::kline::VolumeBubbleConfig {
+                                        three_dimensional: value,
+                                        ..bubbles_cfg
+                                    },
+                                    ..cfg
+                                }),
+                                false,
+                            )
+                        }),
+                    Some("Render volume bubbles with depth, shadow and highlight"),
                     TooltipPosition::Top,
                 );
 
@@ -1417,6 +1465,7 @@ pub fn kline_cfg_view<'a>(
                 column![
                     text("Volume bubbles").size(crate::style::text_size::SECTION),
                     enabled_checkbox,
+                    three_dimensional_checkbox,
                     text("Uses fetched trade data when enabled.")
                         .size(crate::style::text_size::SMALL),
                     preset_picklist,

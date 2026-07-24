@@ -879,6 +879,7 @@ pub struct VolumeBubbleConfig {
     pub min_radius_px: f32,
     pub max_radius_px: f32,
     pub fill_enabled: bool,
+    pub three_dimensional: bool,
     pub fill_intensity: f32,
     pub border_opacity: f32,
     pub hover_opacity: f32,
@@ -915,6 +916,7 @@ impl Default for VolumeBubbleConfig {
             min_radius_px: 5.0,
             max_radius_px: 16.0,
             fill_enabled: true,
+            three_dimensional: false,
             fill_intensity: 1.0,
             border_opacity: 0.90,
             hover_opacity: 0.26,
@@ -989,6 +991,7 @@ struct VolumeBubbleConfigWire {
     min_radius_px: Option<f32>,
     max_radius_px: Option<f32>,
     fill_enabled: Option<bool>,
+    three_dimensional: Option<bool>,
     show_labels: Option<bool>,
     label_mode: Option<BubbleLabelMode>,
     color_mode: Option<BubbleColorMode>,
@@ -1049,6 +1052,7 @@ impl<'de> Deserialize<'de> for VolumeBubbleConfig {
         config.min_radius_px = wire.min_radius_px.unwrap_or(config.min_radius_px);
         config.max_radius_px = wire.max_radius_px.unwrap_or(config.max_radius_px);
         config.fill_enabled = wire.fill_enabled.unwrap_or(config.fill_enabled);
+        config.three_dimensional = wire.three_dimensional.unwrap_or(config.three_dimensional);
         config.label_mode = wire.label_mode.unwrap_or(match wire.show_labels {
             Some(true) => BubbleLabelMode::All,
             Some(false) => BubbleLabelMode::None,
@@ -1861,11 +1865,26 @@ mod volume_bubble_tests {
         assert_eq!(config.max_labels_in_view, 6);
         assert_eq!((config.min_radius_px, config.max_radius_px), (5.0, 16.0));
         assert!(config.fill_enabled);
+        assert!(!config.three_dimensional);
         assert_eq!(config.label_mode, BubbleLabelMode::ExtremeOnly);
         assert_eq!(config.color_mode, BubbleColorMode::Delta);
         assert!(config.age_fading && config.use_raw_trades_when_available);
         assert!(!config.price_response_enabled);
         assert_eq!(config.border_opacity, 0.90);
         assert_eq!(config.hover_opacity, 0.26);
+    }
+
+    #[test]
+    fn three_dimensional_bubbles_round_trip_and_default_off() {
+        let legacy: VolumeBubbleConfig = serde_json::from_str(r#"{"enabled":true}"#).unwrap();
+        assert!(!legacy.three_dimensional);
+
+        let configured = VolumeBubbleConfig {
+            three_dimensional: true,
+            ..VolumeBubbleConfig::default()
+        };
+        let json = serde_json::to_string(&configured).unwrap();
+        let decoded: VolumeBubbleConfig = serde_json::from_str(&json).unwrap();
+        assert!(decoded.three_dimensional);
     }
 }

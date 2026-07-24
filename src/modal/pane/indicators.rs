@@ -325,6 +325,7 @@ pub fn view_kline<'a>(
             move |preset| {
                 let mut volume_bubbles = data::chart::kline::VolumeBubbleConfig::for_preset(preset);
                 volume_bubbles.enabled = bubbles.enabled;
+                volume_bubbles.three_dimensional = bubbles.three_dimensional;
                 config_message(
                     pane,
                     KlineConfig {
@@ -478,6 +479,21 @@ pub fn view_kline<'a>(
                         },
                     )
                 });
+        let three_dimensional = checkbox(bubbles.three_dimensional)
+            .label("3D bubbles")
+            .on_toggle(move |three_dimensional| {
+                config_message(
+                    pane,
+                    KlineConfig {
+                        volume_bubbles: data::chart::kline::VolumeBubbleConfig {
+                            three_dimensional,
+                            ..bubbles
+                        }
+                        .customized(),
+                        ..cfg
+                    },
+                )
+            });
         let price_response = checkbox(bubbles.price_response_enabled)
             .label("Price response analysis")
             .on_toggle(move |price_response_enabled| {
@@ -634,6 +650,7 @@ pub fn view_kline<'a>(
                 viewport_count,
                 min_radius,
                 max_radius,
+                three_dimensional,
                 age_fading,
                 price_response,
                 history,

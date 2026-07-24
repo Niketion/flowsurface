@@ -2,6 +2,7 @@ use crate::style;
 use crate::widget::chart::heatmap::Message;
 use crate::widget::chart::heatmap::scene::Scene;
 use crate::widget::chart::heatmap::scene::depth_grid::GridRing;
+use crate::widget::chart::heatmap::scene::pipeline::circle::CircleInstance;
 use crate::widget::chart::heatmap::ui;
 use crate::widget::chart::heatmap::view;
 
@@ -376,6 +377,10 @@ impl<'a> canvas::Program<Message> for OverlayCanvas<'a> {
                 self.draw_iceberg_tooltip(frame, theme, bounds, cursor_local, event);
                 return;
             }
+            if let Some(circle) = self.hovered_trade_circle(bounds, cursor_local) {
+                self.draw_trade_tooltip(frame, theme, bounds, cursor_local, circle);
+                return;
+            }
             let cell_width = self.scene.cell.width_world();
             let cell_height = self.scene.cell.height_world();
 
@@ -682,6 +687,93 @@ impl<'a> canvas::Program<Message> for OverlayCanvas<'a> {
 }
 
 impl<'a> OverlayCanvas<'a> {
+    fn trade_circle_screen_position(&self, circle: &CircleInstance, bounds: Rectangle) -> Point {
+        let world_x = (circle.x_bin_rel as f32 + circle.x_frac - self.scene.params.origin_x())
+            * self.scene.cell.width_world();
+        Point::new(
+            self.scene.camera.world_to_screen_x(world_x, bounds.width),
+            self.scene
+                .camera
+                .world_to_screen_y(circle.y_world, bounds.width, bounds.height),
+        )
+    }
+
+    fn hovered_trade_circle(&self, bounds: Rectangle, cursor: Point) -> Option<&CircleInstance> {
+        self.scene.circles.iter().rev().find(|circle| {
+            let center = self.trade_circle_screen_position(circle, bounds);
+            center.distance(cursor) <= circle.radius_px.max(4.0) + 3.0
+        })
+    }
+
+    fn draw_trade_tooltip(
+        &self,
+        frame: &mut canvas::Frame,
+        theme: &Theme,
+        bounds: Rectangle,
+        cursor: Point,
+        circle: &CircleInstance,
+    ) {
+        let palette = theme.extended_palette();
+        let width = 270.0_f32.min((bounds.width - 16.0).max(160.0));
+        let height = 116.0;
+        let x = if cursor.x + width + 12.0 <= bounds.width {
+            cursor.x + 12.0
+        } else {
+            cursor.x - width - 12.0
+        }
+        .clamp(8.0, (bounds.width - width - 8.0).max(8.0));
+        let y = (cursor.y - height * 0.5).clamp(8.0, (bounds.height - height - 8.0).max(8.0));
+        frame.fill_rectangle(
+            Point::new(x, y),
+            iced::Size::new(width, height),
+            palette.background.weakest.color.scale_alpha(0.97),
+        );
+
+        let price = Price::from_units(circle.price_units);
+        let bucket = self
+            .scroll_ref_bucket
+            .saturating_add(i64::from(circle.x_bin_rel));
+        let timestamp_ms = bucket.saturating_mul(self.aggr_time_ms as i64);
+        let timestamp = self
+            .timezone
+            .format_with_kind(timestamp_ms, TimeLabelKind::Crosshair { show_millis: true })
+            .unwrap_or_else(|| timestamp_ms.to_string());
+        let side = if circle.is_sell != 0 {
+            "Aggressive sell"
+        } else {
+            "Aggressive buy"
+        };
+        let side_color = if circle.is_sell != 0 {
+            palette.danger.strong.color
+        } else {
+            palette.success.strong.color
+        };
+        let lines = [
+            side.to_string(),
+            format!("Time       {timestamp}"),
+            format!("Price      {}", price.to_string(self.label_precision)),
+            format!("Quantity   {}", abbr_large_numbers(circle.qty as f64)),
+            format!(
+                "Rendering  {}",
+                if circle.style_3d != 0 { "3D" } else { "2D" }
+            ),
+        ];
+        for (index, line) in lines.into_iter().enumerate() {
+            frame.fill_text(canvas::Text {
+                content: line,
+                position: Point::new(x + 10.0, y + 10.0 + index as f32 * 20.0),
+                size: iced::Pixels(if index == 0 { 13.0 } else { 11.0 }),
+                color: if index == 0 {
+                    side_color
+                } else {
+                    palette.background.base.text
+                },
+                font: style::AZERET_MONO,
+                ..canvas::Text::default()
+            });
+        }
+    }
+
     fn event_screen_position(&self, event: &IcebergEvent, bounds: Rectangle) -> Option<Point> {
         let base_price = self.base_price?;
         if self.aggr_time_ms == 0 {

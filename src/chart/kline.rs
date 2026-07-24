@@ -2498,7 +2498,13 @@ impl canvas::Program<Message> for KlineChart {
                             UnixMs::now(),
                             &self.stabilized_bubble_threshold,
                         );
-                        draw_rendered_volume_bubbles(frame, &bubbles, chart.scaling, palette);
+                        draw_rendered_volume_bubbles(
+                            frame,
+                            &bubbles,
+                            chart.scaling,
+                            palette,
+                            &volume_bubbles,
+                        );
                         *self.rendered_volume_bubbles.borrow_mut() = bubbles;
                     }
                 }
@@ -2529,6 +2535,7 @@ impl canvas::Program<Message> for KlineChart {
                         center,
                         chart.translation,
                         chart.scaling,
+                        &self.visual_config.volume_bubbles,
                     );
                     draw_volume_bubble_tooltip(
                         frame,
@@ -2536,6 +2543,8 @@ impl canvas::Program<Message> for KlineChart {
                         palette,
                         &chart.ticker_info,
                         &self.visual_config.volume_bubbles,
+                        cursor_position,
+                        bounds_size,
                     );
                 } else {
                     draw_crosshair_tooltip(
@@ -3753,6 +3762,7 @@ fn draw_rendered_volume_bubbles(
     bubbles: &[RenderedVolumeBubble],
     scaling: f32,
     palette: &Extended,
+    config: &VolumeBubbleConfig,
 ) {
     for bubble in bubbles {
         let radius = bubble.radius_px / scaling;
@@ -3773,7 +3783,11 @@ fn draw_rendered_volume_bubbles(
                     .with_width(1.0 / scaling),
             );
         }
-        frame.fill(&circle, bubble.fill_color.scale_alpha(bubble.fill_alpha));
+        if config.three_dimensional {
+            draw_three_dimensional_bubble(frame, bubble, radius, scaling);
+        } else {
+            frame.fill(&circle, bubble.fill_color.scale_alpha(bubble.fill_alpha));
+        }
         frame.stroke(
             &circle,
             Stroke::default()
@@ -3808,6 +3822,61 @@ fn draw_rendered_volume_bubbles(
             );
         }
     }
+}
+
+fn draw_three_dimensional_bubble(
+    frame: &mut canvas::Frame,
+    bubble: &RenderedVolumeBubble,
+    radius: f32,
+    scaling: f32,
+) {
+    let shadow_offset = 2.5 / scaling;
+    frame.fill(
+        &Path::circle(
+            Point::new(
+                bubble.center.x + shadow_offset,
+                bubble.center.y + shadow_offset * 1.25,
+            ),
+            radius * 1.02,
+        ),
+        Color::BLACK.scale_alpha(0.24 * bubble.age_factor),
+    );
+
+    let base_alpha = (bubble.fill_alpha * 2.4)
+        .max(0.34 * bubble.age_factor)
+        .clamp(0.0, 0.88);
+    frame.fill(
+        &Path::circle(bubble.center, radius),
+        bubble.fill_color.scale_alpha(base_alpha),
+    );
+
+    // Layered highlights approximate a radial gradient while keeping the
+    // bubbles in the existing canvas renderer.
+    for (radius_factor, offset_factor, alpha) in
+        [(0.72, 0.10, 0.16), (0.48, 0.22, 0.19), (0.22, 0.38, 0.28)]
+    {
+        let highlight_center = Point::new(
+            bubble.center.x - radius * offset_factor,
+            bubble.center.y - radius * offset_factor,
+        );
+        frame.fill(
+            &Path::circle(highlight_center, radius * radius_factor),
+            Color::WHITE.scale_alpha(alpha * bubble.age_factor),
+        );
+    }
+
+    frame.stroke(
+        &Path::circle(
+            Point::new(
+                bubble.center.x + radius * 0.08,
+                bubble.center.y + radius * 0.10,
+            ),
+            radius * 0.84,
+        ),
+        Stroke::default()
+            .with_color(Color::BLACK.scale_alpha(0.16 * bubble.age_factor))
+            .with_width(0.8 / scaling),
+    );
 }
 
 fn bubble_screen_center(
@@ -3851,6 +3920,7 @@ fn draw_hovered_volume_bubble(
     viewport_center: Vector,
     translation: Vector,
     scaling: f32,
+    config: &VolumeBubbleConfig,
 ) {
     let center = bubble_screen_center(bubble, viewport_center, translation, scaling);
     let circle = Path::circle(center, bubble.radius_px + 2.0);
@@ -3858,7 +3928,7 @@ fn draw_hovered_volume_bubble(
         &circle,
         bubble
             .fill_color
-            .scale_alpha((0.26 + (1.0 - bubble.age_factor) * 0.02).clamp(0.0, 0.28)),
+            .scale_alpha((config.hover_opacity + (1.0 - bubble.age_factor) * 0.02).clamp(0.0, 1.0)),
     );
     frame.stroke(
         &circle,
@@ -3891,12 +3961,15 @@ fn bubble_tooltip_lines(
         .weighted_time
         .format_utc("%Y-%m-%d %H:%M:%S%.3f UTC")
         .unwrap_or_else(|| cluster.weighted_time.as_u64().to_string());
+    let buy_share = cluster.buy_qty.to_f64() / total.max(f64::EPSILON) * 100.0;
+    let sell_share = cluster.sell_qty.to_f64() / total.max(f64::EPSILON) * 100.0;
     vec![
         heading.to_string(),
         timestamp,
         format!("Total volume      {:.4} {unit}", total),
         format!("Buy volume        {:.4} {unit}", cluster.buy_qty.to_f64()),
         format!("Sell volume       {:.4} {unit}", cluster.sell_qty.to_f64()),
+        format!("Flow split        {buy_share:.1}% buy / {sell_share:.1}% sell"),
         format!("Delta            {:+.4} {unit}", cluster.delta_qty.to_f64()),
         format!("Trades            {}", cluster.trade_count),
         format!(
@@ -3920,6 +3993,8 @@ fn draw_volume_bubble_tooltip(
     palette: &Extended,
     ticker_info: &TickerInfo,
     config: &VolumeBubbleConfig,
+    cursor: Point,
+    bounds: Size,
 ) {
     let symbol = ticker_info.ticker.display_symbol().unwrap_or("units");
     let unit = ["USDT", "USDC", "USD", "BTC", "ETH"]
@@ -3928,17 +4003,25 @@ fn draw_volume_bubble_tooltip(
         .filter(|base| !base.is_empty())
         .unwrap_or("units");
     let lines = bubble_tooltip_lines(bubble, unit, config.threshold_mode);
-    let width = 310.0;
+    let width = 330.0;
     let line_height = 17.0;
+    let height = line_height * lines.len() as f32 + 12.0;
+    let x = if cursor.x + width + 14.0 <= bounds.width {
+        cursor.x + 14.0
+    } else {
+        cursor.x - width - 14.0
+    }
+    .clamp(8.0, (bounds.width - width - 8.0).max(8.0));
+    let y = (cursor.y - height * 0.5).clamp(8.0, (bounds.height - height - 8.0).max(8.0));
     frame.fill_rectangle(
-        Point::new(8.0, 8.0),
-        Size::new(width, line_height * lines.len() as f32 + 12.0),
+        Point::new(x, y),
+        Size::new(width, height),
         palette.background.weakest.color.scale_alpha(0.96),
     );
     for (index, line) in lines.into_iter().enumerate() {
         frame.fill_text(canvas::Text {
             content: line,
-            position: Point::new(14.0, 14.0 + index as f32 * line_height),
+            position: Point::new(x + 8.0, y + 6.0 + index as f32 * line_height),
             size: iced::Pixels(if index == 0 { 13.0 } else { 12.0 }),
             color: if index == 0 {
                 bubble.border_color

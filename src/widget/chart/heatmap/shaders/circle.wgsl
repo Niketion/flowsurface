@@ -7,6 +7,7 @@ struct VertexInput {
     @location(3) x_frac: f32,
     @location(4) radius_px: f32,
     @location(5) color: vec4<f32>,
+    @location(6) style_3d: u32,
 };
 
 struct VertexOutput {
@@ -15,6 +16,7 @@ struct VertexOutput {
     @location(1) color: vec4<f32>,
     @location(2) world_x: f32,
     @location(3) radius_px: f32,
+    @location(4) @interpolate(flat) style_3d: u32,
 };
 
 @vertex
@@ -41,6 +43,7 @@ fn vs_main(input: VertexInput) -> VertexOutput {
     out.color = input.color;
     out.world_x = world_pos.x;
     out.radius_px = input.radius_px;
+    out.style_3d = input.style_3d;
 
     return out;
 }
@@ -60,5 +63,17 @@ fn fs_main(input: VertexOutput) -> @location(0) vec4<f32> {
     }
 
     let fade = fade_factor(input.world_x);
-    return vec4<f32>(input.color.rgb * a * fade, input.color.a * a * fade);
+    if (input.style_3d == 0u) {
+        return vec4<f32>(input.color.rgb * a * fade, input.color.a * a * fade);
+    }
+
+    let z = sqrt(max(1.0 - dot(input.local, input.local), 0.0));
+    let normal = normalize(vec3<f32>(input.local.x, input.local.y, z));
+    let light = normalize(vec3<f32>(-0.55, -0.65, 1.0));
+    let diffuse = max(dot(normal, light), 0.0);
+    let specular = pow(max(dot(normal, light), 0.0), 18.0);
+    let rim = pow(1.0 - z, 2.0);
+    let shaded = input.color.rgb * (0.34 + 0.72 * diffuse);
+    let sphere = mix(shaded, vec3<f32>(1.0), specular * 0.72) * (1.0 - rim * 0.22);
+    return vec4<f32>(sphere * a * fade, input.color.a * a * fade);
 }
