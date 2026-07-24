@@ -234,6 +234,29 @@ pub fn settings() -> Settings {
     }
 }
 
+#[cfg(target_os = "macos")]
+pub fn settings() -> Settings {
+    use iced::window;
+
+    Settings {
+        platform_specific: window::settings::PlatformSpecific {
+            title_hidden: true,
+            titlebar_transparent: true,
+            fullsize_content_view: true,
+        },
+        min_size: Some(Size::new(800.0, 600.0)),
+        ..Default::default()
+    }
+}
+
+#[cfg(target_os = "windows")]
+pub fn settings() -> Settings {
+    Settings {
+        min_size: Some(Size::new(800.0, 600.0)),
+        ..Default::default()
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -351,28 +374,5 @@ mod tests {
                 height: 1032.0
             }
         );
-    }
-}
-
-#[cfg(target_os = "macos")]
-pub fn settings() -> Settings {
-    use iced::window;
-
-    Settings {
-        platform_specific: window::settings::PlatformSpecific {
-            title_hidden: true,
-            titlebar_transparent: true,
-            fullsize_content_view: true,
-        },
-        min_size: Some(Size::new(800.0, 600.0)),
-        ..Default::default()
-    }
-}
-
-#[cfg(target_os = "windows")]
-pub fn settings() -> Settings {
-    Settings {
-        min_size: Some(Size::new(800.0, 600.0)),
-        ..Default::default()
     }
 }
