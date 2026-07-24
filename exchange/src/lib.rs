@@ -97,12 +97,13 @@ impl Timeframe {
         Timeframe::D1,
     ];
 
-    pub const HEATMAP: [Timeframe; 5] = [
+    pub const HEATMAP: [Timeframe; 6] = [
         Timeframe::MS100,
         Timeframe::MS200,
         Timeframe::MS300,
         Timeframe::MS500,
         Timeframe::MS1000,
+        Timeframe::M1,
     ];
 
     /// # Panics

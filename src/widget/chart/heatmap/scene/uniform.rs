@@ -98,6 +98,10 @@ impl ParamsUniform {
         self.depth[0] = denom;
     }
 
+    pub fn depth_denom(&self) -> f32 {
+        self.depth[0]
+    }
+
     pub fn set_trade_fade(&mut self, view_window: &ViewWindow) {
         let fade_start = view_window.volume_profile_max_width * PROFILE_FADE_START_MULT;
         let fade_end = view_window.left_edge_world;

@@ -364,6 +364,7 @@ impl HeatmapShader {
             depth_grid: &self.depth_grid,
             base_price: render_base_price,
             step: self.step,
+            label_precision: self.ticker_info.min_ticksize,
             scroll_ref_bucket,
             qty_scale: self.qty_scale,
             tooltip_cache: &self.canvas_caches.overlay,
@@ -373,6 +374,7 @@ impl HeatmapShader {
             volume_strip_max_qty: self.instances.volume_strip_scale_max_qty,
             depth_profile_max_qty: self.instances.depth_profile_scale_max_qty,
             volume_profile_max_qty: self.instances.volume_profile_scale_max_qty,
+            timezone,
         };
 
         let chart = HeatmapShaderWidget::new(&self.scene, x_axis, y_axis, overlay)
