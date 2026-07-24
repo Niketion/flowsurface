@@ -16,7 +16,8 @@ An open-source native desktop charting application for crypto markets. Supports 
 The `develop` branch currently adds the following features and behavior on top of the upstream project:
 
 -   **Footprint analysis:** a table display mode, per-bar analysis, dynamic cluster color scaling, clearer imbalance markers, and centralized chart/indicator compatibility rules.
--   **Candlestick order-flow overlays:** configurable volume bubbles backed by fetched trades, session filtering, delta/dominant-side coloring, labels and size/quantity controls.
+-   **[Adaptive volume bubbles](./docs/adaptive-volume-bubbles.md):** configurable smart clustering of aggressive executions on candlestick charts, with fixed, percentile, or hybrid thresholds; stable live updates; delta/dominant-side coloring; collision and label budgets; age fading; and optional price-response classification.
+-   **[Binance iceberg detector](./docs/binance-iceberg-detector.md):** optional markers for possible passive iceberg/replenishment activity on Binance USDⓈ-M perpetuals, using sequence-validated L2 depth, raw trades, adaptive baselines, deterministic scoring, and gap/reconnect invalidation.
 -   **Session volume profile:** volume or delta profiles with configurable session interval, side, width, value area, row size, POC, VAH/VAL, session VWAP, and session high/low.
 -   **Cumulative volume delta:** optional candlestick rendering in addition to the line view, with daily or continuous reset behavior.
 -   **GEX options chart:** BTC and ETH gamma-exposure profiles sourced from Deribit, with call/put walls, gamma flip, intrinsic-pressure, gamma-versus-vega, and liquidity-impact analytics.
@@ -53,6 +54,8 @@ See the complete source comparison: [`upstream/main...origin/develop`](https://g
     -   **Time & Sales:** Scrollable list of live trades.
     -   **DOM (Depth of Market) / Ladder:** Displays current L2 orderbook alongside recent trade volumes on grouped price levels.
     -   **Comparison:** Line graph for comparing multiple data sources, normalized by kline `close` prices on a percentage scale
+-   **Adaptive Volume Bubbles:** Highlights significant bursts of aggressive executions on candlestick charts using configurable smart clustering, adaptive thresholds, side/delta coloring, and bounded labels.
+-   **Possible Iceberg Detection:** Marks probable passive absorption and replenishment on Binance USDⓈ-M heatmaps. Detection is disabled by default and reports market-structure evidence, not proof of an exchange-native iceberg order.
 -   Real-time sound effects driven by trade streams
 -   Multi window/monitor support
 -   Pane linking for quickly switching tickers across multiple panes
