@@ -1,47 +1,50 @@
 # Adaptive Volume Bubbles
 
-Volume Bubbles visualizza burst di esecuzioni aggressive, non semplici price bin. Un trade è una
-singola esecuzione; un price bin somma tutte le esecuzioni allo stesso prezzo; uno smart cluster
-unisce invece soltanto trade della stessa candela vicini nel tempo e nel prezzo. Il cluster conserva
-VWAP, tempo volume-weighted, buy/sell, delta, numero di trade e trade massimo.
+Volume Bubbles visualize bursts of aggressive executions rather than simple price bins. A trade is
+a single execution; a price bin sums every execution at the same price; a smart cluster instead
+combines only trades from the same candle that are close in time and price. Each cluster preserves
+its VWAP, volume-weighted time, buy and sell volume, delta, trade count, and largest trade.
 
-La pipeline pura `cluster_volume_bubble_trades` è condivisa da live, storico e replay. Quando i raw
-trade completi sono disponibili hanno precedenza; in alternativa viene usata esclusivamente la
-summary v2 già clusterizzata. Raw e summary non vengono mai sommati. Le summary v1, basate su
-candela/prezzo, vivono in una tabella differente e non sono interpretate come cluster v2.
+The pure `cluster_volume_bubble_trades` pipeline is shared by live data, historical data, and replay.
+When complete raw trades are available, they take precedence; otherwise, only the pre-clustered v2
+summary is used. Raw data and summaries are never added together. V1 summaries, which are based on
+candle and price, live in a separate table and are not interpreted as v2 clusters.
 
-## Soglia e stabilità
+## Thresholds and stability
 
-- **Fixed** usa `min_qty`.
-- **AdaptivePercentile** usa il percentile rolling dei cluster nella finestra configurata.
-- **Hybrid** usa il massimo tra percentile e `min_qty`.
+- **Fixed** uses `min_qty`.
+- **AdaptivePercentile** uses the rolling cluster percentile over the configured window.
+- **Hybrid** uses the greater of the percentile and `min_qty`.
 
-Durante il warm-up il floor assoluto evita NaN e soglie instabili. La soglia live viene aggiornata al
-massimo una volta al secondo e soltanto per variazioni almeno del 10%. L'ID del cluster deriva dagli
-anchor stabili del burst, quindi non cambia mentre il cluster corrente cresce. Una baseline per lato
-può essere usata quando ha campioni sufficienti; altrimenti si usa la distribuzione combinata.
+During warm-up, the absolute floor prevents NaN values and unstable thresholds. The live threshold
+is updated at most once per second and only when it changes by at least 10%. A cluster ID is derived
+from the burst's stable anchors, so it does not change while the current cluster grows. A per-side
+baseline can be used when enough samples are available; otherwise, the combined distribution is
+used.
 
-## Gerarchia visuale
+## Visual hierarchy
 
-Il volume e il percentile dominano l'importance score; dominance e trade count aggiungono soltanto
-piccoli bonus spiegabili. Dopo la soglia si applicano il budget per candela, il budget globale del
-viewport, collisioni orizzontali deterministiche e il budget label. `ExtremeOnly` etichetta soltanto
-gli eventi oltre il percentile label; le altre bubble restano prive di testo.
+Volume and percentile dominate the importance score; dominance and trade count add only small,
+explainable bonuses. After thresholding, the renderer applies the per-candle budget, global viewport
+budget, deterministic horizontal collision handling, and label budget. `ExtremeOnly` labels only
+events above the label percentile; the remaining bubbles are rendered without text.
 
-Il raggio usa compressione logaritmica rispetto alla soglia e interpolazione sull'area del cerchio.
-Resta nei limiti configurati ed è resistente agli outlier. Fill trasparente, bordo più leggibile e
-colori derivati dal tema preservano candele, wick e overlay. I cluster con dominance debole sono
-neutri. L'age fading scende gradualmente fino a circa il 58%, senza nascondere lo storico.
+The radius uses logarithmic compression relative to the threshold and interpolation over the
+circle's area. It remains within the configured limits and is resistant to outliers. A transparent
+fill, more legible outline, and theme-derived colors preserve candles, wicks, and overlays. Clusters
+with weak dominance are neutral. Age fading decreases gradually to about 58% without hiding
+historical bubbles.
 
 ## Price response
 
-L'analisi opzionale classifica la risposta dopo un orizzonte realmente trascorso come
-`FollowThrough`, `Stalled`, `Reversed`, `Pending` o `Neutral`. Non usa dati futuri in live e resta
-secondaria rispetto al volume. `Stalled` può essere compatibile con assorbimento passivo, ma non lo
-dimostra e non identifica automaticamente un iceberg.
+The optional analysis classifies the response after a fully elapsed horizon as `FollowThrough`,
+`Stalled`, `Reversed`, `Pending`, or `Neutral`. It does not use future data in live mode and remains
+secondary to volume. `Stalled` can be consistent with passive absorption, but it does not prove it
+and does not automatically identify an iceberg.
 
-## Limiti interpretativi
+## Interpretation limits
 
-Una bubble indica attività aggressiva aggregata. Non identifica automaticamente apertura o chiusura
-di una posizione. Il risultato dipende dalla qualità, dall'ordine e dalla completezza dei trade
-forniti dall'exchange; dati intrabar incompleti riducono la precisione temporale del clustering.
+A bubble represents aggregated aggressive activity. It does not automatically identify whether a
+position was opened or closed. Results depend on the quality, ordering, and completeness of the
+trades supplied by the exchange; incomplete intrabar data reduces the temporal precision of
+clustering.
