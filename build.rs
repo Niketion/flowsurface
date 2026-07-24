@@ -3,9 +3,17 @@ use std::process::Command;
 
 fn main() {
     println!("cargo:rerun-if-changed=build.rs");
+    println!("cargo:rerun-if-changed=assets/icon.ico");
     println!("cargo:rerun-if-changed=.git/HEAD");
     println!("cargo:rerun-if-changed=.git/refs");
     println!("cargo:rerun-if-changed=.git/packed-refs");
+
+    if env::var("CARGO_CFG_TARGET_OS").as_deref() == Ok("windows") {
+        winresource::WindowsResource::new()
+            .set_icon("assets/icon.ico")
+            .compile()
+            .expect("failed to embed the Windows application icon");
+    }
 
     let Some(git_sha) = git_output(&["rev-parse", "--short=7", "HEAD"]) else {
         return;

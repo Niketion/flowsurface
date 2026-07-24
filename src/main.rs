@@ -37,11 +37,18 @@ use widget::{
 use iced::{
     Alignment, Element, Length, Subscription, Task, Theme, keyboard, padding,
     widget::{
-        button, column, container, pane_grid, pick_list, row, rule, scrollable, text, text_input,
-        tooltip::Position as TooltipPosition,
+        button, column, container, pane_grid, pick_list, progress_bar, row, rule, scrollable, text,
+        text_input, tooltip::Position as TooltipPosition,
     },
 };
-use std::{borrow::Cow, collections::HashMap, path::PathBuf, sync::Arc, time::Duration, vec};
+use std::{
+    borrow::Cow,
+    collections::HashMap,
+    path::PathBuf,
+    sync::Arc,
+    time::{Duration, Instant},
+    vec,
+};
 use windowing::WindowingMode;
 
 /// Set to `true` to emit window focus/unfocus and tick diagnostic logs.
@@ -50,6 +57,10 @@ const DEBUG_WINDOW_DIAGNOSTICS: bool = false;
 
 const DEBUG_TERMINAL_VSCROLL_ID: &str = "debug-terminal-vscroll";
 const DEBUG_TERMINAL_HSCROLL_ID: &str = "debug-terminal-hscroll";
+const STARTUP_MIN_VISIBLE: Duration = Duration::from_millis(900);
+const STARTUP_READY_SETTLE: Duration = Duration::from_millis(650);
+const STARTUP_WINDOW_WIDTH: f32 = 500.0;
+const STARTUP_WINDOW_HEIGHT: f32 = 420.0;
 
 fn main() {
     logger::install_panic_hook();
@@ -128,6 +139,104 @@ struct Flowsurface {
     debug_terminal_compact_mode: bool,
     gex_coordinator: connector::gex::GexDataCoordinator,
     deribit_options_client: Option<exchange::options::deribit::DeribitOptionsClient>,
+    startup_loading: StartupLoading,
+    startup_main_window_target: StartupMainWindowTarget,
+    closing_startup_window: Option<window::Id>,
+}
+
+#[derive(Debug, Clone, Copy)]
+struct StartupMainWindowTarget {
+    position: window::Position,
+    size: iced::Size,
+}
+
+#[derive(Debug)]
+struct StartupLoading {
+    started_at: Instant,
+    ready_since: Option<Instant>,
+    finished: bool,
+}
+
+impl StartupLoading {
+    fn new() -> Self {
+        Self {
+            started_at: Instant::now(),
+            ready_since: None,
+            finished: false,
+        }
+    }
+
+    fn is_active(&self) -> bool {
+        !self.finished
+    }
+
+    fn observe(&mut self, ready: bool, now: Instant) -> bool {
+        if self.finished {
+            return false;
+        }
+        if !ready {
+            self.ready_since = None;
+            return false;
+        }
+
+        let ready_since = *self.ready_since.get_or_insert(now);
+        if now.duration_since(self.started_at) >= STARTUP_MIN_VISIBLE
+            && now.duration_since(ready_since) >= STARTUP_READY_SETTLE
+        {
+            self.finished = true;
+            return true;
+        }
+
+        false
+    }
+}
+
+struct StartupViewState {
+    progress: f32,
+    detail: String,
+}
+
+fn startup_fun_message() -> &'static str {
+    const MESSAGES: &[&str] = &[
+        "Oiling the gears…",
+        "Decoding market-maker intentions…",
+        "Calling Wall Street…",
+        "Teaching candles to behave…",
+        "Convincing liquidity to show up…",
+        "Counting invisible orders…",
+        "Calibrating the crystal ball…",
+        "Negotiating with the spread…",
+        "Waking up the order book…",
+        "Asking the whales to make room…",
+        "Polishing the price ladder…",
+        "Herding rogue candlesticks…",
+        "Synchronizing with New York…",
+        "Looking for the missing liquidity…",
+        "Reading tea leaves in the tape…",
+        "Turning coffee into alpha…",
+        "Checking if the trend is still your friend…",
+        "Summoning the opening bell…",
+        "Feeding the data hamsters…",
+        "Aligning bids and asks…",
+        "Looking under the spread…",
+        "Warming up the matching engine…",
+        "Making volatility feel welcome…",
+        "Asking the bears to wait outside…",
+        "Convincing bulls to take the stairs…",
+        "Counting ticks so you do not have to…",
+        "Finding support in all the right places…",
+        "Making resistance slightly less resistant…",
+        "Checking whether the candles are sentient…",
+        "Translating whale noises into charts…",
+        "Rehearsing a very convincing breakout…",
+        "Removing emotions from the order book…",
+    ];
+    let elapsed_ms = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_millis();
+
+    MESSAGES[(elapsed_ms / 2_200) as usize % MESSAGES.len()]
 }
 
 #[derive(Debug, Clone)]
@@ -572,15 +681,14 @@ impl Flowsurface {
             );
         }
 
-        let (main_window_id, open_main_window) = {
+        let (main_window_id, open_main_window, startup_main_window_target) = {
             let (position, size) = saved_state.window();
-            let config = window::Settings {
-                size,
-                position,
-                exit_on_close_request: false,
-                ..window::settings()
-            };
-            window::open(config)
+            let config = window::startup_popup_settings(iced::Size::new(
+                STARTUP_WINDOW_WIDTH,
+                STARTUP_WINDOW_HEIGHT,
+            ));
+            let (id, open) = window::open(config);
+            (id, open, StartupMainWindowTarget { position, size })
         };
 
         let handles = exchange::adapter::AdapterHandles::spawn_venues(
@@ -649,6 +757,9 @@ impl Flowsurface {
             debug_terminal_compact_mode: true,
             gex_coordinator: connector::gex::GexDataCoordinator::default(),
             deribit_options_client,
+            startup_loading: StartupLoading::new(),
+            startup_main_window_target,
+            closing_startup_window: None,
         };
 
         if let Some(err) = audio_init_err {
@@ -707,19 +818,12 @@ impl Flowsurface {
                 Task::none()
             });
 
-        let debug_terminal = if state.debug_terminal_enabled {
-            state.open_debug_terminal()
-        } else {
-            Task::none()
-        };
-
         (
             state,
             open_main_window
                 .discard()
                 .chain(load_layout)
-                .chain(launch_sidebar.map(Message::Sidebar))
-                .chain(debug_terminal),
+                .chain(launch_sidebar.map(Message::Sidebar)),
         )
     }
 
@@ -971,11 +1075,36 @@ impl Flowsurface {
                 self.gex_coordinator.set_consumers(consumers);
                 self.sync_gex_dashboard(exchange::UnixMs::now());
 
+                let startup_ready = self.startup_dependencies_ready();
+                let startup_completed = self.startup_loading.observe(startup_ready, now);
+                let startup_task = if startup_completed {
+                    log::info!(
+                        "STARTUP Ready | elapsed_ms={} panes={} streams={}",
+                        now.duration_since(self.startup_loading.started_at)
+                            .as_millis(),
+                        self.active_dashboard()
+                            .startup_load_status(self.main_window.id)
+                            .pane_count,
+                        expected_streams.len()
+                    );
+                    self.dirty_flag.mark_dirty();
+                    let dashboard_window = self.open_main_dashboard_window();
+                    let popouts = self.open_startup_popouts();
+                    let debug_terminal = if self.debug_terminal_enabled {
+                        self.open_debug_terminal()
+                    } else {
+                        Task::none()
+                    };
+                    Task::batch([dashboard_window, popouts, debug_terminal])
+                } else {
+                    Task::none()
+                };
+
                 // Keep WS subscriptions alive so their reconnect loop can run,
                 // but freeze chart timers/fetch scheduling while offline. The
                 // reconnect transition performs the missing-range backfill.
                 if self.market_connectivity.overlay_visible() {
-                    return connectivity_task;
+                    return Task::batch([connectivity_task, startup_task]);
                 }
 
                 let gex_now = exchange::UnixMs::now();
@@ -1007,7 +1136,7 @@ impl Flowsurface {
                     });
 
                 return Task::batch(
-                    [connectivity_task, chart_tick]
+                    [connectivity_task, chart_tick, startup_task]
                         .into_iter()
                         .chain(gex_tasks)
                         .collect::<Vec<_>>(),
@@ -1029,6 +1158,22 @@ impl Flowsurface {
                     }
 
                     let main_window = self.main_window.id;
+                    let startup_active = self.startup_loading.is_active();
+                    if startup_active {
+                        let windows = match self.startup_main_window_target.position {
+                            window::Position::Specific(position) => HashMap::from([(
+                                main_window,
+                                WindowSpec::from((
+                                    &position,
+                                    &self.startup_main_window_target.size,
+                                )),
+                            )]),
+                            window::Position::Centered
+                            | window::Position::Default
+                            | window::Position::SpecificWith(_) => HashMap::new(),
+                        };
+                        return Task::done(Message::ExitRequested(windows));
+                    }
                     let dashboard = self.active_dashboard_mut();
 
                     if window != main_window {
@@ -1586,7 +1731,172 @@ impl Flowsurface {
         Task::none()
     }
 
+    fn startup_dependencies_ready(&self) -> bool {
+        let mut dashboard = self
+            .active_dashboard()
+            .startup_load_status(self.main_window.id);
+        if self.deribit_options_client.is_none() {
+            dashboard.loading_gex = 0;
+        }
+
+        !self.sidebar.is_metadata_loading()
+            && dashboard.is_ready()
+            && self.market_connectivity.is_online()
+    }
+
+    fn startup_view_state(&self) -> StartupViewState {
+        let (metadata_loaded, metadata_total) = self.sidebar.metadata_loading_progress();
+        let mut dashboard = self
+            .active_dashboard()
+            .startup_load_status(self.main_window.id);
+        if self.deribit_options_client.is_none() {
+            dashboard.loading_gex = 0;
+        }
+
+        if self.sidebar.is_metadata_loading() {
+            let ratio = if metadata_total == 0 {
+                0.0
+            } else {
+                metadata_loaded as f32 / metadata_total as f32
+            };
+            return StartupViewState {
+                progress: 0.08 + ratio * 0.24,
+                detail: format!("Loading market metadata ({metadata_loaded}/{metadata_total})…"),
+            };
+        }
+        if dashboard.unresolved_streams > 0 {
+            return StartupViewState {
+                progress: 0.42,
+                detail: format!(
+                    "Resolving data sources for {} chart{}…",
+                    dashboard.unresolved_streams,
+                    if dashboard.unresolved_streams == 1 {
+                        ""
+                    } else {
+                        "s"
+                    }
+                ),
+            };
+        }
+        if dashboard.initializing_panes > 0 {
+            return StartupViewState {
+                progress: 0.56,
+                detail: format!(
+                    "Preparing {} chart{}…",
+                    dashboard.initializing_panes,
+                    if dashboard.initializing_panes == 1 {
+                        ""
+                    } else {
+                        "s"
+                    }
+                ),
+            };
+        }
+        if !self.market_connectivity.is_online() {
+            let connected = self.market_connectivity.connected_count();
+            let expected = self.market_connectivity.expected_count();
+            let ratio = if expected == 0 {
+                0.0
+            } else {
+                connected as f32 / expected as f32
+            };
+            return StartupViewState {
+                progress: 0.62 + ratio * 0.14,
+                detail: if expected == 0 {
+                    "Starting market services…".to_string()
+                } else {
+                    format!("Connecting market streams ({connected}/{expected})…")
+                },
+            };
+        }
+        if dashboard.loading_panes > 0 {
+            return StartupViewState {
+                progress: 0.82,
+                detail: format!(
+                    "Loading initial data for {} chart{}…",
+                    dashboard.loading_panes,
+                    if dashboard.loading_panes == 1 {
+                        ""
+                    } else {
+                        "s"
+                    }
+                ),
+            };
+        }
+        if dashboard.loading_gex > 0 {
+            return StartupViewState {
+                progress: 0.92,
+                detail: "Loading options and GEX data…".to_string(),
+            };
+        }
+
+        StartupViewState {
+            progress: 0.98,
+            detail: if dashboard.pane_count == 0 {
+                "Preparing workspace…".to_string()
+            } else {
+                "Opening workspace…".to_string()
+            },
+        }
+    }
+
+    fn startup_loading_view(&self) -> Element<'_, Message> {
+        let state = self.startup_view_state();
+        let modal = container(
+            column![
+                widget::startup_loading_animation(),
+                text("Starting FlowSurface")
+                    .size(crate::style::text_size::TITLE)
+                    .font(iced::Font {
+                        weight: iced::font::Weight::Bold,
+                        ..Default::default()
+                    }),
+                progress_bar(0.0..=1.0, state.progress).girth(Length::Fixed(8.0)),
+                text(state.detail)
+                    .size(crate::style::text_size::BODY)
+                    .style(|_| iced::widget::text::Style {
+                        color: Some(iced::Color::from_rgb8(148, 155, 164)),
+                    }),
+                text(startup_fun_message())
+                    .size(crate::style::text_size::SMALL)
+                    .style(|_| iced::widget::text::Style {
+                        color: Some(iced::Color::from_rgb8(114, 120, 128)),
+                    }),
+            ]
+            .width(Length::Fill)
+            .align_x(Alignment::Center)
+            .spacing(18),
+        )
+        .width(Length::Fixed(440.0))
+        .padding([28, 34])
+        .style(style::startup_modal);
+
+        container(modal)
+            .width(Length::Fill)
+            .height(Length::Fill)
+            .align_x(Alignment::Center)
+            .align_y(Alignment::Center)
+            .style(style::startup_backdrop)
+            .into()
+    }
+
     fn view(&self, id: window::Id) -> Element<'_, Message> {
+        if self.closing_startup_window == Some(id) {
+            return self.startup_loading_view();
+        }
+
+        if self.startup_loading.is_active() {
+            if id == self.main_window.id {
+                return self.startup_loading_view();
+            }
+
+            return container(column![])
+                .width(Length::Fill)
+                .height(Length::Fill)
+                .style(style::startup_backdrop)
+                .into();
+        }
+
         if self.debug_terminal_window == Some(id) {
             let content = self.debug_terminal_view();
             return self.with_connection_overlay(content);
@@ -2164,12 +2474,13 @@ impl Flowsurface {
             .park_inactive_layouts(layout_uid, main_window);
 
         let windowing_mode = self.windowing_mode;
+        let open_native_popouts = !self.startup_loading.is_active();
         self.layout_manager
             .get_mut(layout_uid)
             .map(|layout| {
                 layout
                     .dashboard
-                    .load_layout(main_window, windowing_mode)
+                    .load_layout(main_window, windowing_mode, open_native_popouts)
                     .map(move |msg| Message::Dashboard {
                         layout_id: Some(layout_uid),
                         event: msg,
@@ -2179,6 +2490,44 @@ impl Flowsurface {
                 log::error!("Active layout missing after selection: {}", layout_uid);
                 Task::none()
             })
+    }
+
+    fn open_startup_popouts(&mut self) -> Task<Message> {
+        if !self.windowing_mode.allows_native_popout() {
+            return Task::none();
+        }
+        let Some(layout_id) = self.layout_manager.active_layout_id().map(|id| id.unique) else {
+            return Task::none();
+        };
+
+        self.layout_manager
+            .get_mut(layout_id)
+            .map(|layout| {
+                layout
+                    .dashboard
+                    .open_popout_windows()
+                    .map(move |event| Message::Dashboard {
+                        layout_id: Some(layout_id),
+                        event,
+                    })
+            })
+            .unwrap_or_else(Task::none)
+    }
+
+    fn open_main_dashboard_window(&mut self) -> Task<Message> {
+        let old_window = self.main_window.id;
+        let target = self.startup_main_window_target;
+        let config = window::Settings {
+            size: target.size,
+            position: target.position,
+            exit_on_close_request: false,
+            ..window::settings()
+        };
+        let (new_window, open) = window::open(config);
+        self.closing_startup_window = Some(old_window);
+        self.main_window = window::Window::new(new_window);
+
+        Task::batch([window::close(old_window), open.then(|_| Task::none())])
     }
 
     fn view_with_modal<'a>(
@@ -2744,8 +3093,11 @@ impl Flowsurface {
     }
 
     fn restart(&mut self) -> Task<Message> {
-        let mut windows_to_close: Vec<window::Id> =
-            self.active_dashboard().popout.keys().copied().collect();
+        let mut windows_to_close: Vec<window::Id> = if self.startup_loading.is_active() {
+            Vec::new()
+        } else {
+            self.active_dashboard().popout.keys().copied().collect()
+        };
         windows_to_close.push(self.main_window.id);
 
         let close_windows = Task::batch(
@@ -2828,4 +3180,29 @@ fn compact_log_row(entry: DebugLogEntry) -> Element<'static, Message> {
     .align_y(Alignment::Center)
     .spacing(8)
     .into()
+}
+
+#[cfg(test)]
+mod startup_tests {
+    use super::{STARTUP_MIN_VISIBLE, STARTUP_READY_SETTLE, StartupLoading};
+    use std::time::{Duration, Instant};
+
+    #[test]
+    fn startup_finishes_only_after_dependencies_stay_ready() {
+        let now = Instant::now();
+        let mut startup = StartupLoading {
+            started_at: now - STARTUP_MIN_VISIBLE,
+            ready_since: None,
+            finished: false,
+        };
+
+        assert!(!startup.observe(true, now));
+        assert!(!startup.observe(false, now + Duration::from_millis(100)));
+        assert!(!startup.observe(true, now + Duration::from_millis(200)));
+        assert!(startup.observe(
+            true,
+            now + Duration::from_millis(200) + STARTUP_READY_SETTLE
+        ));
+        assert!(!startup.is_active());
+    }
 }

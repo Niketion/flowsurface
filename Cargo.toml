@@ -69,6 +69,7 @@ fern = "0.7.1"
 rodio = { version = "0.22.2", default-features = false, features = [ "playback", "wav" ]}
 tokio = { version = "1.52", default-features = false, features = ["time"] }
 gif = "0.14.2"
+image = { version = "0.25.10", default-features = false, features = ["ico"] }
 
 bytemuck = "1.25.0"
 iced_wgpu = "0.14.0"
@@ -84,3 +85,6 @@ windows-sys = { version = "0.61.2", features = [
 
 [features]
 debug = ["iced/hot"]
+
+[build-dependencies]
+winresource = "0.1.31"

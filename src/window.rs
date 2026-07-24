@@ -1,4 +1,4 @@
-use std::collections::HashMap;
+use std::{collections::HashMap, sync::OnceLock};
 
 use data::layout::WindowSpec;
 use iced::{Point, Size, Subscription, Task, window};
@@ -19,6 +19,51 @@ impl Window {
 
 pub fn default_size() -> Size {
     WindowSpec::default().size()
+}
+
+pub fn startup_popup_settings(size: Size) -> Settings {
+    let mut popup = settings();
+    popup.size = size;
+    popup.position = Position::Centered;
+    popup.min_size = Some(size);
+    popup.max_size = Some(size);
+    popup.resizable = false;
+    popup.decorations = false;
+    popup.transparent = true;
+    popup.exit_on_close_request = false;
+
+    #[cfg(target_os = "windows")]
+    {
+        popup.platform_specific.skip_taskbar = true;
+        popup.platform_specific.corner_preference =
+            iced::window::settings::platform::CornerPreference::Round;
+    }
+
+    popup
+}
+
+const APP_ICON_ICO: &[u8] = include_bytes!("../assets/icon.ico");
+const APP_ICON_SIZE: u32 = 64;
+
+fn app_icon() -> window::Icon {
+    static ICON: OnceLock<window::Icon> = OnceLock::new();
+
+    ICON.get_or_init(decode_app_icon).clone()
+}
+
+fn decode_app_icon() -> window::Icon {
+    let source = image::load_from_memory_with_format(APP_ICON_ICO, image::ImageFormat::Ico)
+        .expect("embedded application icon must be a valid ICO");
+    let rgba = source
+        .resize_exact(
+            APP_ICON_SIZE,
+            APP_ICON_SIZE,
+            image::imageops::FilterType::Lanczos3,
+        )
+        .into_rgba8();
+
+    window::icon::from_rgba(rgba.into_raw(), APP_ICON_SIZE, APP_ICON_SIZE)
+        .expect("decoded application icon must contain valid RGBA data")
 }
 
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -230,6 +275,7 @@ where
 #[cfg(target_os = "linux")]
 pub fn settings() -> Settings {
     Settings {
+        icon: Some(app_icon()),
         min_size: Some(Size::new(800.0, 600.0)),
         ..Default::default()
     }
@@ -240,6 +286,7 @@ pub fn settings() -> Settings {
     use iced::window;
 
     Settings {
+        icon: Some(app_icon()),
         platform_specific: window::settings::PlatformSpecific {
             title_hidden: true,
             titlebar_transparent: true,
@@ -253,6 +300,7 @@ pub fn settings() -> Settings {
 #[cfg(target_os = "windows")]
 pub fn settings() -> Settings {
     Settings {
+        icon: Some(app_icon()),
         min_size: Some(Size::new(800.0, 600.0)),
         ..Default::default()
     }
@@ -269,6 +317,15 @@ mod tests {
             pos_x: x,
             pos_y: y,
         }
+    }
+
+    #[test]
+    fn embedded_application_icon_decodes_to_expected_rgba_size() {
+        let (pixels, size) = decode_app_icon().into_raw();
+
+        assert_eq!(size, Size::new(APP_ICON_SIZE, APP_ICON_SIZE));
+        assert_eq!(pixels.len(), (APP_ICON_SIZE * APP_ICON_SIZE * 4) as usize);
+        assert!(pixels.chunks_exact(4).any(|pixel| pixel[3] != 0));
     }
 
     #[test]
